@@ -39,13 +39,15 @@
 
 ## API эндпоинты
 
+**Важно:** Все используемые эндпоинты - публичные (market data), API ключи не требуются!
+
 ### Bybit:
-- Тикер фьючерса: `/v5/market/tickers` (category=linear)
-- Фандинг: `/v5/market/funding/history` (category=linear, limit=1)
+- Тикер фьючерса: `/v5/market/tickers` (category=linear) - публичный
+- Фандинг: `/v5/market/funding/history` (category=linear, limit=1) - публичный
 
 ### Gate.io:
-- Тикер фьючерса: `/api/v4/futures/usdt/tickers`
-- Фандинг: `/api/v4/futures/usdt/funding_rate`
+- Тикер фьючерса: `/api/v4/futures/usdt/tickers` - публичный
+- Фандинг: `/api/v4/futures/usdt/funding_rate` - публичный
 
 ## Следующие шаги (TODO)
 Пользователь упомянул, что в следующем сообщении будут дополнительные вычисления, которые нужно реализовать.
