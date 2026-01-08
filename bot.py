@@ -24,6 +24,9 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
+# Отключаем логирование HTTP запросов от httpx
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
 
 class PerpArbitrageBot:
     """Бот для анализа арбитража фьючерсов"""
@@ -159,7 +162,6 @@ class PerpArbitrageBot:
         long_exchange = parsed["long_exchange"]
         short_exchange = parsed["short_exchange"]
         
-        logger.info(f"Обработка арбитража для {coin}: Long на {long_exchange}, Short на {short_exchange}")
         
         # Получаем данные с обеих бирж параллельно
         long_data_task = self.get_futures_data(long_exchange, coin)

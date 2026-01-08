@@ -33,15 +33,8 @@ class AsyncBaseExchange(ABC):
         """Обертка с обработкой ошибок и логированием"""
         try:
             resp = await self.client.request(method, url, params=params)
-            # Для LBank логируем только успешные ответы
-            if self.name == "LBank" and resp.status_code == 200:
-                logger.debug(f"{self.name}: HTTP {resp.status_code} для {url} с params {params}")
-            
             resp.raise_for_status()
             result = resp.json()
-            # Логируем для LBank для отладки
-            if self.name == "LBank":
-                logger.info(f"{self.name}: Успешный JSON ответ от {url}: {str(result)[:500]}")
             return result
         except httpx.HTTPStatusError as e:
             status = e.response.status_code
