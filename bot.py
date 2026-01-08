@@ -181,13 +181,13 @@ class PerpArbitrageBot:
             price_long = long_data.get("price")
             funding_long = long_data.get("funding_rate")
             
-            logger.info(f"Цена монеты на фьючерс ({coin}) {long_exchange}: {price_long}")
+            logger.info(f"({long_exchange}) Цена монеты на фьючерс ({coin}): {price_long}")
             
             if funding_long is not None:
                 funding_long_pct = funding_long * 100
-                logger.info(f"Фандинг ({coin}) {long_exchange}: {funding_long_pct:.6f}%")
+                logger.info(f"({long_exchange}) Фандинг ({coin}): {funding_long_pct:.6f}%")
             else:
-                logger.info(f"Фандинг ({coin}) {long_exchange}: недоступно")
+                logger.info(f"({long_exchange}) Фандинг ({coin}): недоступно")
         else:
             logger.error(f"Не удалось получить данные с {long_exchange}")
             price_long = None
@@ -198,36 +198,45 @@ class PerpArbitrageBot:
             price_short = short_data.get("price")
             funding_short = short_data.get("funding_rate")
             
-            logger.info(f"Цена монеты на фьючерс ({coin}) {short_exchange}: {price_short}")
+            logger.info(f"({short_exchange}) Цена монеты на фьючерс ({coin}): {price_short}")
             
             if funding_short is not None:
                 funding_short_pct = funding_short * 100
-                logger.info(f"Фандинг ({coin}) {short_exchange}: {funding_short_pct:.6f}%")
+                logger.info(f"({short_exchange}) Фандинг ({coin}): {funding_short_pct:.6f}%")
             else:
-                logger.info(f"Фандинг ({coin}) {short_exchange}: недоступно")
+                logger.info(f"({short_exchange}) Фандинг ({coin}): недоступно")
         else:
             logger.error(f"Не удалось получить данные с {short_exchange}")
             price_short = None
             funding_short = None
         
         # Вычисляем спреды
+        price_spread = None
         if price_long is not None and price_short is not None:
             price_spread = self.calculate_spread(price_long, price_short)
             if price_spread is not None:
-                logger.info(f"Спред на цену на фьючерс ({long_exchange} и {short_exchange}): {price_spread:.4f}%")
+                logger.info(f"({long_exchange} и {short_exchange}) Спред на цену на фьючерс: {price_spread:.4f}%")
             else:
-                logger.info(f"Спред на цену на фьючерс ({long_exchange} и {short_exchange}): невозможно вычислить")
+                logger.info(f"({long_exchange} и {short_exchange}) Спред на цену на фьючерс: невозможно вычислить")
         else:
-            logger.info(f"Спред на цену на фьючерс ({long_exchange} и {short_exchange}): недоступно")
+            logger.info(f"({long_exchange} и {short_exchange}) Спред на цену на фьючерс: недоступно")
         
         if funding_long is not None and funding_short is not None:
             funding_spread = self.calculate_funding_spread(funding_long, funding_short)
             if funding_spread is not None:
-                logger.info(f"Спред на фандинги ({long_exchange} и {short_exchange}): {funding_spread:.6f}%")
+                logger.info(f"({long_exchange} и {short_exchange}) Спред на фандинги: {funding_spread:.6f}%")
             else:
-                logger.info(f"Спред на фандинги ({long_exchange} и {short_exchange}): невозможно вычислить")
+                logger.info(f"({long_exchange} и {short_exchange}) Спред на фандинги: невозможно вычислить")
         else:
-            logger.info(f"Спред на фандинги ({long_exchange} и {short_exchange}): недоступно")
+            logger.info(f"({long_exchange} и {short_exchange}) Спред на фандинги: недоступно")
+            funding_spread = None
+        
+        # Вычисляем общий спред (сумма спреда на цену и спреда на фандинги)
+        if price_spread is not None and funding_spread is not None:
+            total_spread = price_spread + funding_spread
+            logger.info(f"({long_exchange} и {short_exchange}) Общий спред: {total_spread:.6f}%")
+        else:
+            logger.info(f"({long_exchange} и {short_exchange}) Общий спред: невозможно вычислить")
         
         logger.info("=" * 60)
 
