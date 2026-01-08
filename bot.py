@@ -7,6 +7,8 @@ import sys
 from typing import Optional, Dict
 from exchanges.async_bybit import AsyncBybitExchange
 from exchanges.async_gate import AsyncGateExchange
+from exchanges.async_mexc import AsyncMexcExchange
+from exchanges.async_lbank import AsyncLbankExchange
 from input_parser import parse_input
 import config
 
@@ -29,9 +31,13 @@ class PerpArbitrageBot:
     def __init__(self):
         self.bybit = AsyncBybitExchange()
         self.gate = AsyncGateExchange()
+        self.mexc = AsyncMexcExchange()
+        self.lbank = AsyncLbankExchange()
         self.exchanges = {
             "bybit": self.bybit,
-            "gate": self.gate
+            "gate": self.gate,
+            "mexc": self.mexc,
+            "lbank": self.lbank
         }
     
     async def close(self):
@@ -39,6 +45,8 @@ class PerpArbitrageBot:
         await asyncio.gather(
             self.bybit.close(),
             self.gate.close(),
+            self.mexc.close(),
+            self.lbank.close(),
             return_exceptions=True
         )
     

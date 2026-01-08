@@ -1,3 +1,4 @@
 .env
+arbitrage_perp_bot.log
 *.log
 

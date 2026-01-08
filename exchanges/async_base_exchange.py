@@ -33,12 +33,32 @@ class AsyncBaseExchange(ABC):
         """Обертка с обработкой ошибок и логированием"""
         try:
             resp = await self.client.request(method, url, params=params)
+            # Для LBank логируем только успешные ответы
+            if self.name == "LBank" and resp.status_code == 200:
+                logger.debug(f"{self.name}: HTTP {resp.status_code} для {url} с params {params}")
+            
             resp.raise_for_status()
-            return resp.json()
+            result = resp.json()
+            # Логируем для LBank для отладки
+            if self.name == "LBank":
+                logger.info(f"{self.name}: Успешный JSON ответ от {url}: {str(result)[:500]}")
+            return result
         except httpx.HTTPStatusError as e:
             status = e.response.status_code
-            logger.debug(f"{self.name}: HTTP {status} для {url}")
+            # Для LBank и 404 ошибок - это означает, что публичный API недоступен
+            if self.name == "LBank" and status == 404:
+                # Не логируем каждую 404 ошибку отдельно, чтобы не засорять лог
+                # Основное сообщение будет в методах get_futures_ticker/get_funding_rate
+                pass
+            else:
+                try:
+                    error_body = e.response.text[:200]
+                    logger.debug(f"{self.name}: HTTP {status} для {url} с params {params}: {error_body}")
+                except:
+                    logger.debug(f"{self.name}: HTTP {status} для {url} с params {params}")
         except (httpx.RequestError, asyncio.TimeoutError) as e:
-            logger.debug(f"{self.name}: Ошибка соединения для {url}: {e}")
+            logger.warning(f"{self.name}: Ошибка соединения для {url} с params {params}: {e}")
+        except Exception as e:
+            logger.warning(f"{self.name}: Неожиданная ошибка для {url} с params {params}: {e}")
         return None
 

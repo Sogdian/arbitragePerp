@@ -1,77 +1,21 @@
-2026-01-08 15:59:34,705 - __main__ - INFO - Обработка арбитража для CVC: Long на bybit, Short на gate
-2026-01-08 15:59:34,975 - httpx - INFO - HTTP Request: GET https://api.bybit.com/v5/market/tickers?category=linear&symbol=CVCUSDT "HTTP/1.1 200 OK"
-2026-01-08 15:59:34,977 - httpx - INFO - HTTP Request: GET https://api.bybit.com/v5/market/funding/history?category=linear&symbol=CVCUSDT&limit=1 "HTTP/1.1 200 OK"
-2026-01-08 15:59:35,713 - httpx - INFO - HTTP Request: GET https://api.gateio.ws/api/v4/futures/usdt/tickers?contract=CVC_USDT "HTTP/1.1 200 OK"
-2026-01-08 15:59:36,254 - httpx - INFO - HTTP Request: GET https://api.gateio.ws/api/v4/futures/usdt/funding_rate?contract=CVC_USDT "HTTP/1.1 200 OK"
-2026-01-08 15:59:36,255 - __main__ - INFO - ============================================================
-2026-01-08 15:59:36,256 - __main__ - INFO - Анализ арбитража для CVC
-2026-01-08 15:59:36,256 - __main__ - INFO - ============================================================
-2026-01-08 15:59:36,257 - __main__ - INFO - Цена монеты на фьючерс (CVC) bybit: 0.04929
-2026-01-08 15:59:36,257 - __main__ - INFO - Фандинг (CVC) bybit: -0.128388%
-2026-01-08 15:59:36,257 - __main__ - INFO - Цена монеты на фьючерс (CVC) gate: 0.04939
-2026-01-08 15:59:36,257 - __main__ - INFO - Фандинг (CVC) gate: -0.189400%
-2026-01-08 15:59:36,257 - __main__ - INFO - Спред на цену на фьючерс (bybit и gate): -0.2025%
-2026-01-08 15:59:36,257 - __main__ - INFO - Спред на фандинги (bybit и gate): 0.061012%
-2026-01-08 15:59:36,258 - __main__ - INFO - ============================================================
-2026-01-08 16:19:55,652 - __main__ - INFO - Обработка арбитража для CVC: Long на bybit, Short на gate
-2026-01-08 16:19:55,906 - httpx - INFO - HTTP Request: GET https://api.bybit.com/v5/market/tickers?category=linear&symbol=CVCUSDT "HTTP/1.1 200 OK"
-2026-01-08 16:19:55,912 - httpx - INFO - HTTP Request: GET https://api.bybit.com/v5/market/funding/history?category=linear&symbol=CVCUSDT&limit=1 "HTTP/1.1 200 OK"
-2026-01-08 16:19:56,628 - httpx - INFO - HTTP Request: GET https://api.gateio.ws/api/v4/futures/usdt/funding_rate?contract=CVC_USDT "HTTP/1.1 200 OK"
-2026-01-08 16:19:56,631 - httpx - INFO - HTTP Request: GET https://api.gateio.ws/api/v4/futures/usdt/tickers?contract=CVC_USDT "HTTP/1.1 200 OK"
-2026-01-08 16:19:56,633 - __main__ - INFO - ============================================================
-2026-01-08 16:19:56,634 - __main__ - INFO - Анализ арбитража для CVC
-2026-01-08 16:19:56,634 - __main__ - INFO - ============================================================
-2026-01-08 16:19:56,634 - __main__ - INFO - Цена монеты на фьючерс (CVC) bybit: 0.04942
-2026-01-08 16:19:56,635 - __main__ - INFO - Фандинг (CVC) bybit: -0.177921%
-2026-01-08 16:19:56,635 - __main__ - INFO - Цена монеты на фьючерс (CVC) gate: 0.04944
-2026-01-08 16:19:56,635 - __main__ - INFO - Фандинг (CVC) gate: -0.235200%
-2026-01-08 16:19:56,635 - __main__ - INFO - Спред на цену на фьючерс (bybit и gate): -0.0405%
-2026-01-08 16:19:56,636 - __main__ - INFO - Спред на фандинги (bybit и gate): 0.057279%
-2026-01-08 16:19:56,636 - __main__ - INFO - ============================================================
-2026-01-08 16:20:58,111 - __main__ - INFO - Обработка арбитража для CVC: Long на bybit, Short на gate
-2026-01-08 16:20:58,383 - httpx - INFO - HTTP Request: GET https://api.bybit.com/v5/market/tickers?category=linear&symbol=CVCUSDT "HTTP/1.1 200 OK"
-2026-01-08 16:20:58,392 - httpx - INFO - HTTP Request: GET https://api.bybit.com/v5/market/funding/history?category=linear&symbol=CVCUSDT&limit=1 "HTTP/1.1 200 OK"
-2026-01-08 16:20:59,085 - httpx - INFO - HTTP Request: GET https://api.gateio.ws/api/v4/futures/usdt/funding_rate?contract=CVC_USDT "HTTP/1.1 200 OK"
-2026-01-08 16:20:59,091 - httpx - INFO - HTTP Request: GET https://api.gateio.ws/api/v4/futures/usdt/tickers?contract=CVC_USDT "HTTP/1.1 200 OK"
-2026-01-08 16:20:59,093 - __main__ - INFO - ============================================================
-2026-01-08 16:20:59,093 - __main__ - INFO - Анализ арбитража для CVC
-2026-01-08 16:20:59,093 - __main__ - INFO - ============================================================
-2026-01-08 16:20:59,094 - __main__ - INFO - Цена монеты на фьючерс (CVC) bybit: 0.04943
-2026-01-08 16:20:59,094 - __main__ - INFO - Фандинг (CVC) bybit: -0.177921%
-2026-01-08 16:20:59,094 - __main__ - INFO - Цена монеты на фьючерс (CVC) gate: 0.0495
-2026-01-08 16:20:59,094 - __main__ - INFO - Фандинг (CVC) gate: -0.235200%
-2026-01-08 16:20:59,095 - __main__ - INFO - Спред на цену на фьючерс (bybit и gate): -0.1414%
-2026-01-08 16:20:59,095 - __main__ - INFO - Спред на фандинги (bybit и gate): 0.057279%
-2026-01-08 16:20:59,095 - __main__ - INFO - ============================================================
-2026-01-08 16:23:18,140 - __main__ - INFO - Обработка арбитража для CVC: Long на bybit, Short на gate
-2026-01-08 16:23:18,381 - httpx - INFO - HTTP Request: GET https://api.bybit.com/v5/market/tickers?category=linear&symbol=CVCUSDT "HTTP/1.1 200 OK"
-2026-01-08 16:23:18,394 - httpx - INFO - HTTP Request: GET https://api.bybit.com/v5/market/funding/history?category=linear&symbol=CVCUSDT&limit=1 "HTTP/1.1 200 OK"
-2026-01-08 16:23:19,151 - httpx - INFO - HTTP Request: GET https://api.gateio.ws/api/v4/futures/usdt/funding_rate?contract=CVC_USDT "HTTP/1.1 200 OK"
-2026-01-08 16:23:19,169 - httpx - INFO - HTTP Request: GET https://api.gateio.ws/api/v4/futures/usdt/tickers?contract=CVC_USDT "HTTP/1.1 200 OK"
-2026-01-08 16:23:19,170 - __main__ - INFO - ============================================================
-2026-01-08 16:23:19,171 - __main__ - INFO - Анализ арбитража для CVC
-2026-01-08 16:23:19,171 - __main__ - INFO - ============================================================
-2026-01-08 16:23:19,171 - __main__ - INFO - Цена монеты на фьючерс (CVC) bybit: 0.04937
-2026-01-08 16:23:19,171 - __main__ - INFO - Фандинг (CVC) bybit: -0.177921%
-2026-01-08 16:23:19,171 - __main__ - INFO - Цена монеты на фьючерс (CVC) gate: 0.04946
-2026-01-08 16:23:19,172 - __main__ - INFO - Фандинг (CVC) gate: -0.235200%
-2026-01-08 16:23:19,172 - __main__ - INFO - Спред на цену на фьючерс (bybit и gate): -0.1820%
-2026-01-08 16:23:19,172 - __main__ - INFO - Спред на фандинги (bybit и gate): 0.057279%
-2026-01-08 16:23:19,172 - __main__ - INFO - Общий спред: -0.124686%
-2026-01-08 16:23:19,173 - __main__ - INFO - ============================================================
-2026-01-08 16:26:53,525 - __main__ - INFO - Обработка арбитража для CVC: Long на bybit, Short на gate
-2026-01-08 16:26:53,773 - httpx - INFO - HTTP Request: GET https://api.bybit.com/v5/market/funding/history?category=linear&symbol=CVCUSDT&limit=1 "HTTP/1.1 200 OK"
-2026-01-08 16:26:53,775 - httpx - INFO - HTTP Request: GET https://api.bybit.com/v5/market/tickers?category=linear&symbol=CVCUSDT "HTTP/1.1 200 OK"
-2026-01-08 16:26:54,503 - httpx - INFO - HTTP Request: GET https://api.gateio.ws/api/v4/futures/usdt/funding_rate?contract=CVC_USDT "HTTP/1.1 200 OK"
-2026-01-08 16:26:54,506 - httpx - INFO - HTTP Request: GET https://api.gateio.ws/api/v4/futures/usdt/tickers?contract=CVC_USDT "HTTP/1.1 200 OK"
-2026-01-08 16:26:54,508 - __main__ - INFO - ============================================================
-2026-01-08 16:26:54,508 - __main__ - INFO - Анализ арбитража для CVC
-2026-01-08 16:26:54,508 - __main__ - INFO - ============================================================
-2026-01-08 16:26:54,508 - __main__ - INFO - (bybit) Цена монеты на фьючерс (CVC): 0.04968
-2026-01-08 16:26:54,509 - __main__ - INFO - (bybit) Фандинг (CVC): -0.177921%
-2026-01-08 16:26:54,509 - __main__ - INFO - (gate) Цена монеты на фьючерс (CVC): 0.04977
-2026-01-08 16:26:54,509 - __main__ - INFO - (gate) Фандинг (CVC): -0.235200%
-2026-01-08 16:26:54,509 - __main__ - INFO - (bybit и gate) Спред на цену на фьючерс: -0.1808%
-2026-01-08 16:26:54,510 - __main__ - INFO - (bybit и gate) Спред на фандинги: 0.057279%
-2026-01-08 16:26:54,510 - __main__ - INFO - (bybit и gate) Общий спред: -0.123553%
-2026-01-08 16:26:54,510 - __main__ - INFO - ============================================================
+2026-01-08 19:12:36,589 - __main__ - INFO - Обработка арбитража для IOTA: Long на mexc, Short на lbank
+2026-01-08 19:12:36,623 - exchanges.async_base_exchange - WARNING - LBank: Ошибка соединения для /v2/futures/ticker с params {'symbol': 'IOTAUSDT'}: [Errno 11001] getaddrinfo failed
+2026-01-08 19:12:36,625 - exchanges.async_base_exchange - WARNING - LBank: Ошибка соединения для /v2/futures/fundingRate с params {'symbol': 'IOTAUSDT'}: [Errno 11001] getaddrinfo failed
+2026-01-08 19:12:36,979 - httpx - INFO - HTTP Request: GET https://contract.mexc.com/api/v1/contract/ticker?symbol=IOTA_USDT "HTTP/1.1 200 OK"
+2026-01-08 19:12:36,996 - httpx - INFO - HTTP Request: GET https://www.lbank.com/v2/futures/ticker?symbol=IOTAUSDT "HTTP/1.1 404 Not Found"
+2026-01-08 19:12:37,004 - exchanges.async_lbank - WARNING - LBank: не удалось получить тикер для IOTA
+2026-01-08 19:12:37,005 - exchanges.async_lbank - WARNING - LBank: публичный API для фьючерсов недоступен. LBank не предоставляет публичный API для получения данных о фьючерсах или требует аутентификацию.
+2026-01-08 19:12:37,013 - httpx - INFO - HTTP Request: GET https://www.lbank.com/v2/futures/fundingRate?symbol=IOTAUSDT "HTTP/1.1 404 Not Found"
+2026-01-08 19:12:37,027 - exchanges.async_lbank - WARNING - LBank: не удалось получить фандинг для IOTA
+2026-01-08 19:12:37,029 - exchanges.async_lbank - WARNING - LBank: публичный API для фьючерсов недоступен. LBank не предоставляет публичный API для получения данных о фьючерсах или требует аутентификацию.
+2026-01-08 19:12:37,454 - httpx - INFO - HTTP Request: GET https://contract.mexc.com/api/v1/contract/funding_rate?symbol=IOTA_USDT "HTTP/1.1 200 OK"
+2026-01-08 19:12:37,459 - __main__ - INFO - ============================================================
+2026-01-08 19:12:37,459 - __main__ - INFO - Анализ арбитража для IOTA
+2026-01-08 19:12:37,459 - __main__ - INFO - ============================================================
+2026-01-08 19:12:37,459 - __main__ - INFO - (mexc) Цена монеты на фьючерс (IOTA): 0.1046
+2026-01-08 19:12:37,460 - __main__ - INFO - (mexc) Фандинг (IOTA): 0.001600%
+2026-01-08 19:12:37,460 - __main__ - ERROR - Не удалось получить данные с lbank
+2026-01-08 19:12:37,460 - __main__ - INFO - (mexc и lbank) Спред на цену на фьючерс: недоступно
+2026-01-08 19:12:37,461 - __main__ - INFO - (mexc и lbank) Спред на фандинги: недоступно
+2026-01-08 19:12:37,461 - __main__ - INFO - (mexc и lbank) Общий спред: невозможно вычислить
+2026-01-08 19:12:37,461 - __main__ - INFO - ============================================================
