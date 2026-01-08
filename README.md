@@ -18,12 +18,9 @@ pip install -r requirements.txt
 LOG_FILE=arbitrage_perp_bot.log
 LOG_LEVEL=INFO
 ```
-
-**Важно:** API ключи не требуются! Бот использует только публичные эндпоинты для получения данных о ценах и фандингах.
-
 ## Использование
 
-### Способ 1: Аргумент командной строки
+### Способ 1: Аргумент командной строки (пример)
 ```bash
 python bot.py "CVC Long (bybit), Short (gate)"
 ```

@@ -1,13 +1,9 @@
 """
 Асинхронная реализация LBank для фьючерсов на базе AsyncBaseExchange
 
-ВАЖНО: LBank, похоже, требует API ключи для доступа к данным о фьючерсах.
-Публичный API для фьючерсов может быть недоступен или ограничен.
-
-Если запросы не работают:
-1. Проверьте официальную документацию LBank API
-2. Возможно, требуется аутентификация через API ключи
-3. Рассмотрите использование других бирж (Bybit, Gate.io, MEXC) для арбитража
+Использует публичный API LBank для фьючерсов:
+- Базовый URL: https://lbkperp.lbank.com
+- Эндпоинты: /cfd/openApi/v1/pub/*
 """
 from typing import Dict, Optional
 import logging
@@ -17,22 +13,80 @@ logger = logging.getLogger(__name__)
 
 
 class AsyncLbankExchange(AsyncBaseExchange):
-    # LBank может использовать разные базовые URL для фьючерсов
-    # Пробуем разные варианты базовых URL
-    BASE_URL = "https://api.lbank.com"
+    # LBank использует отдельный домен для фьючерсов (perp)
+    BASE_URL = "https://lbkperp.lbank.com"
+    PRODUCT_GROUP = "SwapU"  # Обязательный параметр для получения данных
     
     def __init__(self, pool_limit: int = 100):
         super().__init__("LBank", pool_limit)
-        # Альтернативные базовые URL для фьючерсов
-        self.alternative_base_urls = [
-            "https://www.lbank.com",
-            "https://api.lbank.info",
-        ]
 
     def _normalize_symbol(self, coin: str) -> str:
         """Преобразует монету в формат LBank для фьючерсов (например, CVC -> CVCUSDT)"""
-        # LBank может использовать формат без подчеркивания
+        # LBank использует формат без подчеркивания для фьючерсов
         return f"{coin.upper()}USDT"
+    
+    def _pick_market_item(self, data: dict, symbol_to_use: str) -> Optional[dict]:
+        """
+        Выбирает из marketData ровно тот элемент, у которого symbol == symbol_to_use.
+        
+        Args:
+            data: Ответ от API marketData
+            symbol_to_use: Символ для поиска (например, "IOTAUSDT")
+            
+        Returns:
+            Словарь с данными инструмента или None если не найден
+        """
+        if not isinstance(data, dict) or "data" not in data:
+            logger.debug(f"LBank _pick_market_item: data не является dict или нет поля 'data'")
+            return None
+        
+        symbol_upper = symbol_to_use.upper()
+        payload = data.get("data")
+        
+        # Иногда приходит dict, иногда list
+        if isinstance(payload, dict):
+            item_symbol = (payload.get("symbol") or "").upper()
+            if item_symbol == symbol_upper:
+                logger.debug(f"LBank _pick_market_item: найден {symbol_to_use} в dict")
+                return payload
+            else:
+                logger.debug(f"LBank _pick_market_item: dict содержит {item_symbol}, ищем {symbol_upper}")
+                return None
+        
+        if isinstance(payload, list):
+            found_count = 0
+            for it in payload:
+                if isinstance(it, dict):
+                    item_symbol = (it.get("symbol") or "").upper()
+                    if item_symbol == symbol_upper:
+                        logger.debug(f"LBank _pick_market_item: найден {symbol_to_use} в списке на позиции {found_count}")
+                        return it
+                    found_count += 1
+            logger.debug(f"LBank _pick_market_item: {symbol_to_use} не найден в списке из {len(payload)} элементов")
+            # Логируем первые несколько символов для отладки
+            if len(payload) > 0:
+                first_symbols = [it.get("symbol") for it in payload[:5] if isinstance(it, dict)]
+                logger.debug(f"LBank _pick_market_item: первые символы в списке: {first_symbols}")
+            return None
+        
+        logger.debug(f"LBank _pick_market_item: payload имеет неожиданный тип: {type(payload)}")
+        return None
+    
+    async def get_available_instruments(self) -> Optional[list]:
+        """
+        Получить список доступных инструментов на LBank
+        Может быть полезно для отладки формата символов
+        """
+        try:
+            url = "/cfd/openApi/v1/pub/instrument"
+            params = {"productGroup": self.PRODUCT_GROUP}
+            data = await self._request_json("GET", url, params=params)
+            if data and data.get("data") and isinstance(data["data"], list):
+                return data["data"]
+            return None
+        except Exception as e:
+            logger.debug(f"LBank: ошибка при получении списка инструментов: {e}")
+            return None
 
     async def get_futures_ticker(self, coin: str) -> Optional[Dict]:
         """
@@ -51,40 +105,64 @@ class AsyncLbankExchange(AsyncBaseExchange):
             или None если ошибка
         """
         try:
-            symbol = self._normalize_symbol(coin)
-            # Пробуем только основной URL и один альтернативный
-            # LBank, похоже, не предоставляет публичный API для фьючерсов
-            base_urls_to_try = [self.BASE_URL, "https://www.lbank.com"]
+            symbol = self._normalize_symbol(coin)  # IOTAUSDT
             
-            # Основной эндпоинт
-            url = "/v2/futures/ticker"
-            param_name = "symbol"
+            # Сначала получаем список всех инструментов, чтобы найти правильный формат символа
+            url = "/cfd/openApi/v1/pub/instrument"
+            instruments_data = await self._request_json("GET", url, params={"productGroup": self.PRODUCT_GROUP})
             
-            data = None
-            for base_url in base_urls_to_try:
-                # Временно меняем базовый URL клиента
-                original_base_url = self.client.base_url
-                try:
-                    self.client.base_url = base_url
-                    # Пробуем только основной формат символа
-                    params = {param_name: symbol}
-                    data = await self._request_json("GET", url, params=params)
-                    if data:
-                        logger.info(f"LBank: успешный запрос к {base_url}{url}")
-                        # Парсим данные тикера
-                        parsed = self._parse_ticker_response(data, coin)
-                        if parsed:
-                            return parsed
-                finally:
-                    self.client.base_url = original_base_url
-                
-                if data:
-                    break
+            correct_symbol = None
+            if instruments_data and instruments_data.get("data"):
+                instruments_list = instruments_data.get("data")
+                if isinstance(instruments_list, list):
+                    # Ищем наш символ в списке инструментов
+                    for instrument in instruments_list:
+                        if isinstance(instrument, dict):
+                            inst_symbol = instrument.get("symbol") or instrument.get("instrumentId") or instrument.get("instrument_id")
+                            if inst_symbol:
+                                # Проверяем точное совпадение (приоритет) или точное окончание
+                                inst_symbol_upper = inst_symbol.upper()
+                                symbol_upper = symbol.upper()
+                                if symbol_upper == inst_symbol_upper:
+                                    # Точное совпадение - это то, что нужно
+                                    correct_symbol = inst_symbol
+                                    logger.debug(f"LBank: найден точный символ {correct_symbol} для {coin}")
+                                    break
+                                elif inst_symbol_upper.endswith(symbol_upper) and len(inst_symbol_upper) == len(symbol_upper):
+                                    # Точное окончание без дополнительных символов
+                                    correct_symbol = inst_symbol
+                                    logger.debug(f"LBank: найден символ {correct_symbol} для {coin} (по окончанию)")
+                                    # Не break, продолжаем искать точное совпадение
             
-            if not data:
-                logger.warning(f"LBank: не удалось получить тикер для {coin}")
-                logger.warning(f"LBank: публичный API для фьючерсов недоступен. LBank не предоставляет публичный API для получения данных о фьючерсах или требует аутентификацию.")
-                return None
+            # Используем найденный символ или исходный
+            symbol_to_use = correct_symbol or symbol
+            
+            # Пробуем получить данные через marketData с правильным символом
+            url = "/cfd/openApi/v1/pub/marketData"
+            params = {"productGroup": self.PRODUCT_GROUP, "symbol": symbol_to_use}
+            data = await self._request_json("GET", url, params=params)
+            
+            item = self._pick_market_item(data, symbol_to_use)
+            if item:
+                logger.debug(f"LBank marketData picked symbol={item.get('symbol')} lastPrice={item.get('lastPrice')} fundingRate={item.get('fundingRate')}")
+                parsed = self._parse_ticker_response({"data": item}, coin)
+                if parsed:
+                    logger.info(f"LBank: успешно получен тикер для {coin} (символ: {symbol_to_use})")
+                    return parsed
+            
+            # fallback: грузим весь список и ищем точное совпадение
+            data = await self._request_json("GET", url, params={"productGroup": self.PRODUCT_GROUP})
+            item = self._pick_market_item(data, symbol_to_use)
+            if item:
+                logger.debug(f"LBank marketData picked symbol={item.get('symbol')} lastPrice={item.get('lastPrice')} fundingRate={item.get('fundingRate')}")
+                parsed = self._parse_ticker_response({"data": item}, coin)
+                if parsed:
+                    logger.info(f"LBank: успешно получен тикер для {coin} из общего списка (символ: {symbol_to_use})")
+                    return parsed
+            
+            logger.warning(f"LBank: не удалось получить тикер для {coin}. API вернул пустой массив данных.")
+            logger.warning(f"LBank: проверьте доступность символа {coin} на LBank фьючерсах.")
+            return None
                 
         except Exception as e:
             logger.error(f"LBank: ошибка при получении тикера для {coin}: {e}", exc_info=True)
@@ -96,21 +174,49 @@ class AsyncLbankExchange(AsyncBaseExchange):
         item = None
         if isinstance(data, dict):
             if "data" in data:
-                item = data["data"]
+                data_list = data["data"]
+                # Проверяем, что data не пустой массив
+                if isinstance(data_list, list):
+                    if len(data_list) > 0:
+                        item = data_list[0]
+                    else:
+                        # Пустой массив - символ не найден
+                        return None
+                elif isinstance(data_list, dict):
+                    item = data_list
             elif "result" in data:
                 item = data["result"]
             else:
                 item = data
-        elif isinstance(data, list) and data:
+        elif isinstance(data, list) and len(data) > 0:
             item = data[0]
         
         if not item:
-            logger.warning(f"LBank: тикер для {coin} не найден в ответе")
             return None
         
-        # Извлекаем цены (проверяем разные возможные поля)
+        # Для depth эндпоинта: bids и asks - это массивы [цена, количество]
+        if "bids" in item and "asks" in item:
+            bids = item.get("bids", [])
+            asks = item.get("asks", [])
+            
+            if bids and asks:
+                try:
+                    bid = float(bids[0][0]) if isinstance(bids[0], list) else float(bids[0])
+                    ask = float(asks[0][0]) if isinstance(asks[0], list) else float(asks[0])
+                    # Используем среднюю цену как текущую цену
+                    price = (bid + ask) / 2
+                    
+                    return {
+                        "price": price,
+                        "bid": bid,
+                        "ask": ask,
+                    }
+                except (ValueError, TypeError, IndexError) as e:
+                    logger.warning(f"LBank: ошибка парсинга depth для {coin}: {e}")
+        
+        # Для marketData эндпоинта: проверяем стандартные поля
         last_price_raw = (item.get("lastPrice") or item.get("last") or item.get("close") or 
-                        item.get("price") or item.get("latestPrice"))
+                        item.get("price") or item.get("latestPrice") or item.get("markPrice"))
         bid_raw = (item.get("bidPrice") or item.get("bid1") or item.get("bid") or 
                   item.get("bestBid") or item.get("buy"))
         ask_raw = (item.get("askPrice") or item.get("ask1") or item.get("ask") or 
@@ -142,40 +248,82 @@ class AsyncLbankExchange(AsyncBaseExchange):
             coin: Название монеты без /USDT (например, "CVC")
             
         Returns:
-            Ставка фандинга (например, 0.0001 = 0.01%) или None если ошибка
+            Ставка фандинга в decimal формате (например, 0.0001 = 0.01%) или None если ошибка
+            Примечание: bot.py умножает на 100 для отображения в процентах
         """
         try:
-            symbol = self._normalize_symbol(coin)
-            # Пробуем только основной URL и один альтернативный
-            # LBank, похоже, не предоставляет публичный API для фьючерсов
-            base_urls_to_try = [self.BASE_URL, "https://www.lbank.com"]
+            symbol = self._normalize_symbol(coin)  # IOTAUSDT
             
-            url = "/v2/futures/fundingRate"
-            param_name = "symbol"
+            # Сначала получаем список всех инструментов, чтобы найти правильный формат символа
+            url = "/cfd/openApi/v1/pub/instrument"
+            instruments_data = await self._request_json("GET", url, params={"productGroup": self.PRODUCT_GROUP})
             
-            data = None
-            for base_url in base_urls_to_try:
-                original_base_url = self.client.base_url
-                try:
-                    self.client.base_url = base_url
-                    # Пробуем только основной формат символа
-                    params = {param_name: symbol}
-                    data = await self._request_json("GET", url, params=params)
-                    if data:
-                        logger.info(f"LBank: успешный запрос к {base_url}{url}")
-                        parsed = self._parse_funding_response(data, coin)
-                        if parsed is not None:
-                            return parsed
-                finally:
-                    self.client.base_url = original_base_url
-                
-                if data:
-                    break
+            correct_symbol = None
+            if instruments_data and instruments_data.get("data"):
+                instruments_list = instruments_data.get("data")
+                if isinstance(instruments_list, list):
+                    # Ищем наш символ в списке инструментов
+                    for instrument in instruments_list:
+                        if isinstance(instrument, dict):
+                            inst_symbol = instrument.get("symbol") or instrument.get("instrumentId") or instrument.get("instrument_id")
+                            if inst_symbol:
+                                # Проверяем точное совпадение (приоритет) или точное окончание
+                                inst_symbol_upper = inst_symbol.upper()
+                                symbol_upper = symbol.upper()
+                                if symbol_upper == inst_symbol_upper:
+                                    # Точное совпадение - это то, что нужно
+                                    correct_symbol = inst_symbol
+                                    logger.debug(f"LBank: найден точный символ {correct_symbol} для {coin} (фандинг)")
+                                    break
+                                elif inst_symbol_upper.endswith(symbol_upper) and len(inst_symbol_upper) == len(symbol_upper):
+                                    # Точное окончание без дополнительных символов
+                                    correct_symbol = inst_symbol
+                                    logger.debug(f"LBank: найден символ {correct_symbol} для {coin} (фандинг, по окончанию)")
+                                    # Не break, продолжаем искать точное совпадение
             
-            if not data:
-                logger.warning(f"LBank: не удалось получить фандинг для {coin}")
-                logger.warning(f"LBank: публичный API для фьючерсов недоступен. LBank не предоставляет публичный API для получения данных о фьючерсах или требует аутентификацию.")
-                return None
+            # Используем найденный символ или исходный
+            symbol_to_use = correct_symbol or symbol
+            
+            # Пробуем получить фандинг через marketData с правильным символом
+            url = "/cfd/openApi/v1/pub/marketData"
+            params = {"productGroup": self.PRODUCT_GROUP, "symbol": symbol_to_use}
+            data = await self._request_json("GET", url, params=params)
+            
+            item = self._pick_market_item(data, symbol_to_use)
+            if item:
+                item_symbol = item.get('symbol')
+                item_funding_rate = item.get('fundingRate')
+                item_position_fee_rate = item.get('positionFeeRate')
+                logger.info(f"LBank marketData picked symbol={item_symbol} lastPrice={item.get('lastPrice')} fundingRate={item_funding_rate} positionFeeRate={item_position_fee_rate}")
+                if item_symbol and item_symbol.upper() != symbol_to_use.upper():
+                    logger.warning(f"LBank: ВНИМАНИЕ! Выбран неправильный символ: {item_symbol} вместо {symbol_to_use}")
+                parsed = self._parse_funding_response({"data": item}, coin)
+                if parsed is not None:
+                    logger.info(f"LBank: успешно получен фандинг для {coin} (символ: {symbol_to_use}, значение: {parsed}%)")
+                    return parsed
+            else:
+                logger.warning(f"LBank: _pick_market_item не нашел {symbol_to_use} в ответе")
+            
+            # fallback: полный список
+            data = await self._request_json("GET", url, params={"productGroup": self.PRODUCT_GROUP})
+            item = self._pick_market_item(data, symbol_to_use)
+            if item:
+                item_symbol = item.get('symbol')
+                item_funding_rate = item.get('fundingRate')
+                item_position_fee_rate = item.get('positionFeeRate')
+                logger.info(f"LBank marketData picked (fallback) symbol={item_symbol} lastPrice={item.get('lastPrice')} fundingRate={item_funding_rate} positionFeeRate={item_position_fee_rate}")
+                if item_symbol and item_symbol.upper() != symbol_to_use.upper():
+                    logger.warning(f"LBank: ВНИМАНИЕ! Выбран неправильный символ в fallback: {item_symbol} вместо {symbol_to_use}")
+                parsed = self._parse_funding_response({"data": item}, coin)
+                if parsed is not None:
+                    logger.info(f"LBank: успешно получен фандинг для {coin} из общего списка (символ: {symbol_to_use}, значение: {parsed}%)")
+                    return parsed
+            else:
+                logger.warning(f"LBank: _pick_market_item не нашел {symbol_to_use} в fallback списке")
+            
+            logger.warning(f"LBank: не удалось получить фандинг для {coin}. API вернул пустой массив данных.")
+            logger.warning(f"LBank: проверьте доступность символа {coin} на LBank фьючерсах.")
+            return None
                 
         except Exception as e:
             logger.error(f"LBank: ошибка при получении фандинга для {coin}: {e}", exc_info=True)
@@ -188,35 +336,60 @@ class AsyncLbankExchange(AsyncBaseExchange):
         if isinstance(data, dict):
             if "data" in data:
                 data_list = data["data"]
-                if isinstance(data_list, list) and data_list:
-                    item = data_list[0]
+                # Проверяем, что data не пустой массив
+                if isinstance(data_list, list):
+                    if len(data_list) > 0:
+                        # Для истории фандинга - берем первую (последнюю) запись
+                        item = data_list[0]
+                    else:
+                        # Пустой массив - символ не найден
+                        return None
                 elif isinstance(data_list, dict):
                     item = data_list
             elif "result" in data:
                 result = data["result"]
-                if isinstance(result, list) and result:
+                if isinstance(result, list) and len(result) > 0:
                     item = result[0]
                 elif isinstance(result, dict):
                     item = result
             else:
                 item = data
-        elif isinstance(data, list) and data:
+        elif isinstance(data, list) and len(data) > 0:
             item = data[0]
         
         if not item:
-            logger.warning(f"LBank: фандинг для {coin} не найден в ответе")
             return None
         
         # LBank может возвращать ставку в разных полях
-        funding_rate_raw = item.get("fundingRate") or item.get("rate") or item.get("r") or item.get("funding_rate")
+        # Приоритет: fundingRate (основное поле) > positionFeeRate (альтернатива)
+        funding_rate_raw = item.get("fundingRate")
+        position_fee_rate_raw = item.get("positionFeeRate")
+        
+        # Логируем оба значения для отладки
+        logger.info(f"LBank _parse_funding_response для {coin}: fundingRate={funding_rate_raw}, positionFeeRate={position_fee_rate_raw}")
+        
+        # Используем fundingRate если есть, иначе positionFeeRate
+        if funding_rate_raw is not None:
+            funding_rate_raw = funding_rate_raw
+            logger.info(f"LBank: используем fundingRate={funding_rate_raw} для {coin}")
+        elif position_fee_rate_raw is not None:
+            funding_rate_raw = position_fee_rate_raw
+            logger.warning(f"LBank: используем positionFeeRate={position_fee_rate_raw} вместо fundingRate для {coin}")
+        else:
+            # Пробуем другие поля
+            funding_rate_raw = (item.get("rate") or item.get("r") or
+                              item.get("funding_rate") or
+                              item.get("fundRate") or item.get("fund_rate"))
         
         if funding_rate_raw is None:
-            logger.warning(f"LBank: нет ставки фандинга для {coin} в ответе: {item}")
+            logger.warning(f"LBank: нет ставки фандинга для {coin} в ответе. Доступные поля: {list(item.keys()) if isinstance(item, dict) else 'N/A'}")
             return None
         
         try:
-            funding_rate = float(funding_rate_raw)
-            return funding_rate
+            funding_rate_decimal = float(funding_rate_raw)   # например 0.00001122
+            # Возвращаем в decimal формате (как другие биржи), bot.py умножит на 100 для отображения
+            logger.info(f"LBank: получен фандинг для {coin}: {funding_rate_decimal} (будет показано как {funding_rate_decimal * 100}%)")
+            return funding_rate_decimal
         except (ValueError, TypeError) as e:
             logger.warning(f"LBank: ошибка парсинга фандинга для {coin}: {e}")
             return None
