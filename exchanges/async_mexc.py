@@ -126,11 +126,34 @@ class AsyncMexcExchange(AsyncBaseExchange):
                     return None
                 
                 item = data.get("data")
-                # Если data - это список, берем первый элемент
+                # Если data - это список, ищем элемент с правильным символом
                 if isinstance(item, list) and item:
-                    item = item[0]
+                    # Ищем элемент с нужным символом
+                    symbol_to_find = self._normalize_symbol(coin)
+                    for elem in item:
+                        if isinstance(elem, dict) and elem.get("symbol") == symbol_to_find:
+                            item = elem
+                            break
+                    else:
+                        # Если не нашли, берем первый элемент (fallback)
+                        item = item[0]
+                elif isinstance(item, dict):
+                    # Проверяем, что символ совпадает
+                    item_symbol = item.get("symbol")
+                    symbol_to_find = self._normalize_symbol(coin)
+                    if item_symbol and item_symbol != symbol_to_find:
+                        logger.warning(f"MEXC: получен фандинг для {item_symbol} вместо {symbol_to_find}")
+                        return None
             elif isinstance(data, list) and data:
-                item = data[0]
+                # Ищем элемент с правильным символом
+                symbol_to_find = self._normalize_symbol(coin)
+                for elem in data:
+                    if isinstance(elem, dict) and elem.get("symbol") == symbol_to_find:
+                        item = elem
+                        break
+                else:
+                    # Если не нашли, берем первый элемент (fallback)
+                    item = data[0]
             
             if not item:
                 logger.warning(f"MEXC: фандинг для {coin} не найден")
@@ -139,6 +162,13 @@ class AsyncMexcExchange(AsyncBaseExchange):
             # Проверяем, что item - это словарь
             if not isinstance(item, dict):
                 logger.warning(f"MEXC: неожиданный формат данных для фандинга {coin}: {type(item)}")
+                return None
+            
+            # Проверяем, что символ совпадает
+            item_symbol = item.get("symbol")
+            symbol_to_find = self._normalize_symbol(coin)
+            if item_symbol and item_symbol != symbol_to_find:
+                logger.warning(f"MEXC: получен фандинг для {item_symbol} вместо {symbol_to_find}, пропускаем")
                 return None
             
             # MEXC может возвращать ставку в разных полях
@@ -150,6 +180,9 @@ class AsyncMexcExchange(AsyncBaseExchange):
             
             try:
                 funding_rate = float(funding_rate_raw)
+                # MEXC возвращает фандинг уже в decimal формате (например, 0.000052 = 0.0052%)
+                # как и другие биржи, поэтому просто возвращаем значение
+                # bot.py потом умножит на 100 для отображения
                 return funding_rate
             except (ValueError, TypeError) as e:
                 logger.warning(f"MEXC: ошибка парсинга фандинга для {coin}: {e}")
