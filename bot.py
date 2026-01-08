@@ -249,6 +249,137 @@ class PerpArbitrageBot:
             logger.info(f"({long_exchange} и {short_exchange}) Общий спред: невозможно вычислить")
         
         logger.info("=" * 60)
+        
+        # Сохраняем данные для мониторинга
+        return {
+            "coin": coin,
+            "long_exchange": long_exchange,
+            "short_exchange": short_exchange,
+            "long_data": long_data,
+            "short_data": short_data
+        }
+    
+    def calculate_opening_spread(self, ask_long: Optional[float], bid_short: Optional[float]) -> Optional[float]:
+        """
+        Вычислить спред открытия позиции (max)
+        
+        Формула: (ask_long - bid_short) / bid_short * 100
+        
+        Args:
+            ask_long: Цена ask на бирже Long
+            bid_short: Цена bid на бирже Short
+            
+        Returns:
+            Спред открытия в процентах или None
+        """
+        if ask_long is None or bid_short is None:
+            return None
+        
+        if bid_short == 0:
+            return None
+        
+        spread = ((ask_long - bid_short) / bid_short) * 100
+        return spread
+    
+    def calculate_closing_spread(self, bid_long: Optional[float], ask_short: Optional[float]) -> Optional[float]:
+        """
+        Вычислить спред закрытия позиции (min)
+        
+        Формула: (bid_long - ask_short) / ask_short * 100
+        
+        Args:
+            bid_long: Цена bid на бирже Long
+            ask_short: Цена ask на бирже Short
+            
+        Returns:
+            Спред закрытия в процентах или None
+        """
+        if bid_long is None or ask_short is None:
+            return None
+        
+        if ask_short == 0:
+            return None
+        
+        spread = ((bid_long - ask_short) / ask_short) * 100
+        return spread
+    
+    async def monitor_spreads(self, coin: str, long_exchange: str, short_exchange: str):
+        """
+        Мониторинг спредов открытия и закрытия каждую секунду
+        
+        Args:
+            coin: Название монеты
+            long_exchange: Биржа для Long позиции
+            short_exchange: Биржа для Short позиции
+        """
+        logger.info("=" * 60)
+        logger.info(f"Начало мониторинга спредов для {coin}")
+        logger.info("=" * 60)
+        
+        try:
+            while True:
+                # Получаем данные с обеих бирж параллельно
+                long_data_task = self.get_futures_data(long_exchange, coin)
+                short_data_task = self.get_futures_data(short_exchange, coin)
+                
+                long_data, short_data = await asyncio.gather(
+                    long_data_task,
+                    short_data_task,
+                    return_exceptions=True
+                )
+                
+                if isinstance(long_data, Exception):
+                    logger.error(f"Ошибка при получении данных с {long_exchange}: {long_data}")
+                    long_data = None
+                
+                if isinstance(short_data, Exception):
+                    logger.error(f"Ошибка при получении данных с {short_exchange}: {short_data}")
+                    short_data = None
+                
+                if long_data and short_data:
+                    # Извлекаем данные
+                    ask_long = long_data.get("ask")
+                    bid_long = long_data.get("bid")
+                    funding_long = long_data.get("funding_rate")
+                    
+                    bid_short = short_data.get("bid")
+                    ask_short = short_data.get("ask")
+                    funding_short = short_data.get("funding_rate")
+                    
+                    # Рассчитываем спреды
+                    opening_spread = self.calculate_opening_spread(ask_long, bid_short)
+                    closing_spread = self.calculate_closing_spread(bid_long, ask_short)
+                    
+                    # Форматируем фандинги в проценты
+                    funding_long_pct = funding_long * 100 if funding_long is not None else None
+                    funding_short_pct = funding_short * 100 if funding_short is not None else None
+                    
+                    # Рассчитываем спред на фандинг
+                    fr_spread = None
+                    if funding_long_pct is not None and funding_short_pct is not None:
+                        fr_spread = funding_long_pct - funding_short_pct
+                    
+                    # Формируем строку вывода
+                    closing_str = f"Закрытие (min): {closing_spread:.2f}" if closing_spread is not None else "Закрытие (min): N/A"
+                    opening_str = f"Открытие (max): {opening_spread:.2f}" if opening_spread is not None else "Открытие (max): N/A"
+                    
+                    coin_str = coin
+                    long_fr_str = f"{funding_long_pct:.2f}" if funding_long_pct is not None else "N/A"
+                    short_fr_str = f"{funding_short_pct:.2f}" if funding_short_pct is not None else "N/A"
+                    fr_spread_str = f"{fr_spread:.3f}" if fr_spread is not None else "N/A"
+                    
+                    # Выводим одной строкой
+                    logger.info(f"{closing_str} {coin_str}: long fr {long_fr_str}, short fr {short_fr_str}, fr spread {fr_spread_str} | {opening_str} {coin_str}: long fr {long_fr_str}, short fr {short_fr_str}, fr spread {fr_spread_str}")
+                
+                # Ждем 1 секунду перед следующей итерацией
+                await asyncio.sleep(1)
+                
+        except KeyboardInterrupt:
+            logger.info("=" * 60)
+            logger.info("Мониторинг прерван пользователем")
+            logger.info("=" * 60)
+        except Exception as e:
+            logger.error(f"Ошибка в мониторинге: {e}", exc_info=True)
 
 
 async def main():
@@ -270,7 +401,24 @@ async def main():
             logger.error("Не указаны вводные данные")
             return
         
-        await bot.process_input(input_text)
+        # Обрабатываем вводные данные и получаем информацию для мониторинга
+        monitoring_data = await bot.process_input(input_text)
+        
+        if monitoring_data:
+            # Спрашиваем про ручное открытие позиций
+            print("\nБыло ли ручное открытие позиций (long и short)?")
+            print("Введите 'Да' или 'Нет':")
+            answer = input().strip().lower()
+            
+            if answer == "да" or answer == "yes" or answer == "y":
+                # Запускаем мониторинг
+                await bot.monitor_spreads(
+                    monitoring_data["coin"],
+                    monitoring_data["long_exchange"],
+                    monitoring_data["short_exchange"]
+                )
+            else:
+                logger.info("Мониторинг не запущен")
         
     except KeyboardInterrupt:
         logger.info("Прервано пользователем")
