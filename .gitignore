@@ -1,11 +1,16 @@
 .env
+
+# Log files
+*.log
 arbitrage_perp_bot.log
 
 # Python cache files
 __pycache__/
 *.py[cod]
+*.pyc
+*.pyo
+*.pyd
 *$py.class
 *.so
 .Python
-*.log
 
