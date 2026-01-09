@@ -210,13 +210,13 @@ class PerpArbitrageBot:
             price_long = long_data.get("price")
             funding_long = long_data.get("funding_rate")
             
-            logger.info(f"({long_exchange}) Цена монеты на фьючерс ({coin}): {price_long}")
+            logger.info(f"({long_exchange} Long) ({coin}) Цена: {price_long}")
             
             if funding_long is not None:
                 funding_long_pct = funding_long * 100
-                logger.info(f"({long_exchange}) Фандинг ({coin}): {funding_long_pct:.6f}%")
+                logger.info(f"({long_exchange} Long) ({coin}) Фандинг: {funding_long_pct:.6f}%")
             else:
-                logger.info(f"({long_exchange}) Фандинг ({coin}): недоступно")
+                logger.info(f"({long_exchange} Long) ({coin}) Фандинг: недоступно")
         else:
             logger.error(f"Не удалось получить данные с {long_exchange}")
             price_long = None
@@ -227,13 +227,13 @@ class PerpArbitrageBot:
             price_short = short_data.get("price")
             funding_short = short_data.get("funding_rate")
             
-            logger.info(f"({short_exchange}) Цена монеты на фьючерс ({coin}): {price_short}")
+            logger.info(f"({short_exchange} Short) ({coin}) Цена: {price_short}")
             
             if funding_short is not None:
                 funding_short_pct = funding_short * 100
-                logger.info(f"({short_exchange}) Фандинг ({coin}): {funding_short_pct:.6f}%")
+                logger.info(f"({short_exchange} Short) ({coin}) Фандинг: {funding_short_pct:.6f}%")
             else:
-                logger.info(f"({short_exchange}) Фандинг ({coin}): недоступно")
+                logger.info(f"({short_exchange} Short) ({coin}) Фандинг: недоступно")
         else:
             logger.error(f"Не удалось получить данные с {short_exchange}")
             price_short = None
@@ -244,11 +244,11 @@ class PerpArbitrageBot:
         if price_long is not None and price_short is not None:
             price_spread = self.calculate_spread(price_long, price_short)
             if price_spread is not None:
-                logger.info(f"({long_exchange} и {short_exchange}) Спред на цену на фьючерс: {price_spread:.4f}%")
+                logger.info(f"({long_exchange} и {short_exchange}) Спред на цену: {price_spread:.4f}%")
             else:
-                logger.info(f"({long_exchange} и {short_exchange}) Спред на цену на фьючерс: невозможно вычислить")
+                logger.info(f"({long_exchange} и {short_exchange}) Спред на цену: невозможно вычислить")
         else:
-            logger.info(f"({long_exchange} и {short_exchange}) Спред на цену на фьючерс: недоступно")
+            logger.info(f"({long_exchange} и {short_exchange}) Спред на цену: недоступно")
         
         if funding_long is not None and funding_short is not None:
             funding_spread = self.calculate_funding_spread(funding_long, funding_short)
