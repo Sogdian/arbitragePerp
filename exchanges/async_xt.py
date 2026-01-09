@@ -121,3 +121,54 @@ class AsyncXtExchange(AsyncBaseExchange):
             logger.error(f"XT: ошибка при получении фандинга для {coin}: {e}", exc_info=True)
             return None
 
+    async def get_orderbook(self, coin: str, limit: int = 50) -> Optional[Dict]:
+        """
+        Получить orderbook (книгу заявок) для монеты
+        
+        Args:
+            coin: Название монеты без /USDT (например, "GPS")
+            limit: Количество уровней (по умолчанию 50)
+            
+        Returns:
+            Словарь с данными orderbook:
+            {
+                "bids": [[price, size], ...],  # Заявки на покупку (от высокой к низкой)
+                "asks": [[price, size], ...],  # Заявки на продажу (от низкой к высокой)
+            }
+            или None если ошибка
+        """
+        try:
+            symbol = self._normalize_symbol(coin)
+            url = "/future/market/v1/public/q/depth"
+            params = {"symbol": symbol, "limit": limit}
+            
+            data = await self._request_json("GET", url, params=params)
+            if not data:
+                logger.warning(f"XT: не удалось получить orderbook для {coin}")
+                return None
+            
+            return_code = data.get("returnCode")
+            if return_code != 0:
+                msg = data.get("msgInfo", "Unknown error")
+                logger.warning(f"XT: API вернул ошибку для orderbook {coin}: returnCode={return_code}, msg={msg}")
+                return None
+            
+            result = data.get("result")
+            if not result or not isinstance(result, dict):
+                logger.warning(f"XT: orderbook для {coin} не найден (result пустой или не словарь)")
+                return None
+            
+            # XT возвращает bids и asks в поле result
+            bids = result.get("bids", [])
+            asks = result.get("asks", [])
+            
+            if not bids or not asks:
+                logger.warning(f"XT: пустой orderbook для {coin}")
+                return None
+            
+            return {"bids": bids, "asks": asks}
+                
+        except Exception as e:
+            logger.error(f"XT: ошибка при получении orderbook для {coin}: {e}", exc_info=True)
+            return None
+

@@ -304,14 +304,15 @@ class PerpArbitrageBot:
         
         for size in notional_sizes:
             # Проверяем ликвидность на Long бирже (для покупки)
-            if long_exchange == "bybit":
-                long_liquidity = await self.bybit.check_liquidity(
+            long_exchange_obj = self.exchanges.get(long_exchange)
+            if long_exchange_obj:
+                long_liquidity = await long_exchange_obj.check_liquidity(
                     coin, 
                     notional_usdt=size,
                     ob_limit=50,
                     max_spread_bps=30.0,
                     max_impact_bps=50.0,
-                    mode="entry_long"
+                    mode="entry_long" # Проверяем только глубину на покупку
                 )
                 if long_liquidity:
                     status = "✓" if long_liquidity["ok"] else "✗"
@@ -320,16 +321,19 @@ class PerpArbitrageBot:
                               f"spread={long_liquidity['spread_bps']:.1f}bps, buy_impact={buy_impact_str}")
                     if not long_liquidity["ok"]:
                         logger.warning(f"  Причины: {', '.join(long_liquidity['reasons'])}")
+                else:
+                    logger.warning(f"Не удалось проверить ликвидность {long_exchange} Long ({coin}) для {size} USDT")
             
             # Проверяем ликвидность на Short бирже (для продажи)
-            if short_exchange == "bybit":
-                short_liquidity = await self.bybit.check_liquidity(
+            short_exchange_obj = self.exchanges.get(short_exchange)
+            if short_exchange_obj:
+                short_liquidity = await short_exchange_obj.check_liquidity(
                     coin,
                     notional_usdt=size,
                     ob_limit=50,
                     max_spread_bps=30.0,
                     max_impact_bps=50.0,
-                    mode="entry_short"
+                    mode="entry_short" # Проверяем только глубину на продажу
                 )
                 if short_liquidity:
                     status = "✓" if short_liquidity["ok"] else "✗"
@@ -338,6 +342,8 @@ class PerpArbitrageBot:
                               f"spread={short_liquidity['spread_bps']:.1f}bps, sell_impact={sell_impact_str}")
                     if not short_liquidity["ok"]:
                         logger.warning(f"  Причины: {', '.join(short_liquidity['reasons'])}")
+                else:
+                    logger.warning(f"Не удалось проверить ликвидность {short_exchange} Short ({coin}) для {size} USDT")
     
     async def check_delisting_for_coin(self, coin: str, exchanges: Optional[List[str]] = None, days_back: int = 60):
         """

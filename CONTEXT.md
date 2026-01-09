@@ -365,7 +365,10 @@
 
 ### Поддерживаемые биржи
 - **Bybit** - через официальный API orderbook (`/v5/market/orderbook`)
-- Другие биржи: поддержка может быть добавлена в будущем
+- **Gate.io** - через официальный API orderbook (`/api/v4/futures/usdt/order_book`)
+- **MEXC** - через официальный API orderbook (`/api/v1/contract/depth`)
+- **XT.com** - через официальный API orderbook (`/future/market/v1/public/q/depth`)
+- **LBank** - через официальный API orderbook (`/cfd/openApi/v1/pub/depth`)
 
 ### Размеры сделок
 Проверка выполняется для трех размеров:
@@ -542,10 +545,32 @@ sell_impact_bps = |bid1 - sell_vwap| / mid * 10_000
 
 ### Технические детали
 
-**API эндпоинт Bybit:**
+**API эндпоинты для orderbook:**
+
+**Bybit:**
 - `GET /v5/market/orderbook`
 - Параметры: `category=linear`, `symbol=COINUSDT`, `limit=50`
 - Возвращает: `{"retCode": 0, "result": {"b": [[price, size], ...], "a": [[price, size], ...]}}`
+
+**Gate.io:**
+- `GET /api/v4/futures/usdt/order_book`
+- Параметры: `contract=COIN_USDT`, `limit=50`
+- Возвращает: `{"bids": [[price, size], ...], "asks": [[price, size], ...]}`
+
+**MEXC:**
+- `GET /api/v1/contract/depth`
+- Параметры: `symbol=COIN_USDT`, `limit=50`
+- Возвращает: `{"code": 0, "data": {"bids": [[price, size], ...], "asks": [[price, size], ...]}}`
+
+**XT.com:**
+- `GET /future/market/v1/public/q/depth`
+- Параметры: `symbol=coin_usdt`, `limit=50`
+- Возвращает: `{"returnCode": 0, "result": {"bids": [[price, size], ...], "asks": [[price, size], ...]}}`
+
+**LBank:**
+- `GET /cfd/openApi/v1/pub/depth`
+- Параметры: `productGroup=SwapU`, `symbol=COINUSDT`, `limit=50`
+- Возвращает: `{"data": {"bids": [[price, size], ...], "asks": [[price, size], ...]}}`
 
 **Расчет VWAP (детально):**
 

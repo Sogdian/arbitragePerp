@@ -140,3 +140,43 @@ class AsyncGateExchange(AsyncBaseExchange):
             logger.error(f"Gate: ошибка при получении фандинга для {coin}: {e}", exc_info=True)
             return None
 
+    async def get_orderbook(self, coin: str, limit: int = 50) -> Optional[Dict]:
+        """
+        Получить orderbook (книгу заявок) для монеты
+        
+        Args:
+            coin: Название монеты без /USDT (например, "GPS")
+            limit: Количество уровней (по умолчанию 50)
+            
+        Returns:
+            Словарь с данными orderbook:
+            {
+                "bids": [[price, size], ...],  # Заявки на покупку (от высокой к низкой)
+                "asks": [[price, size], ...],  # Заявки на продажу (от низкой к высокой)
+            }
+            или None если ошибка
+        """
+        try:
+            symbol = self._normalize_symbol(coin)
+            url = "/api/v4/futures/usdt/order_book"
+            params = {"contract": symbol, "limit": limit}
+            
+            data = await self._request_json("GET", url, params=params)
+            if not data:
+                logger.warning(f"Gate: не удалось получить orderbook для {coin}")
+                return None
+            
+            # Gate.io возвращает словарь с bids и asks
+            bids = data.get("bids", [])
+            asks = data.get("asks", [])
+            
+            if not bids or not asks:
+                logger.warning(f"Gate: пустой orderbook для {coin}")
+                return None
+            
+            return {"bids": bids, "asks": asks}
+                
+        except Exception as e:
+            logger.error(f"Gate: ошибка при получении orderbook для {coin}: {e}", exc_info=True)
+            return None
+

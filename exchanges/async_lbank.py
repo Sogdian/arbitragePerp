@@ -357,3 +357,62 @@ class AsyncLbankExchange(AsyncBaseExchange):
             logger.warning(f"LBank: ошибка парсинга фандинга для {coin}: {e}")
             return None
 
+    async def get_orderbook(self, coin: str, limit: int = 50) -> Optional[Dict]:
+        """
+        Получить orderbook (книгу заявок) для монеты
+        
+        Args:
+            coin: Название монеты без /USDT (например, "GPS")
+            limit: Количество уровней (по умолчанию 50)
+            
+        Returns:
+            Словарь с данными orderbook:
+            {
+                "bids": [[price, size], ...],  # Заявки на покупку (от высокой к низкой)
+                "asks": [[price, size], ...],  # Заявки на продажу (от низкой к высокой)
+            }
+            или None если ошибка
+        """
+        try:
+            symbol = self._normalize_symbol(coin)
+            
+            # LBank использует эндпоинт depth для получения orderbook
+            url = "/cfd/openApi/v1/pub/depth"
+            params = {
+                "productGroup": self.PRODUCT_GROUP,
+                "symbol": symbol,
+                "limit": limit
+            }
+            
+            data = await self._request_json("GET", url, params=params)
+            if not data:
+                logger.warning(f"LBank: не удалось получить orderbook для {coin}")
+                return None
+            
+            # LBank возвращает данные в поле "data"
+            result = data.get("data")
+            if not result:
+                logger.warning(f"LBank: пустой ответ orderbook для {coin}")
+                return None
+            
+            # Если result - это список, берем первый элемент
+            if isinstance(result, list) and result:
+                result = result[0]
+            
+            if not isinstance(result, dict):
+                logger.warning(f"LBank: неожиданный формат orderbook для {coin}")
+                return None
+            
+            bids = result.get("bids", [])
+            asks = result.get("asks", [])
+            
+            if not bids or not asks:
+                logger.warning(f"LBank: пустой orderbook для {coin}")
+                return None
+            
+            return {"bids": bids, "asks": asks}
+                
+        except Exception as e:
+            logger.error(f"LBank: ошибка при получении orderbook для {coin}: {e}", exc_info=True)
+            return None
+
