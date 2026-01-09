@@ -262,6 +262,9 @@ class PerpArbitrageBot:
         
         logger.info("=" * 60)
         
+        # Проверяем ликвидность на обеих биржах (для размеров 50, 100, 150 USDT)
+        await self.check_liquidity_for_coin(coin, long_exchange, short_exchange)
+        
         # Проверяем делистинг на обеих биржах
         await self.check_delisting_for_coin(coin, exchanges=[long_exchange, short_exchange])
         
@@ -273,6 +276,53 @@ class PerpArbitrageBot:
             "long_data": long_data,
             "short_data": short_data
         }
+    
+    async def check_liquidity_for_coin(self, coin: str, long_exchange: str, short_exchange: str):
+        """
+        Проверяет ликвидность на обеих биржах для размеров 50, 100, 150 USDT
+        
+        Args:
+            coin: Символ монеты
+            long_exchange: Биржа для Long позиции
+            short_exchange: Биржа для Short позиции
+        """
+        # Размеры для проверки
+        notional_sizes = [50.0, 100.0, 150.0]
+        
+        for size in notional_sizes:
+            # Проверяем ликвидность на Long бирже (для покупки)
+            if long_exchange == "bybit":
+                long_liquidity = await self.bybit.check_liquidity(
+                    coin, 
+                    notional_usdt=size,
+                    ob_limit=50,
+                    max_spread_bps=30.0,
+                    max_impact_bps=50.0
+                )
+                if long_liquidity:
+                    status = "✓" if long_liquidity["ok"] else "✗"
+                    buy_impact_str = f"{long_liquidity['buy_impact_bps']:.1f}bps" if long_liquidity['buy_impact_bps'] is not None else "N/A"
+                    logger.info(f"{status} Ликвидность {long_exchange} Long ({coin}): {size} USDT | "
+                              f"spread={long_liquidity['spread_bps']:.1f}bps, buy_impact={buy_impact_str}")
+                    if not long_liquidity["ok"]:
+                        logger.warning(f"  Причины: {', '.join(long_liquidity['reasons'])}")
+            
+            # Проверяем ликвидность на Short бирже (для продажи)
+            if short_exchange == "bybit":
+                short_liquidity = await self.bybit.check_liquidity(
+                    coin,
+                    notional_usdt=size,
+                    ob_limit=50,
+                    max_spread_bps=30.0,
+                    max_impact_bps=50.0
+                )
+                if short_liquidity:
+                    status = "✓" if short_liquidity["ok"] else "✗"
+                    sell_impact_str = f"{short_liquidity['sell_impact_bps']:.1f}bps" if short_liquidity['sell_impact_bps'] is not None else "N/A"
+                    logger.info(f"{status} Ликвидность {short_exchange} Short ({coin}): {size} USDT | "
+                              f"spread={short_liquidity['spread_bps']:.1f}bps, sell_impact={sell_impact_str}")
+                    if not short_liquidity["ok"]:
+                        logger.warning(f"  Причины: {', '.join(short_liquidity['reasons'])}")
     
     async def check_delisting_for_coin(self, coin: str, exchanges: Optional[List[str]] = None, days_back: int = 60):
         """
