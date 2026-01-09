@@ -36,6 +36,14 @@ class NewsMonitor:
                 "https://www.gate.com/ru/announcements/delisted",
             ],
         }
+        
+        # Маппинг названий бирж из запроса на названия в системе
+        self.exchange_name_mapping = {
+            "bybit": "Bybit",
+            "gate": "Gate",
+            "mexc": "MEXC",
+            "lbank": "LBank"
+        }
     
     @staticmethod
     def _dedupe_by_url(items: List[Dict]) -> List[Dict]:
@@ -179,13 +187,14 @@ class NewsMonitor:
             logger.warning("Bybit announcements API ошибка: %s", e)
             return []
     
-    async def _fetch_exchange_announcements(self, limit: int = 100, days_back: int = 60) -> List[Dict]:
+    async def _fetch_exchange_announcements(self, limit: int = 100, days_back: int = 60, exchanges: Optional[List[str]] = None) -> List[Dict]:
         """
         Получает объявления с бирж
         
         Args:
             limit: Максимальное количество новостей
             days_back: Количество дней назад для поиска
+            exchanges: Список бирж для проверки (например, ["bybit", "gate"]). Если None, проверяются все биржи.
             
         Returns:
             Список новостей с бирж
@@ -198,6 +207,13 @@ class NewsMonitor:
         
         timeout = httpx.Timeout(connect=5.0, read=8.0, write=8.0, pool=5.0)
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        
+        # Фильтруем биржи, если указаны
+        exchanges_to_check = self.exchange_announcement_urls
+        if exchanges:
+            # Преобразуем названия бирж из запроса в названия в системе
+            mapped_exchanges = [self.exchange_name_mapping.get(ex.lower(), ex.capitalize()) for ex in exchanges]
+            exchanges_to_check = {name: url for name, url in self.exchange_announcement_urls.items() if name in mapped_exchanges}
         
         async def _fetch_one(exchange_name: str, base_url: Optional[Union[str, List[str]]]) -> List[Dict]:
             local: List[Dict] = []
@@ -303,7 +319,7 @@ class NewsMonitor:
                 logger.warning("❌ %s: ошибка загрузки announcements: %s", exchange_name, e)
                 return []
         
-        tasks = [_fetch_one(name, url) for name, url in self.exchange_announcement_urls.items() if url is not None]
+        tasks = [_fetch_one(name, url) for name, url in exchanges_to_check.items() if url is not None]
         chunks = await asyncio.gather(*tasks, return_exceptions=False)
         for chunk in chunks:
             all_news.extend(chunk)
@@ -372,21 +388,23 @@ class NewsMonitor:
         
         return relevant_news
     
-    async def check_delisting(self, coin_symbol: str, days_back: int = 60) -> List[Dict]:
+    async def check_delisting(self, coin_symbol: str, exchanges: Optional[List[str]] = None, days_back: int = 60) -> List[Dict]:
         """
         Проверяет наличие новостей о делистинге монеты за последние N дней
         
         Args:
             coin_symbol: Символ монеты (например, "DGRAM", "IOTA")
+            exchanges: Список бирж для проверки (например, ["bybit", "gate"]). Если None, проверяются все биржи.
             days_back: Количество дней назад для поиска (по умолчанию 60)
             
         Returns:
             Список новостей о делистинге
         """
-        logger.info(f"Проверка делистинга для {coin_symbol} за последние {days_back} дней...")
+        exchanges_str = ", ".join(exchanges) if exchanges else "всех"
+        logger.info(f"Проверка делистинга для {coin_symbol} на биржах {exchanges_str} за последние {days_back} дней...")
         
         # Получаем объявления с бирж
-        all_announcements = await self._fetch_exchange_announcements(limit=200, days_back=days_back)
+        all_announcements = await self._fetch_exchange_announcements(limit=200, days_back=days_back, exchanges=exchanges)
         logger.info(f"Получено {len(all_announcements)} объявлений с бирж")
         
         # Ищем новости о делистинге

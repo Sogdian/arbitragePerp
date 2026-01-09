@@ -4,7 +4,7 @@
 import asyncio
 import logging
 import sys
-from typing import Optional, Dict
+from typing import Optional, Dict, List
 from exchanges.async_bybit import AsyncBybitExchange
 from exchanges.async_gate import AsyncGateExchange
 from exchanges.async_mexc import AsyncMexcExchange
@@ -252,8 +252,8 @@ class PerpArbitrageBot:
         
         logger.info("=" * 60)
         
-        # Проверяем делистинг
-        await self.check_delisting_for_coin(coin)
+        # Проверяем делистинг на обеих биржах
+        await self.check_delisting_for_coin(coin, exchanges=[long_exchange, short_exchange])
         
         # Сохраняем данные для мониторинга
         return {
@@ -264,16 +264,17 @@ class PerpArbitrageBot:
             "short_data": short_data
         }
     
-    async def check_delisting_for_coin(self, coin: str, days_back: int = 60):
+    async def check_delisting_for_coin(self, coin: str, exchanges: Optional[List[str]] = None, days_back: int = 60):
         """
-        Проверяет наличие новостей о делистинге монеты
+        Проверяет наличие новостей о делистинге монеты на указанных биржах
         
         Args:
             coin: Символ монеты
+            exchanges: Список бирж для проверки (например, ["bybit", "gate"]). Если None, проверяются все биржи.
             days_back: Количество дней назад для поиска (по умолчанию 60)
         """
         try:
-            delisting_news = await self.news_monitor.check_delisting(coin, days_back=days_back)
+            delisting_news = await self.news_monitor.check_delisting(coin, exchanges=exchanges, days_back=days_back)
             
             if not delisting_news:
                 logger.info(f"✓ Новостей о делистинге {coin} за последние {days_back} дней не найдено")
