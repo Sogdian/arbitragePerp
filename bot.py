@@ -183,10 +183,23 @@ class PerpArbitrageBot:
             logger.error(f"Ошибка при получении данных с {short_exchange}: {short_data}")
             short_data = None
         
-        # Выводим информацию
+        # Проверяем, доступна ли монета на биржах
         logger.info("=" * 60)
         logger.info(f"Анализ арбитража для {coin}")
         logger.info("=" * 60)
+        
+        # Если тикер не найден на бирже, монета недоступна/делистирована
+        if long_data is None:
+            logger.warning(f"⚠️ {coin} недоступна/делистирована на {long_exchange}")
+            logger.warning("Арбитраж невозможен: тикер не найден на бирже Long")
+            logger.info("=" * 60)
+            return None
+        
+        if short_data is None:
+            logger.warning(f"⚠️ {coin} недоступна/делистирована на {short_exchange}")
+            logger.warning("Арбитраж невозможен: тикер не найден на бирже Short")
+            logger.info("=" * 60)
+            return None
         
         # Данные Long биржи
         if long_data:
