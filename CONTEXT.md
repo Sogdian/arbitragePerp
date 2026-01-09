@@ -199,9 +199,18 @@
    - Для открытия: (ask_long - bid_short) / bid_short * 100
    - Для закрытия: (bid_long - ask_short) / ask_short * 100
 
-2. **Спред на фандинг (fr_spread):**
-   - fr_long - fr_short (в процентах)
-   - Показывает разницу в ставках фандинга между биржами
+2. **Спред на фандинг (fr_spread / Net funding):**
+   - Формула: `Net funding = funding_short - funding_long`
+   - Экономическая логика funding:
+     - Если funding > 0: Long платит, Short получает
+     - Если funding < 0: Long получает, Short платит
+   - PnL для позиций:
+     - PnL Long = -funding_long
+     - PnL Short = +funding_short
+   - Net funding = PnL_long + PnL_short = funding_short - funding_long
+   - Показывает чистый эффект по фандингу за один funding-период
+   - Положительное значение = прибыль, отрицательное значение = убыток
+   - **Пример:** Long: -2.0%, Short: -2.5% → Net funding = (-2.5%) - (-2.0%) = -0.5% (убыток)
 
 3. **Общий спред (total_spread):**
    - pr_spread + fr_spread

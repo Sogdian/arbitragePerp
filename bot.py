@@ -130,26 +130,39 @@ class PerpArbitrageBot:
         spread = ((price1 - price2) / price2) * 100
         return spread
     
-    def calculate_funding_spread(self, funding1: Optional[float], funding2: Optional[float]) -> Optional[float]:
+    def calculate_funding_spread(self, funding_long: Optional[float], funding_short: Optional[float]) -> Optional[float]:
         """
-        Вычислить спред между двумя ставками фандинга (в процентах)
+        Вычислить чистый эффект по фандингу для арбитража (Long и Short позиции)
+        
+        Экономическая логика funding:
+        - Если funding > 0: Long платит, Short получает
+        - Если funding < 0: Long получает, Short платит
+        
+        PnL для позиций:
+        - PnL Long = -funding_long (если funding положительный, платим; если отрицательный, получаем)
+        - PnL Short = +funding_short (если funding положительный, получаем; если отрицательный, платим)
+        
+        Формула: Net funding = PnL_long + PnL_short = (-funding_long) + (+funding_short) = funding_short - funding_long
         
         Args:
-            funding1: Первая ставка фандинга
-            funding2: Вторая ставка фандинга
+            funding_long: Ставка фандинга на бирже Long (в десятичном формате, например, -0.02 = -2%)
+            funding_short: Ставка фандинга на бирже Short (в десятичном формате, например, -0.025 = -2.5%)
             
         Returns:
-            Разница в процентах или None если невозможно вычислить
+            Чистый эффект по фандингу в процентах или None если невозможно вычислить
+            Положительное значение = прибыль, отрицательное значение = убыток
+            Пример: -0.5% означает, что за один funding-период будет убыток 0.5%
         """
-        if funding1 is None or funding2 is None:
+        if funding_long is None or funding_short is None:
             return None
         
         # Конвертируем в проценты (funding rate обычно в формате 0.0001 = 0.01%)
-        funding1_pct = funding1 * 100
-        funding2_pct = funding2 * 100
+        funding_long_pct = funding_long * 100
+        funding_short_pct = funding_short * 100
         
-        spread = funding1_pct - funding2_pct
-        return spread
+        # Net funding PnL: funding_short - funding_long
+        net_funding = funding_short_pct - funding_long_pct
+        return net_funding
     
     async def process_input(self, input_text: str):
         """
