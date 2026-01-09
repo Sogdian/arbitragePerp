@@ -563,9 +563,9 @@ sell_impact_bps = |bid1 - sell_vwap| / mid * 10_000
 - Возвращает: `{"code": 0, "data": {"bids": [[price, size], ...], "asks": [[price, size], ...]}}`
 
 **XT.com:**
-- `GET /future/market/v1/public/q/depth`
-- Параметры: `symbol=coin_usdt`, `limit=50`
-- Возвращает: `{"returnCode": 0, "result": {"bids": [[price, size], ...], "asks": [[price, size], ...]}}`
+- `GET /future/market/v1/public/cg/orderbook`
+- Параметры: `symbol=coin_usdt`, `level=50` (level ограничен от 1 до 200)
+- Возвращает: `{"bids": [[price, size], ...], "asks": [[price, size], ...]}`
 
 **LBank:**
 - `GET /cfd/openApi/v1/pub/depth`
