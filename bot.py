@@ -292,15 +292,15 @@ class PerpArbitrageBot:
     
     async def check_liquidity_for_coin(self, coin: str, long_exchange: str, short_exchange: str):
         """
-        Проверяет ликвидность на обеих биржах для размеров 50, 100, 150 USDT
+        Проверяет ликвидность на обеих биржах для размера 150 USDT
         
         Args:
             coin: Символ монеты
             long_exchange: Биржа для Long позиции
             short_exchange: Биржа для Short позиции
         """
-        # Размеры для проверки
-        notional_sizes = [50.0, 100.0, 150.0]
+        # Размер для проверки
+        notional_sizes = [150.0]
         
         for size in notional_sizes:
             # Проверяем ликвидность на Long бирже (для покупки)
