@@ -161,7 +161,6 @@ class AsyncBybitExchange(AsyncBaseExchange):
     def _vwap_for_notional(
         levels: List[List[str]],  # [[price, size], ...] as strings
         target_usdt: float,
-        side: str,  # "buy" uses asks, "sell" uses bids
     ) -> Tuple[Optional[float], float]:
         """
         Вычисляет VWAP для заданного номинала (notional) в USDT
@@ -169,14 +168,13 @@ class AsyncBybitExchange(AsyncBaseExchange):
         Args:
             levels: Список уровней [[price, size], ...] как строки
             target_usdt: Целевой номинал в USDT
-            side: "buy" или "sell" (для логики)
             
         Returns:
             Кортеж (vwap_price, filled_usdt). Если глубины не хватило -> (None, filled_usdt)
         """
         remaining = target_usdt
-        return_cost = 0.0
-        return_base = 0.0
+        filled_usdt = 0.0
+        filled_base = 0.0
         
         for p_raw, sz_raw in levels:
             p = float(p_raw)
@@ -184,21 +182,21 @@ class AsyncBybitExchange(AsyncBaseExchange):
             level_notional = p * sz
             take = level_notional if level_notional <= remaining else remaining
             take_sz = take / p
-            return_cost += take
-            return_base += take_sz
+            filled_usdt += take
+            filled_base += take_sz
             remaining -= take
             
             if remaining <= 1e-9:
                 break
         
-        if return_base <= 0:
+        if filled_base <= 0:
             return None, 0.0
         
         if remaining > 1e-6:
             # не хватило глубины
-            return None, return_cost
+            return None, filled_usdt
         
-        vwap = return_cost / return_base
+        vwap = filled_usdt / filled_base
         return vwap, target_usdt
     
     async def check_liquidity(
@@ -208,6 +206,7 @@ class AsyncBybitExchange(AsyncBaseExchange):
         ob_limit: int = 50,
         max_spread_bps: float = 30.0,
         max_impact_bps: float = 50.0,
+        mode: str = "roundtrip",
     ) -> Optional[Dict]:
         """
         Проверка ликвидности под сделку notional_usdt
@@ -218,6 +217,10 @@ class AsyncBybitExchange(AsyncBaseExchange):
             ob_limit: Количество уровней в orderbook (по умолчанию 50)
             max_spread_bps: Максимальный спред в базисных пунктах (по умолчанию 30)
             max_impact_bps: Максимальный проскальзывание в базисных пунктах (по умолчанию 50)
+            mode: Режим проверки (по умолчанию "roundtrip"):
+                - "entry_long" - проверка для входа в Long (важен только buy_vwap)
+                - "entry_short" - проверка для входа в Short (важен только sell_vwap)
+                - "roundtrip" - проверка для полного цикла (нужны оба buy_vwap и sell_vwap)
             
         Returns:
             Словарь с метриками ликвидности:
@@ -252,20 +255,33 @@ class AsyncBybitExchange(AsyncBaseExchange):
             
             spread_bps = (ask1 - bid1) / mid * 10_000
             
-            # BUY uses asks (чтобы оценить вход в лонг по рынку)
-            buy_vwap, buy_filled = self._vwap_for_notional(asks, notional_usdt, "buy")
-            # SELL uses bids (чтобы оценить вход в шорт по рынку)
-            sell_vwap, sell_filled = self._vwap_for_notional(bids, notional_usdt, "sell")
+            # Валидация mode
+            valid_modes = ("entry_long", "entry_short", "roundtrip")
+            if mode not in valid_modes:
+                logger.warning(f"Bybit: неверный mode '{mode}', используется 'roundtrip'")
+                mode = "roundtrip"
             
-            # если глубины не хватило
-            enough_depth = (buy_vwap is not None) and (sell_vwap is not None)
+            # BUY uses asks (чтобы оценить вход в лонг по рынку)
+            buy_vwap, buy_filled = self._vwap_for_notional(asks, notional_usdt)
+            # SELL uses bids (чтобы оценить вход в шорт по рынку)
+            sell_vwap, sell_filled = self._vwap_for_notional(bids, notional_usdt)
+            
+            # Проверяем достаточность глубины в зависимости от режима
+            if mode == "entry_long":
+                enough_depth = buy_vwap is not None
+            elif mode == "entry_short":
+                enough_depth = sell_vwap is not None
+            else:  # "roundtrip"
+                enough_depth = (buy_vwap is not None) and (sell_vwap is not None)
             
             buy_impact_bps = None
             sell_impact_bps = None
             if buy_vwap is not None:
-                buy_impact_bps = abs(buy_vwap - mid) / mid * 10_000
+                # Impact считается относительно ask1 (top-of-book для покупки)
+                buy_impact_bps = abs(buy_vwap - ask1) / mid * 10_000
             if sell_vwap is not None:
-                sell_impact_bps = abs(mid - sell_vwap) / mid * 10_000
+                # Impact считается относительно bid1 (top-of-book для продажи)
+                sell_impact_bps = abs(bid1 - sell_vwap) / mid * 10_000
             
             ok = True
             reasons = []
@@ -276,14 +292,23 @@ class AsyncBybitExchange(AsyncBaseExchange):
             
             if not enough_depth:
                 ok = False
-                reasons.append(f"not enough depth for {notional_usdt} USDT (buy_filled={buy_filled:.2f}, sell_filled={sell_filled:.2f})")
+                # Формируем сообщение в зависимости от режима
+                if mode == "entry_long":
+                    reasons.append(f"not enough depth for {notional_usdt} USDT (buy_filled={buy_filled:.2f})")
+                elif mode == "entry_short":
+                    reasons.append(f"not enough depth for {notional_usdt} USDT (sell_filled={sell_filled:.2f})")
+                else:  # "roundtrip"
+                    reasons.append(f"not enough depth for {notional_usdt} USDT (buy_filled={buy_filled:.2f}, sell_filled={sell_filled:.2f})")
             else:
-                if buy_impact_bps is not None and buy_impact_bps > max_impact_bps:
-                    ok = False
-                    reasons.append(f"buy impact {buy_impact_bps:.1f} bps > {max_impact_bps:.1f}")
-                if sell_impact_bps is not None and sell_impact_bps > max_impact_bps:
-                    ok = False
-                    reasons.append(f"sell impact {sell_impact_bps:.1f} bps > {max_impact_bps:.1f}")
+                # Проверяем impact только для нужной стороны в зависимости от режима
+                if mode in ("entry_long", "roundtrip"):
+                    if buy_impact_bps is not None and buy_impact_bps > max_impact_bps:
+                        ok = False
+                        reasons.append(f"buy impact {buy_impact_bps:.1f} bps > {max_impact_bps:.1f}")
+                if mode in ("entry_short", "roundtrip"):
+                    if sell_impact_bps is not None and sell_impact_bps > max_impact_bps:
+                        ok = False
+                        reasons.append(f"sell impact {sell_impact_bps:.1f} bps > {max_impact_bps:.1f}")
             
             return {
                 "coin": coin.upper(),

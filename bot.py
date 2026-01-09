@@ -310,7 +310,8 @@ class PerpArbitrageBot:
                     notional_usdt=size,
                     ob_limit=50,
                     max_spread_bps=30.0,
-                    max_impact_bps=50.0
+                    max_impact_bps=50.0,
+                    mode="entry_long"
                 )
                 if long_liquidity:
                     status = "✓" if long_liquidity["ok"] else "✗"
@@ -327,7 +328,8 @@ class PerpArbitrageBot:
                     notional_usdt=size,
                     ob_limit=50,
                     max_spread_bps=30.0,
-                    max_impact_bps=50.0
+                    max_impact_bps=50.0,
+                    mode="entry_short"
                 )
                 if short_liquidity:
                     status = "✓" if short_liquidity["ok"] else "✗"

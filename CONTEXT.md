@@ -396,17 +396,23 @@ spread_bps = (ask1 - bid1) / mid * 10_000
 **Метод расчета:**
 1. Берется книга заявок (orderbook) с 50 уровнями
 2. Рассчитывается VWAP для покупки (используя asks) и продажи (используя bids)
-3. Вычисляется отклонение VWAP от средней цены (mid)
+3. Вычисляется отклонение VWAP от top-of-book цены (ask1 для покупки, bid1 для продажи)
+
+**Важно:** Impact считается относительно top-of-book, а не mid, чтобы разделить spread и impact:
+- **Spread** = разница между ask1 и bid1 (стоимость входа из-за спреда)
+- **Impact** = дополнительная потеря из-за глубины стакана (проскальзывание)
 
 **Формула для buy impact:**
 ```
-buy_impact_bps = |buy_vwap - mid| / mid * 10_000
+buy_impact_bps = |buy_vwap - ask1| / mid * 10_000
 ```
+где `ask1` - лучшая цена продажи на первом уровне
 
 **Формула для sell impact:**
 ```
-sell_impact_bps = |mid - sell_vwap| / mid * 10_000
+sell_impact_bps = |bid1 - sell_vwap| / mid * 10_000
 ```
+где `bid1` - лучшая цена покупки на первом уровне
 
 **Порог:** ≤ 50 bps (0.50%) на сторону
 - Рекомендуется ≤ 30 bps для лучшей ликвидности
@@ -437,19 +443,74 @@ sell_impact_bps = |mid - sell_vwap| / mid * 10_000
 - Запрашивается книга заявок через API: `GET /v5/market/orderbook?category=linear&symbol=GPSUSDT&limit=50`
 - Получаются списки bids (заявки на покупку) и asks (заявки на продажу)
 
-#### 2. Расчет метрик
-- **Спред:** `(ask1 - bid1) / mid * 10_000`
-- **Buy VWAP:** Рассчитывается для покупки заданного номинала по asks
-- **Sell VWAP:** Рассчитывается для продажи заданного номинала по bids
-- **Buy Impact:** `|buy_vwap - mid| / mid * 10_000`
-- **Sell Impact:** `|mid - sell_vwap| / mid * 10_000`
+#### 2. Режимы проверки
+Проверка ликвидности может выполняться в трех режимах:
 
-#### 3. Проверка условий
+- **`entry_long`** - проверка для входа в Long позицию
+  - Важна только глубина на покупку (`buy_vwap`)
+  - Проверяется только `buy_impact_bps`
+  - Используется для Long биржи
+  
+- **`entry_short`** - проверка для входа в Short позицию
+  - Важна только глубина на продажу (`sell_vwap`)
+  - Проверяется только `sell_impact_bps`
+  - Используется для Short биржи
+  
+- **`roundtrip`** - проверка для полного цикла (вход + выход)
+  - Нужны оба: `buy_vwap` и `sell_vwap`
+  - Проверяются оба impact
+  - Используется по умолчанию
+
+**Логика:** В режиме `entry_long` не нужно заваливать проверку из-за большого `sell_impact`, так как входим только в Long. Аналогично для `entry_short`.
+
+#### 3. Расчет метрик
+
+**Спред:**
+```
+spread_bps = (ask1 - bid1) / mid * 10_000
+```
+где `mid = (bid1 + ask1) / 2.0`
+
+**Расчет VWAP (Volume Weighted Average Price):**
+
+Алгоритм расчета VWAP для заданного номинала:
+1. Итерация по уровням стакана (asks для покупки, bids для продажи)
+2. Для каждого уровня:
+   - Вычисляется номинал уровня: `level_notional = price * size`
+   - Берется нужное количество: `take = min(level_notional, remaining)`
+   - Конвертируется в базовую монету: `take_sz = take / price`
+   - Накопление: `filled_usdt += take`, `filled_base += take_sz`
+   - Остаток: `remaining -= take`
+3. Если `remaining <= 1e-9` - глубина достаточна
+4. Если `remaining > 1e-6` - глубина недостаточна, возвращается `(None, filled_usdt)`
+5. Расчет VWAP: `vwap = filled_usdt / filled_base`
+
+**Buy VWAP:** Рассчитывается для покупки заданного номинала по asks (сверху вниз)
+**Sell VWAP:** Рассчитывается для продажи заданного номинала по bids (сверху вниз)
+
+**Buy Impact:**
+```
+buy_impact_bps = |buy_vwap - ask1| / mid * 10_000
+```
+Отклонение от лучшей цены продажи (ask1)
+
+**Sell Impact:**
+```
+sell_impact_bps = |bid1 - sell_vwap| / mid * 10_000
+```
+Отклонение от лучшей цены покупки (bid1)
+
+#### 4. Проверка условий
 Проверка считается успешной (`ok = True`), если:
 - Спред ≤ 30 bps
-- Глубины хватает для полного номинала (buy_vwap и sell_vwap не None)
-- Buy impact ≤ 50 bps
-- Sell impact ≤ 50 bps
+- Глубины хватает для нужной стороны:
+  - `entry_long`: `buy_vwap is not None`
+  - `entry_short`: `sell_vwap is not None`
+  - `roundtrip`: оба `buy_vwap` и `sell_vwap` не None
+- Impact для нужной стороны ≤ 50 bps:
+  - `entry_long`: только `buy_impact_bps ≤ 50 bps`
+  - `entry_short`: только `sell_impact_bps ≤ 50 bps`
+  - `roundtrip`: оба impact ≤ 50 bps
 
 Если хотя бы одно условие не выполнено, проверка считается неуспешной (`ok = False`).
 
@@ -486,14 +547,40 @@ sell_impact_bps = |mid - sell_vwap| / mid * 10_000
 - Параметры: `category=linear`, `symbol=COINUSDT`, `limit=50`
 - Возвращает: `{"retCode": 0, "result": {"b": [[price, size], ...], "a": [[price, size], ...]}}`
 
-**Расчет VWAP:**
-- Итерация по уровням стакана (asks для покупки, bids для продажи)
-- Накопление объема до достижения целевого номинала (USDT)
-- Расчет средневзвешенной цены: `vwap = total_cost / total_base_quantity`
+**Расчет VWAP (детально):**
+
+Метод `_vwap_for_notional()` выполняет следующие шаги:
+
+1. **Инициализация:**
+   - `remaining = target_usdt` (целевой номинал в USDT)
+   - `filled_usdt = 0.0` (накопленный номинал)
+   - `filled_base = 0.0` (накопленное количество базовой монеты)
+
+2. **Итерация по уровням стакана:**
+   - Для каждого уровня `[price, size]`:
+     - `level_notional = price * size` (номинал уровня в USDT)
+     - `take = min(level_notional, remaining)` (сколько берем с этого уровня)
+     - `take_sz = take / price` (количество базовой монеты)
+     - `filled_usdt += take`
+     - `filled_base += take_sz`
+     - `remaining -= take`
+     - Если `remaining <= 1e-9` → глубина достаточна, выходим
+
+3. **Проверка результата:**
+   - Если `filled_base <= 0` → возвращается `(None, 0.0)`
+   - Если `remaining > 1e-6` → глубина недостаточна, возвращается `(None, filled_usdt)`
+   - Иначе: `vwap = filled_usdt / filled_base`, возвращается `(vwap, target_usdt)`
 
 **Обработка недостаточной глубины:**
 - Если объема не хватает, `vwap = None`
-- В лог выводится информация о том, сколько USDT удалось "заполнить" (`buy_filled`, `sell_filled`)
+- В лог выводится информация о том, сколько USDT удалось "заполнить" (`filled_usdt`)
+- Сообщение формируется в зависимости от режима:
+  - `entry_long`: показывает только `buy_filled`
+  - `entry_short`: показывает только `sell_filled`
+  - `roundtrip`: показывает оба `buy_filled` и `sell_filled`
+
+**Валидация режима:**
+- Если передан неверный `mode` (не `entry_long`, `entry_short`, `roundtrip`), выводится предупреждение и используется `roundtrip` по умолчанию
 
 ### Пример работы
 
