@@ -260,13 +260,6 @@ class PerpArbitrageBot:
             logger.info(f"({long_exchange} и {short_exchange}) Спред на фандинги: недоступно")
             funding_spread = None
         
-        # Вычисляем общий спред (сумма спреда на цену и спреда на фандинги)
-        if price_spread is not None and funding_spread is not None:
-            total_spread = price_spread + funding_spread
-            logger.info(f"({long_exchange} и {short_exchange}) Общий спред: {total_spread:.6f}%")
-        else:
-            logger.info(f"({long_exchange} и {short_exchange}) Общий спред: невозможно вычислить")
-        
         logger.info("=" * 60)
         
         # Проверяем делистинг на обеих биржах
