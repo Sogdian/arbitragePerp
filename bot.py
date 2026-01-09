@@ -478,8 +478,8 @@ class PerpArbitrageBot:
                     short_fr_str = f"{funding_short_pct:.2f}" if funding_short_pct is not None else "N/A"
                     fr_spread_str = f"{fr_spread:.3f}" if fr_spread is not None else "N/A"
                     
-                    # Выводим одной строкой
-                    logger.info(f"{closing_str} {coin_str}: long fr {long_fr_str}, short fr {short_fr_str}, fr spread {fr_spread_str} | {opening_str} {coin_str}: long fr {long_fr_str}, short fr {short_fr_str}, fr spread {fr_spread_str}")
+                    # Выводим одной строкой (фандинг выводится один раз, так как он одинаковый для обоих спредов)
+                    logger.info(f"{closing_str} {coin_str} | {opening_str} {coin_str} | long fr {long_fr_str}, short fr {short_fr_str}, fr spread {fr_spread_str}")
                 
                 # Ждем 1 секунду перед следующей итерацией
                 await asyncio.sleep(1)
