@@ -10,6 +10,7 @@ from exchanges.async_gate import AsyncGateExchange
 from exchanges.async_mexc import AsyncMexcExchange
 from exchanges.async_lbank import AsyncLbankExchange
 from input_parser import parse_input
+from news_monitor import NewsMonitor
 import config
 
 # Настройка логирования
@@ -42,6 +43,7 @@ class PerpArbitrageBot:
             "mexc": self.mexc,
             "lbank": self.lbank
         }
+        self.news_monitor = NewsMonitor()
     
     async def close(self):
         """Закрывает соединения с биржами"""
@@ -250,6 +252,9 @@ class PerpArbitrageBot:
         
         logger.info("=" * 60)
         
+        # Проверяем делистинг
+        await self.check_delisting_for_coin(coin)
+        
         # Сохраняем данные для мониторинга
         return {
             "coin": coin,
@@ -258,6 +263,22 @@ class PerpArbitrageBot:
             "long_data": long_data,
             "short_data": short_data
         }
+    
+    async def check_delisting_for_coin(self, coin: str, days_back: int = 60):
+        """
+        Проверяет наличие новостей о делистинге монеты
+        
+        Args:
+            coin: Символ монеты
+            days_back: Количество дней назад для поиска (по умолчанию 60)
+        """
+        try:
+            delisting_news = await self.news_monitor.check_delisting(coin, days_back=days_back)
+            
+            if not delisting_news:
+                logger.info(f"✓ Новостей о делистинге {coin} за последние {days_back} дней не найдено")
+        except Exception as e:
+            logger.warning(f"Ошибка при проверке делистинга для {coin}: {e}")
     
     def calculate_opening_spread(self, ask_long: Optional[float], bid_short: Optional[float]) -> Optional[float]:
         """
