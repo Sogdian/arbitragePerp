@@ -394,36 +394,20 @@ class NewsMonitor:
         
         Args:
             coin_symbol: Символ монеты (например, "DGRAM", "IOTA")
-            exchanges: Список бирж для проверки (например, ["bybit", "gate"]). Если None, проверяются все биржи.
+            exchanges: Список бирж для проверки (например, ["bybit", "gate"]). Если None, проверка не выполняется.
             days_back: Количество дней назад для поиска (по умолчанию 60)
             
         Returns:
             Список новостей о делистинге
         """
-        exchanges_str = ", ".join(exchanges) if exchanges else "всех"
-        logger.info(f"Проверка делистинга для {coin_symbol} на биржах {exchanges_str} за последние {days_back} дней...")
+        if not exchanges:
+            return []
         
         # Получаем объявления с бирж
         all_announcements = await self._fetch_exchange_announcements(limit=200, days_back=days_back, exchanges=exchanges)
-        logger.info(f"Получено {len(all_announcements)} объявлений с бирж")
         
         # Ищем новости о делистинге
         delisting_news = self.find_delisting_news(all_announcements, coin_symbol)
-        
-        if not delisting_news:
-            # Логируем для отладки - проверяем все объявления Bybit на наличие монеты
-            bybit_announcements = [a for a in all_announcements if a.get("source") == "Bybit"]
-            logger.info(f"Делистинг не найден. Проверено {len(bybit_announcements)} объявлений Bybit. Проверяем первые 10 для отладки:")
-            coin_pattern_debug = re.compile(
-                rf"(?<![A-Z0-9]){re.escape(coin_symbol.upper())}(?:USDT)?(?![A-Z0-9])",
-                re.IGNORECASE
-            )
-            for i, ann in enumerate(bybit_announcements[:10]):
-                title = ann.get("title", "")[:100]
-                body = ann.get("body", "")[:100]
-                title_body = (title + " " + body).upper()
-                coin_found = coin_pattern_debug.search(title_body) is not None
-                logger.info(f"  {i+1}. [{ann.get('source', 'Unknown')}] {title} | Монета найдена: {coin_found}")
         
         return delisting_news
 

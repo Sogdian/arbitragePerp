@@ -8,9 +8,14 @@ arbitrage_perp_bot.log
 __pycache__/
 *.py[cod]
 *.pyc
+*.cpython-*.pyc
 *.pyo
 *.pyd
 *$py.class
 *.so
 .Python
+
+# Python cache files in subdirectories
+**/__pycache__/
+**/*.cpython-*.pyc
 

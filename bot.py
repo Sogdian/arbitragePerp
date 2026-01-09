@@ -9,6 +9,7 @@ from exchanges.async_bybit import AsyncBybitExchange
 from exchanges.async_gate import AsyncGateExchange
 from exchanges.async_mexc import AsyncMexcExchange
 from exchanges.async_lbank import AsyncLbankExchange
+from exchanges.async_xt import AsyncXtExchange
 from input_parser import parse_input
 from news_monitor import NewsMonitor
 import config
@@ -37,11 +38,13 @@ class PerpArbitrageBot:
         self.gate = AsyncGateExchange()
         self.mexc = AsyncMexcExchange()
         self.lbank = AsyncLbankExchange()
+        self.xt = AsyncXtExchange()
         self.exchanges = {
             "bybit": self.bybit,
             "gate": self.gate,
             "mexc": self.mexc,
-            "lbank": self.lbank
+            "lbank": self.lbank,
+            "xt": self.xt
         }
         self.news_monitor = NewsMonitor()
     
@@ -52,6 +55,7 @@ class PerpArbitrageBot:
             self.gate.close(),
             self.mexc.close(),
             self.lbank.close(),
+            self.xt.close(),
             return_exceptions=True
         )
     
@@ -283,14 +287,21 @@ class PerpArbitrageBot:
         
         Args:
             coin: Символ монеты
-            exchanges: Список бирж для проверки (например, ["bybit", "gate"]). Если None, проверяются все биржи.
+            exchanges: Список бирж для проверки (например, ["bybit", "gate"]). Если None, проверка не выполняется.
             days_back: Количество дней назад для поиска (по умолчанию 60)
         """
         try:
+            if not exchanges:
+                logger.warning(f"Укажите биржи для проверки делистинга {coin}")
+                return
+            
             delisting_news = await self.news_monitor.check_delisting(coin, exchanges=exchanges, days_back=days_back)
             
+            # Формируем строку с биржами для вывода
+            exchanges_str = ", ".join(exchanges)
+            
             if not delisting_news:
-                logger.info(f"✓ Новостей о делистинге {coin} за последние {days_back} дней не найдено")
+                logger.info(f"✓ Новостей о делистинге {coin} ({exchanges_str}) за последние {days_back} дней не найдено")
         except Exception as e:
             logger.warning(f"Ошибка при проверке делистинга для {coin}: {e}")
     

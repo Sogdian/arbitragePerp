@@ -41,7 +41,8 @@ python bot.py
 - **Bybit** (bybit) ✅
 - **Gate.io** (gate) ✅
 - **MEXC** (mexc) ✅
-- **LBank** (lbank) ⚠️ - может требовать API ключи для фьючерсов
+- **LBank** (lbank) ✅
+- **XT.com** (xt) ✅
 
 ## Вывод
 
