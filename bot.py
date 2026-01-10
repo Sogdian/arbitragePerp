@@ -329,10 +329,9 @@ class PerpArbitrageBot:
                 if long_liquidity:
                     status = "✓" if long_liquidity["ok"] else "✗"
                     buy_impact_str = f"{long_liquidity['buy_impact_bps']:.1f}bps" if long_liquidity['buy_impact_bps'] is not None else "N/A"
+                    reasons_str = f" (Причины: {', '.join(long_liquidity['reasons'])})" if not long_liquidity["ok"] else ""
                     logger.info(f"{status} Ликвидность {long_exchange} Long ({coin}): {size} USDT | "
-                              f"spread={long_liquidity['spread_bps']:.1f}bps, buy_impact={buy_impact_str}")
-                    if not long_liquidity["ok"]:
-                        logger.warning(f"  Причины: {', '.join(long_liquidity['reasons'])}")
+                              f"spread={long_liquidity['spread_bps']:.1f}bps, buy_impact={buy_impact_str}{reasons_str}")
                 else:
                     logger.warning(f"Не удалось проверить ликвидность {long_exchange} Long ({coin}) для {size} USDT")
             
@@ -350,10 +349,9 @@ class PerpArbitrageBot:
                 if short_liquidity:
                     status = "✓" if short_liquidity["ok"] else "✗"
                     sell_impact_str = f"{short_liquidity['sell_impact_bps']:.1f}bps" if short_liquidity['sell_impact_bps'] is not None else "N/A"
+                    reasons_str = f" (Причины: {', '.join(short_liquidity['reasons'])})" if not short_liquidity["ok"] else ""
                     logger.info(f"{status} Ликвидность {short_exchange} Short ({coin}): {size} USDT | "
-                              f"spread={short_liquidity['spread_bps']:.1f}bps, sell_impact={sell_impact_str}")
-                    if not short_liquidity["ok"]:
-                        logger.warning(f"  Причины: {', '.join(short_liquidity['reasons'])}")
+                              f"spread={short_liquidity['spread_bps']:.1f}bps, sell_impact={sell_impact_str}{reasons_str}")
                 else:
                     logger.warning(f"Не удалось проверить ликвидность {short_exchange} Short ({coin}) для {size} USDT")
     
