@@ -477,11 +477,7 @@ class AsyncLbankExchange(AsyncBaseExchange):
             "Origin": "https://www.lbank.com",
         }
 
-        try:
-            data = await self._request_json("GET", url, params=params, headers=headers)
-        except Exception as e:
-            logger.warning(f"LBank: не удалось получить orderbook для {coin}: {e}")
-            return None
+        data = await self._request_json("GET", url, params=params, headers=headers)
 
         if not data:
             logger.warning(f"LBank: не удалось получить orderbook для {coin} (empty response)")

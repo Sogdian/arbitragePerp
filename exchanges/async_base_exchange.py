@@ -3,7 +3,7 @@
 Использует httpx.AsyncClient, должен наследоваться всеми async-* биржами.
 """
 from abc import ABC, abstractmethod
-from typing import Dict, Optional, List, Tuple
+from typing import Dict, Optional, List, Tuple, Sequence, Union
 import httpx
 import asyncio
 import logging
@@ -41,6 +41,8 @@ class AsyncBaseExchange(ABC):
             # Для LBank и 404 ошибок - это означает, что публичный API недоступен
             if self.name == "LBank" and status == 404:
                 logger.warning(f"{self.name}: HTTP 404 для {url} с params {params}. Публичный endpoint недоступен или неверные params.")
+            elif self.name == "LBank" and status in (403, 429):
+                logger.warning(f"{self.name}: HTTP {status} для {url} с params {params}. Похоже на Cloudflare/rate-limit.")
             else:
                 try:
                     error_body = e.response.text[:200]
@@ -55,7 +57,7 @@ class AsyncBaseExchange(ABC):
 
     @staticmethod
     def _vwap_for_notional(
-        levels: List[List[str]],  # [[price, size], ...] as strings
+        levels: Sequence[Sequence[Union[str, float]]],  # [[price, size], ...] as strings or floats
         target_usdt: float,
     ) -> Tuple[Optional[float], float]:
         """
