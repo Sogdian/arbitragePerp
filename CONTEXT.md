@@ -1004,3 +1004,213 @@ sell_impact_bps = |bid1 - sell_vwap| / mid * 10_000
      Причины: spread 45.2 bps > 30.0, buy impact 68.5 bps > 50.0
    ```
 
+## Автоматическое обнаружение монет и сканирование спредов
+
+### Назначение
+Модуль `coin_list_fetchers.py` и скрипт `scan_spreads.py` обеспечивают автоматическое обнаружение всех доступных монет на фьючерсах для каждой биржи и непрерывное сканирование арбитражных возможностей между всеми парами бирж.
+
+### Архитектура
+
+#### 1. Модуль `coin_list_fetchers.py`
+Централизованный модуль для получения списка всех доступных монет на USDT-M perpetual для каждой биржи.
+
+**Основные функции:**
+- `fetch_bybit_coins(exchange)` - получение монет с Bybit
+- `fetch_gate_coins(exchange)` - получение монет с Gate.io
+- `fetch_mexc_coins(exchange)` - получение монет с MEXC
+- `fetch_xt_coins(exchange)` - получение монет с XT.com
+- `fetch_binance_coins(exchange)` - получение монет с Binance
+- `fetch_bitget_coins(exchange)` - получение монет с Bitget
+- `fetch_okx_coins(exchange)` - получение монет с OKX
+- `fetch_bingx_coins(exchange)` - получение монет с BingX
+- `fetch_lbank_coins(exchange)` - получение монет с LBank
+
+**Возвращаемое значение:**
+- Все функции возвращают `Set[str]` - множество монет без суффиксов (например, `{"BTC", "ETH", "SOL", ...}`)
+- Монеты приводятся к верхнему регистру (`.upper()`)
+
+**Интеграция:**
+- Каждый класс биржи (`AsyncBybitExchange`, `AsyncGateExchange`, и т.д.) реализует метод `get_all_futures_coins() -> Set[str]`
+- Метод вызывает соответствующую функцию из `coin_list_fetchers.py`
+- Это обеспечивает единообразный интерфейс для всех бирж
+
+#### 2. Скрипт `scan_spreads.py`
+Непрерывное сканирование арбитражных возможностей между всеми парами бирж.
+
+**Основные компоненты:**
+
+**A) Сбор монет по биржам:**
+```python
+async def collect_coins_by_exchange(bot, exchanges) -> Dict[str, Set[str]]
+```
+- Собирает список монет для каждой биржи параллельно
+- Возвращает словарь `{exchange_name: set_of_coins}`
+- Обрабатывает ошибки (пустые наборы для бирж с ошибками)
+
+**B) Построение union:**
+```python
+def build_union(coins_by_exchange) -> List[str]
+```
+- Строит union всех монет со всех бирж
+- Возвращает отсортированный список уникальных монет
+
+**C) Сканирование одной монеты:**
+```python
+async def scan_coin(bot, coin, coins_by_exchange, exchanges) -> List[Tuple]
+```
+- Определяет биржи, где монета реально есть (из `coins_by_exchange`)
+- Запрашивает данные только с этих бирж (убирает "шум" ошибок)
+- Вычисляет спреды для всех пар доступных бирж
+- Возвращает список найденных возможностей
+
+**D) Батчинг и параллелизм:**
+```python
+async def scan_once(bot, exchanges, coins, coins_by_exchange) -> List[Tuple]
+```
+- Обрабатывает монеты батчами (по умолчанию 50 монет за раз)
+- Параллельно обрабатывает монеты внутри батча
+- Ограничивает параллелизм через семафор (по умолчанию 40 одновременных запросов)
+- Выводит прогресс после каждого батча: `scan progress: 50/858 coins`
+
+**E) Семафор для ограничения параллелизма:**
+```python
+sem = asyncio.Semaphore(MAX_CONCURRENCY)
+async def fetch(bot, ex, coin):
+    async with sem:
+        return await bot.get_futures_data(ex, coin)
+```
+- Предотвращает перегрузку API rate-limit
+- Настраивается через `SCAN_MAX_CONCURRENCY` (по умолчанию 40)
+
+### Настройки через .env
+
+**Рекомендуемые значения:**
+```env
+MIN_SPREAD=2                    # минимальный спред в процентах для вывода
+SCAN_INTERVAL_SEC=5             # интервал между сканами в секундах
+SCAN_MAX_CONCURRENCY=40         # максимальное количество одновременных HTTP запросов
+SCAN_COIN_BATCH_SIZE=50         # размер батча монет для обработки
+```
+
+**Настройка под нагрузку:**
+- Если начинаются rate-limit / timeouts → снизить `SCAN_MAX_CONCURRENCY` до 20-30
+- Если всё стабильно → можно поднять до 60-80 (аккуратно)
+- При большом количестве монет (800+) можно увеличить `SCAN_COIN_BATCH_SIZE` до 100
+
+### Логика работы
+
+#### 1. Инициализация
+1. Собираются монеты для каждой биржи параллельно
+2. Строится union всех монет
+3. Выводится статистика: количество монет на каждой бирже и общее количество
+
+#### 2. Цикл сканирования
+1. Монеты обрабатываются батчами (по умолчанию 50)
+2. Для каждой монеты:
+   - Определяются биржи, где монета реально есть
+   - Запрашиваются данные только с этих бирж (убирает "шум")
+   - Вычисляются спреды для всех пар бирж
+3. После каждого батча выводится прогресс
+4. Найденные возможности сортируются по спреду (desc)
+5. Выводятся только возможности с `spread >= MIN_SPREAD`
+
+#### 3. Преимущества новой логики
+
+**Устранение "шума":**
+- Запросы выполняются только к биржам, где монета реально есть
+- Убираются предупреждения "инструмент не найден" для монет, которых нет на бирже
+- Снижается количество бесполезных запросов в разы
+
+**Устранение "зависания":**
+- Батчинг позволяет видеть прогресс после каждой пачки монет
+- Параллелизм ускоряет обработку
+- Прогресс-логи показывают, что скрипт работает
+
+**Оптимизация производительности:**
+- Ограничение параллелизма предотвращает перегрузку API
+- Батчинг позволяет контролировать нагрузку
+- Обработка только общих монет для пар бирж снижает количество запросов
+
+### API endpoints для получения списка монет
+
+**Bybit:**
+- Endpoint: `/v5/market/instruments-info`
+- Параметры: `category=linear`, `limit=1000`, `cursor` (пагинация)
+- Фильтры: `quoteCoin="USDT"`, `settleCoin="USDT"`, `status="Trading"`, `contractType="LinearPerpetual"`
+- Формат ответа: `{"retCode": 0, "result": {"list": [...], "nextPageCursor": "..."}}`
+
+**Gate.io:**
+- Endpoint: `/api/v4/futures/usdt/contracts`
+- Фильтры: `name.endswith("_USDT")`, `in_delisting is not True`, `trade_status` не в `("delisting", "suspend", "suspended", "closed")`
+- Формат ответа: список объектов с полем `name`
+
+**MEXC:**
+- Endpoint: `/api/v1/contract/detail`
+- Фильтры: `symbol.endswith("_USDT")`, `state` не в `("3", "4", "5")`
+- Формат ответа: `{"code": 0, "data": [...]}`
+
+**XT.com:**
+- Endpoint: `/future/market/v1/public/cg/contracts`
+- Базовый URL: `https://fapi.xt.com` (отдельный домен для фьючерсов)
+- Формат ответа: список объектов или `{"returnCode": 0, "result": [...]}`
+- Символы: `symbol` или `contractCode` в формате `btc_usdt` (lowercase с подчеркиванием)
+
+**Binance:**
+- Endpoint: `/fapi/v1/exchangeInfo`
+- Фильтры: `contractType="PERPETUAL"`, `quoteAsset="USDT"`, `status="TRADING"`
+- Формат ответа: `{"symbols": [...]}`
+
+**Bitget:**
+- Endpoint: `/api/v2/mix/market/tickers`
+- Параметры: `productType=USDT-FUTURES`
+- Формат ответа: `{"code": "00000", "data": [...]}`
+- Символы: `symbol` в формате `BTCUSDT` (может быть суффикс `_UMCBL`, который удаляется)
+
+**OKX:**
+- Endpoint: `/api/v5/public/instruments`
+- Параметры: `instType=SWAP`
+- Фильтры: `settleCcy="USDT"`, `instId.endswith("-USDT-SWAP")`, `state="live"`
+- Формат ответа: `{"code": "0", "data": [...]}`
+
+**BingX:**
+- Endpoint: `/openApi/swap/v2/quote/contracts`
+- Фильтры: `symbol.endswith("-USDT")`
+- Формат ответа: `{"code": 0, "data": [...]}`
+
+**LBank:**
+- Использует кешированный список инструментов через `exchange._get_instruments_with_cache()`
+- Фильтры: применяется канонизация символов через `exchange._canon()`
+- Формат ответа: зависит от внутреннего API биржи
+
+### Пример работы
+
+**Инициализация:**
+```
+Всего монет (union по биржам): 858
+bybit: 450 монет
+gate: 320 монет
+mexc: 280 монет
+xt: 150 монет
+binance: 380 монет
+bitget: 290 монет
+okx: 420 монет
+bingx: 200 монет
+
+scan_spreads started | MIN_SPREAD=2.00% | interval=5s | exchanges=['bybit', 'gate', ...] | total_coins=858 | batch=50 | max_concurrency=40
+```
+
+**Прогресс сканирования:**
+```
+scan progress: 50/858 coins
+scan progress: 100/858 coins
+scan progress: 150/858 coins
+...
+```
+
+**Найденные возможности:**
+```
+BTC Long (gate), Short (bingx) spread 2.3456%
+ETH Long (bybit), Short (okx) spread 2.1234%
+SOL Long (mexc), Short (bitget) spread 2.5678%
+```
+

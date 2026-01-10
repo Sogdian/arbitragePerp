@@ -43,6 +43,8 @@ load_dotenv(".env")
 
 MIN_SPREAD = float(os.getenv("MIN_SPREAD", "2"))  # в процентах, например 2
 SCAN_INTERVAL_SEC = float(os.getenv("SCAN_INTERVAL_SEC", "5"))  # каждые N секунд
+MAX_CONCURRENCY = int(os.getenv("SCAN_MAX_CONCURRENCY", "40"))  # сколько одновременных http запросов
+COIN_BATCH_SIZE = int(os.getenv("SCAN_COIN_BATCH_SIZE", "50"))  # сколько монет обрабатывать за пачку
 EXCLUDE_EXCHANGES = {"lbank"}  # не использовать
 
 # Монеты теперь собираются автоматически со всех бирж
@@ -80,11 +82,16 @@ def calc_open_spread_pct(ask_long: Optional[float], bid_short: Optional[float]) 
     return ((bid_short - ask_long) / ask_long) * 100.0
 
 
-async def fetch(bot: PerpArbitrageBot, ex: str, coin: str) -> Optional[Dict[str, Any]]:
-    return await bot.get_futures_data(ex, coin)
+# Семафор для ограничения параллелизма (создается в main() после загрузки настроек)
 
 
-async def collect_coins_map(bot: PerpArbitrageBot, exchanges: List[str]) -> Dict[str, Set[str]]:
+async def fetch(bot: PerpArbitrageBot, ex: str, coin: str, sem: asyncio.Semaphore) -> Optional[Dict[str, Any]]:
+    """Запрос данных с ограничением параллелизма через семафор"""
+    async with sem:
+        return await bot.get_futures_data(ex, coin)
+
+
+async def collect_coins_by_exchange(bot: PerpArbitrageBot, exchanges: List[str]) -> Dict[str, Set[str]]:
     """
     Собирает карту монет для каждой биржи.
     
@@ -99,63 +106,106 @@ async def collect_coins_map(bot: PerpArbitrageBot, exchanges: List[str]) -> Dict
         if isinstance(res, Exception) or not res:
             out[ex] = set()
         else:
-            out[ex] = res  # res уже является Set[str]
+            out[ex] = set(res)  # res уже является Set[str]
     
     return out
+
+
+def build_union(coins_by_exchange: Dict[str, Set[str]]) -> List[str]:
+    """Строит union всех монет и возвращает отсортированный список"""
+    sets = [s for s in coins_by_exchange.values() if s]
+    if not sets:
+        return []
+    return sorted(set.union(*sets))
+
+
+async def scan_coin(
+    bot: PerpArbitrageBot,
+    coin: str,
+    coins_by_exchange: Dict[str, Set[str]],
+    exchanges: List[str],
+    sem: asyncio.Semaphore,
+) -> List[Tuple[str, str, str, float]]:
+    """
+    Сканирует одну монету на всех биржах, где она реально есть.
+    
+    Returns:
+        Список найденных возможностей: (coin, long_exchange, short_exchange, open_spread_pct)
+    """
+    # биржи где монета реально есть
+    present = [ex for ex in exchanges if coin in coins_by_exchange.get(ex, set())]
+    if len(present) < 2:
+        return []
+
+    # запрашиваем только present биржи
+    tasks = {ex: asyncio.create_task(fetch(bot, ex, coin, sem)) for ex in present}
+    results = await asyncio.gather(*tasks.values(), return_exceptions=True)
+
+    available: Dict[str, Dict[str, Any]] = {}
+    for ex, res in zip(tasks.keys(), results):
+        if isinstance(res, Exception) or not res:
+            continue
+        bid = res.get("bid")
+        ask = res.get("ask")
+        if bid is None or ask is None:
+            continue
+        available[ex] = res
+
+    if len(available) < 2:
+        return []
+
+    found: List[Tuple[str, str, str, float]] = []
+    for ex1, ex2 in combinations(available.keys(), 2):
+        d1 = available[ex1]
+        d2 = available[ex2]
+
+        s1 = calc_open_spread_pct(d1["ask"], d2["bid"])
+        if s1 is not None and s1 >= MIN_SPREAD:
+            found.append((coin, ex1, ex2, s1))
+
+        s2 = calc_open_spread_pct(d2["ask"], d1["bid"])
+        if s2 is not None and s2 >= MIN_SPREAD:
+            found.append((coin, ex2, ex1, s2))
+
+    return found
 
 
 async def scan_once(
     bot: PerpArbitrageBot,
     exchanges: List[str],
-    coins_map: Dict[str, Set[str]],
+    coins: List[str],
+    coins_by_exchange: Dict[str, Set[str]],
+    sem: asyncio.Semaphore,
 ) -> List[Tuple[str, str, str, float]]:
     """
-    Возвращает список найденных возможностей в виде:
-    (coin, long_exchange, short_exchange, open_spread_pct)
+    Сканирует все монеты батчами с прогресс-логом.
     
-    Сканирует по парам бирж, используя только общие монеты (intersection).
+    Returns:
+        Список найденных возможностей: (coin, long_exchange, short_exchange, open_spread_pct)
     """
-    found: List[Tuple[str, str, str, float]] = []
+    found_all: List[Tuple[str, str, str, float]] = []
 
-    # для каждой пары бирж
-    for ex1, ex2 in combinations(exchanges, 2):
-        s1 = coins_map.get(ex1) or set()
-        s2 = coins_map.get(ex2) or set()
-        common = s1 & s2  # intersection - только общие монеты
-        
-        if not common:
-            continue
+    total = len(coins)
+    processed = 0
 
-        # сканируем только общие монеты
-        for coin in common:
-            d1_task = asyncio.create_task(fetch(bot, ex1, coin))
-            d2_task = asyncio.create_task(fetch(bot, ex2, coin))
-            d1, d2 = await asyncio.gather(d1_task, d2_task, return_exceptions=True)
-            
-            if isinstance(d1, Exception) or isinstance(d2, Exception):
+    for i in range(0, total, COIN_BATCH_SIZE):
+        batch = coins[i:i + COIN_BATCH_SIZE]
+
+        batch_tasks = [asyncio.create_task(scan_coin(bot, c, coins_by_exchange, exchanges, sem)) for c in batch]
+        batch_results = await asyncio.gather(*batch_tasks, return_exceptions=True)
+
+        for res in batch_results:
+            if isinstance(res, Exception) or not res:
                 continue
-            if not d1 or not d2:
-                continue
+            found_all.extend(res)
 
-            # нужны bid/ask с обеих сторон
-            if d1.get("ask") is None or d1.get("bid") is None:
-                continue
-            if d2.get("ask") is None or d2.get("bid") is None:
-                continue
+        processed += len(batch)
 
-            # LONG ex1 / SHORT ex2
-            sp12 = calc_open_spread_pct(d1["ask"], d2["bid"])
-            if sp12 is not None and sp12 >= MIN_SPREAD:
-                found.append((coin, ex1, ex2, sp12))
+        # прогресс раз в пачку
+        logger.info(f"scan progress: {processed}/{total} coins")
 
-            # LONG ex2 / SHORT ex1
-            sp21 = calc_open_spread_pct(d2["ask"], d1["bid"])
-            if sp21 is not None and sp21 >= MIN_SPREAD:
-                found.append((coin, ex2, ex1, sp21))
-
-    # сортируем по спреду (desc) чтобы в лог шло от лучшего
-    found.sort(key=lambda x: x[3], reverse=True)
-    return found
+    found_all.sort(key=lambda x: x[3], reverse=True)
+    return found_all
 
 
 async def main():
@@ -163,28 +213,25 @@ async def main():
     try:
         exchanges = [ex for ex in bot.exchanges.keys() if ex not in EXCLUDE_EXCHANGES]
         
+        # Создаем семафор для ограничения параллелизма
+        sem = asyncio.Semaphore(MAX_CONCURRENCY)
+        
         # Собираем карту монет для каждой биржи
-        coins_map = await collect_coins_map(bot, exchanges)
+        coins_by_exchange = await collect_coins_by_exchange(bot, exchanges)
+        coins = build_union(coins_by_exchange)
         
-        # Статистика
-        total_union = set().union(*coins_map.values()) if coins_map else set()
-        logger.info(f"Всего монет (union по биржам): {len(total_union)}")
-        
-        empty = [ex for ex, s in coins_map.items() if not s]
-        if empty:
-            logger.warning(f"Биржи без списка монет (будут фактически пропущены): {empty}")
-        
-        # Логируем количество монет на каждой бирже
-        for ex, coins_set in coins_map.items():
-            logger.info(f"{ex}: {len(coins_set)} монет")
+        logger.info(f"Всего монет (union по биржам): {len(coins)}")
+        for ex in exchanges:
+            logger.info(f"{ex}: {len(coins_by_exchange.get(ex, set()))} монет")
 
         logger.info(
             f"scan_spreads started | MIN_SPREAD={MIN_SPREAD:.2f}% | interval={SCAN_INTERVAL_SEC}s | "
-            f"exchanges={exchanges} | total_coins={len(total_union)}"
+            f"exchanges={exchanges} | total_coins={len(coins)} | "
+            f"batch={COIN_BATCH_SIZE} | max_concurrency={MAX_CONCURRENCY}"
         )
 
         while True:
-            found = await scan_once(bot, exchanges, coins_map)
+            found = await scan_once(bot, exchanges, coins, coins_by_exchange, sem)
 
             # Пишем в лог ТОЛЬКО если нашли
             if found:
