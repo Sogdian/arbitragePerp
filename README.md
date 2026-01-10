@@ -45,6 +45,7 @@ python bot.py
 - **XT.com** (xt) ✅
 - **Binance** (binance) ✅
 - **Bitget** (bitget) ✅
+- **OKX** (okx) ✅
 
 ## Вывод
 

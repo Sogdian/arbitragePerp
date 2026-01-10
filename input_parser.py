@@ -51,7 +51,7 @@ def parse_input(input_text: str) -> Optional[Dict]:
     
     # Проверяем, что биржи поддерживаются
     # LBank временно отключен для арбитража (код не удален)
-    supported_exchanges = {"bybit", "gate", "mexc", "xt", "binance", "bitget"}
+    supported_exchanges = {"bybit", "gate", "mexc", "xt", "binance", "bitget", "okx"}
     if long_exchange not in supported_exchanges:
         logger.error(f"Неподдерживаемая биржа для Long: {long_exchange}. Поддерживаются: {supported_exchanges}")
         return None
