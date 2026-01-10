@@ -67,8 +67,28 @@ class AsyncXtExchange(AsyncBaseExchange):
                 return None
             
             last = float(last_price)
-            bid = float(result.get("b", last_price))
-            ask = float(result.get("a", last_price))
+            bid_raw = result.get("b")
+            ask_raw = result.get("a")
+            
+            # Проверка на разумность значений: если bid/ask сильно отличаются от last_price (> 10x), вероятно ошибка
+            # Используем last_price как fallback
+            if bid_raw:
+                bid_val = float(bid_raw)
+                if bid_val > 0 and (bid_val > last * 10 or bid_val < last / 10):
+                    bid = last
+                else:
+                    bid = bid_val
+            else:
+                bid = last
+            
+            if ask_raw:
+                ask_val = float(ask_raw)
+                if ask_val > 0 and (ask_val > last * 10 or ask_val < last / 10):
+                    ask = last
+                else:
+                    ask = ask_val
+            else:
+                ask = last
             
             return {
                 "price": last,

@@ -110,24 +110,30 @@ class PerpArbitrageBot:
             "funding_rate": funding_rate
         }
     
-    def calculate_spread(self, price1: Optional[float], price2: Optional[float]) -> Optional[float]:
+    def calculate_spread(self, price_short: Optional[float], price_long: Optional[float]) -> Optional[float]:
         """
-        Вычислить спред между двумя ценами (в процентах)
+        Вычислить спред на цену для арбитража (в процентах)
+        
+        Формула: (price_short - price_long) / price_long * 100
+        
+        Для схемы Long (A) / Short (B):
+        - Положительный спред = хорошо (цена на Short бирже выше)
+        - Отрицательный спред = плохо (цена на Short бирже ниже)
         
         Args:
-            price1: Первая цена
-            price2: Вторая цена
+            price_short: Цена на бирже Short
+            price_long: Цена на бирже Long
             
         Returns:
             Спред в процентах или None если невозможно вычислить
         """
-        if price1 is None or price2 is None:
+        if price_short is None or price_long is None:
             return None
         
-        if price2 == 0:
+        if price_long == 0:
             return None
         
-        spread = ((price1 - price2) / price2) * 100
+        spread = ((price_short - price_long) / price_long) * 100
         return spread
     
     def calculate_funding_spread(self, funding_long: Optional[float], funding_short: Optional[float]) -> Optional[float]:
@@ -255,7 +261,9 @@ class PerpArbitrageBot:
         # Вычисляем спреды
         price_spread = None
         if price_long is not None and price_short is not None:
-            price_spread = self.calculate_spread(price_long, price_short)
+            # Формула: (price_short - price_long) / price_long * 100
+            # Положительный спред = хорошо (цена на Short бирже выше)
+            price_spread = self.calculate_spread(price_short, price_long)
             if price_spread is not None:
                 logger.info(f"({long_exchange} и {short_exchange}) Спред на цену: {price_spread:.4f}%")
             else:
@@ -459,6 +467,7 @@ class PerpArbitrageBot:
                     # Рассчитываем спреды
                     opening_spread = self.calculate_opening_spread(ask_long, bid_short)
                     closing_spread = self.calculate_closing_spread(bid_long, ask_short)
+                    
                     
                     # Форматируем фандинги в проценты
                     funding_long_pct = funding_long * 100 if funding_long is not None else None

@@ -65,10 +65,50 @@ class AsyncBybitExchange(AsyncBaseExchange):
             if last_price is None:
                 return None
             
+            last = float(last_price)
+            
+            # Проверка, что last_price тоже валиден (не мусор)
+            if last <= 0:
+                return None
+            
+            def _safe_px(raw: object, fallback: float) -> float:
+                """
+                Безопасное преобразование цены с проверками на разумность
+                
+                Args:
+                    raw: Сырое значение цены (может быть строкой, числом, None, или мусором)
+                    fallback: Значение по умолчанию (обычно last_price)
+                    
+                Returns:
+                    Валидная цена или fallback
+                """
+                try:
+                    v = float(raw)
+                except (TypeError, ValueError):
+                    return fallback
+                
+                if v <= 0:
+                    return fallback
+                
+                # Sanity check: если отличается от fallback больше чем в 10 раз — считаем мусором
+                # Порог 10x обычно достаточен; для очень волатильных инструментов можно сделать параметром (5x-20x)
+                if v > fallback * 10 or v < fallback / 10:
+                    return fallback
+                
+                return v
+            
+            bid = _safe_px(item.get("bid1Price"), last)
+            ask = _safe_px(item.get("ask1Price"), last)
+            
+            # Если после проверок bid > ask (бывает на мусорных данных) — откатываем на last
+            if bid > ask:
+                bid = last
+                ask = last
+            
             return {
-                "price": float(last_price),
-                "bid": float(item.get("bid1Price", last_price)),
-                "ask": float(item.get("ask1Price", last_price)),
+                "price": last,
+                "bid": bid,
+                "ask": ask,
             }
                 
         except Exception as e:
