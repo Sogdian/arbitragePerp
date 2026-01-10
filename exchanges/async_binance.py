@@ -6,9 +6,10 @@
 - Символ: COINUSDT (без подчеркивания)
 - Если COINUSDT не найден → считаем, что инструмента нет
 """
-from typing import Dict, Optional, List
+from typing import Dict, Optional, Set
 import logging
 from .async_base_exchange import AsyncBaseExchange
+from .coin_list_fetchers import fetch_binance_coins
 
 logger = logging.getLogger(__name__)
 
@@ -221,33 +222,11 @@ class AsyncBinanceExchange(AsyncBaseExchange):
             logger.error(f"Binance: ошибка при получении orderbook для {coin}: {e}", exc_info=True)
             return None
 
-    async def get_all_futures_coins(self) -> List[str]:
+    async def get_all_futures_coins(self) -> Set[str]:
         """
-        Возвращает список монет, доступных во фьючерсах на Binance.
+        Возвращает множество монет, доступных во фьючерсах на Binance.
         
         Returns:
-            Список монет без суффиксов (например, ["BTC", "ETH", "SOL", ...])
+            Множество монет без суффиксов (например, {"BTC", "ETH", "SOL", ...})
         """
-        try:
-            url = "/fapi/v1/exchangeInfo"
-            
-            data = await self._request_json("GET", url, params=None)
-            if not data or not isinstance(data, dict):
-                logger.warning("Binance: не удалось получить exchangeInfo")
-                return []
-            
-            symbols = data.get("symbols") or []
-            coins = []
-            for symbol_info in symbols:
-                symbol = symbol_info.get("symbol", "")
-                contract_type = symbol_info.get("contractType", "")
-                # Только perpetual контракты
-                if contract_type == "PERPETUAL" and symbol.endswith("USDT"):
-                    coin = symbol[:-4]  # Убираем "USDT"
-                    if coin:
-                        coins.append(coin)
-            
-            return sorted(set(coins))
-        except Exception as e:
-            logger.error(f"Binance: ошибка при получении списка монет: {e}", exc_info=True)
-            return []
+        return await fetch_binance_coins(self)

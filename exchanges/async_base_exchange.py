@@ -3,7 +3,7 @@
 Использует httpx.AsyncClient, должен наследоваться всеми async-* биржами.
 """
 from abc import ABC, abstractmethod
-from typing import Dict, Optional, List, Tuple, Sequence, Union, Any
+from typing import Dict, Optional, List, Tuple, Sequence, Union, Any, Set
 import httpx
 import asyncio
 import logging
@@ -254,14 +254,14 @@ class AsyncBaseExchange(ABC):
         pass
 
     @abstractmethod
-    async def get_all_futures_coins(self) -> List[str]:
+    async def get_all_futures_coins(self) -> Set[str]:
         """
-        Возвращает список монет, доступных во фьючерсах на этой бирже.
+        Вернуть множество монет (base asset) доступных в USDT-M perpetual на этой бирже.
         
         Returns:
-            Список монет без суффиксов (например, ["BTC", "ETH", "SOL", ...])
+            Множество монет без суффиксов (например, {"BTC", "ETH", ...})
         """
-        pass
+        raise NotImplementedError
 
     async def get_orderbook(self, coin: str, limit: int = 50) -> Optional[Dict]:
         """
@@ -283,4 +283,5 @@ class AsyncBaseExchange(ABC):
         """
         logger.warning(f"{self.name}: get_orderbook не реализован")
         return None
+
 

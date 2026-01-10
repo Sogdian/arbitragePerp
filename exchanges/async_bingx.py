@@ -7,9 +7,10 @@
 - API версия: v2
 - Если COIN-USDT не найден → считаем, что инструмента нет
 """
-from typing import Dict, Optional, Any, List
+from typing import Dict, Optional, Any, Set
 import logging
 from .async_base_exchange import AsyncBaseExchange
+from .coin_list_fetchers import fetch_bingx_coins
 
 logger = logging.getLogger(__name__)
 
@@ -266,44 +267,12 @@ class AsyncBingxExchange(AsyncBaseExchange):
             logger.error(f"BingX: ошибка при получении orderbook для {coin}: {e}", exc_info=True)
             return None
 
-    async def get_all_futures_coins(self) -> List[str]:
+    async def get_all_futures_coins(self) -> Set[str]:
         """
-        Возвращает список монет, доступных во фьючерсах на BingX.
+        Возвращает множество монет, доступных во фьючерсах на BingX.
         
         Returns:
-            Список монет без суффиксов (например, ["BTC", "ETH", "SOL", ...])
+            Множество монет без суффиксов (например, {"BTC", "ETH", "SOL", ...})
         """
-        try:
-            url = "/openApi/swap/v2/quote/contracts"
-            
-            data = await self._request_json("GET", url, params=None)
-            if not data or self._is_api_error(data):
-                logger.warning("BingX: не удалось получить список контрактов")
-                return []
-            
-            contracts_data = data.get("data")
-            if isinstance(contracts_data, list) and contracts_data:
-                contracts_data = contracts_data[0]
-            if not isinstance(contracts_data, dict):
-                contracts_list = data.get("data") or []
-            else:
-                contracts_list = contracts_data.get("data") or []
-            
-            if not isinstance(contracts_list, list):
-                contracts_list = []
-            
-            coins = []
-            for contract in contracts_list:
-                if isinstance(contract, dict):
-                    symbol = contract.get("symbol", "")
-                    # Извлекаем монету из символа (например, "BTC-USDT" -> "BTC")
-                    if symbol.endswith("-USDT"):
-                        coin = symbol[:-5]  # Убираем "-USDT"
-                        if coin:
-                            coins.append(coin)
-            
-            return sorted(set(coins))
-        except Exception as e:
-            logger.error(f"BingX: ошибка при получении списка монет: {e}", exc_info=True)
-            return []
+        return await fetch_bingx_coins(self)
 

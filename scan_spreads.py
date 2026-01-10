@@ -102,7 +102,8 @@ async def collect_all_coins(bot: PerpArbitrageBot, exchanges: List[str]) -> List
     for ex, res in zip(exchanges, results):
         if isinstance(res, Exception) or not res:
             continue
-        sets.append(set(res))
+        # res уже является Set[str]
+        sets.append(res)
     
     # берем объединение всех монет со всех бирж
     if not sets:

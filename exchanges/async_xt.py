@@ -7,9 +7,10 @@
 - Символ: coin_usdt (нижний регистр, с подчеркиванием)
 - Если coin_usdt не найден → считаем, что инструмента нет
 """
-from typing import Dict, Optional, List
+from typing import Dict, Optional, Set
 import logging
 from .async_base_exchange import AsyncBaseExchange
+from .coin_list_fetchers import fetch_xt_coins
 
 logger = logging.getLogger(__name__)
 
@@ -187,36 +188,12 @@ class AsyncXtExchange(AsyncBaseExchange):
             logger.error(f"XT: orderbook error for {coin}: {e}", exc_info=True)
             return None
 
-    async def get_all_futures_coins(self) -> List[str]:
+    async def get_all_futures_coins(self) -> Set[str]:
         """
-        Возвращает список монет, доступных во фьючерсах на XT.com.
+        Возвращает множество монет, доступных во фьючерсах на XT.com.
         
         Returns:
-            Список монет без суффиксов (например, ["BTC", "ETH", "SOL", ...])
+            Множество монет без суффиксов (например, {"BTC", "ETH", "SOL", ...})
         """
-        try:
-            url = "/future/market/v1/public/q/instruments"
-            
-            data = await self._request_json("GET", url, params=None)
-            if not data or data.get("returnCode") != 0:
-                logger.warning("XT: не удалось получить список инструментов")
-                return []
-            
-            result = data.get("result")
-            if not result or not isinstance(result, list):
-                return []
-            
-            coins = []
-            for item in result:
-                symbol = item.get("symbol", "")
-                # Извлекаем монету из символа (например, "btc_usdt" -> "BTC")
-                if symbol.endswith("_usdt"):
-                    coin = symbol[:-5].upper()  # Убираем "_usdt" и приводим к верхнему регистру
-                    if coin:
-                        coins.append(coin)
-            
-            return sorted(set(coins))
-        except Exception as e:
-            logger.error(f"XT: ошибка при получении списка монет: {e}", exc_info=True)
-            return []
+        return await fetch_xt_coins(self)
 

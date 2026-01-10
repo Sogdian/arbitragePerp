@@ -5,10 +5,11 @@
 - Базовый URL: https://lbkperp.lbank.com
 - Эндпоинты: /cfd/openApi/v1/pub/*
 """
-from typing import Dict, Optional, List
+from typing import Dict, Optional, Set
 import logging
 import time
 from .async_base_exchange import AsyncBaseExchange
+from .coin_list_fetchers import fetch_lbank_coins
 
 logger = logging.getLogger(__name__)
 
@@ -527,30 +528,12 @@ class AsyncLbankExchange(AsyncBaseExchange):
 
         return {"bids": bids[:depth], "asks": asks[:depth]}
 
-    async def get_all_futures_coins(self) -> List[str]:
+    async def get_all_futures_coins(self) -> Set[str]:
         """
-        Возвращает список монет, доступных во фьючерсах на LBank.
+        Возвращает множество монет, доступных во фьючерсах на LBank.
         
         Returns:
-            Список монет без суффиксов (например, ["BTC", "ETH", "SOL", ...])
+            Множество монет без суффиксов (например, {"BTC", "ETH", "SOL", ...})
         """
-        try:
-            instruments_list = await self._get_instruments_with_cache()
-            if not instruments_list:
-                return []
-            
-            coins = []
-            for instrument in instruments_list:
-                symbol = instrument.get("symbol", "")
-                # Извлекаем монету из символа (например, "BTCUSDT" -> "BTC")
-                symbol_canon = self._canon(symbol)
-                if symbol_canon.endswith("USDT"):
-                    coin = symbol_canon[:-4]  # Убираем "USDT"
-                    if coin:
-                        coins.append(coin)
-            
-            return sorted(set(coins))
-        except Exception as e:
-            logger.error(f"LBank: ошибка при получении списка монет: {e}", exc_info=True)
-            return []
+        return await fetch_lbank_coins(self)
 

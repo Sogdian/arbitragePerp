@@ -1,9 +1,10 @@
 """
 Асинхронная реализация Gate.io для фьючерсов на базе AsyncBaseExchange
 """
-from typing import Dict, Optional, List, Tuple, Any
+from typing import Dict, Optional, Set, Tuple, Any, List
 import logging
 from .async_base_exchange import AsyncBaseExchange
+from .coin_list_fetchers import fetch_gate_coins
 
 logger = logging.getLogger(__name__)
 
@@ -225,31 +226,11 @@ class AsyncGateExchange(AsyncBaseExchange):
             logger.error(f"Gate: ошибка при получении orderbook для {coin}: {e}", exc_info=True)
             return None
 
-    async def get_all_futures_coins(self) -> List[str]:
+    async def get_all_futures_coins(self) -> Set[str]:
         """
-        Возвращает список монет, доступных во фьючерсах на Gate.io.
+        Возвращает множество монет, доступных во фьючерсах на Gate.io.
         
         Returns:
-            Список монет без суффиксов (например, ["BTC", "ETH", "SOL", ...])
+            Множество монет без суффиксов (например, {"BTC", "ETH", "SOL", ...})
         """
-        try:
-            url = "/api/v4/futures/usdt/contracts"
-            
-            data = await self._request_json("GET", url, params=None)
-            if not data or not isinstance(data, list):
-                logger.warning("Gate: не удалось получить список контрактов")
-                return []
-            
-            coins = []
-            for contract in data:
-                contract_name = contract.get("name", "")
-                # Извлекаем монету из имени контракта (например, "BTC_USDT" -> "BTC")
-                if contract_name.endswith("_USDT"):
-                    coin = contract_name[:-5]  # Убираем "_USDT"
-                    if coin:
-                        coins.append(coin)
-            
-            return sorted(set(coins))
-        except Exception as e:
-            logger.error(f"Gate: ошибка при получении списка монет: {e}", exc_info=True)
-            return []
+        return await fetch_gate_coins(self)

@@ -5,19 +5,20 @@
 - Рынок: USDT-M Futures (Perpetual)
 - Символ: COINUSDT (без подчеркивания и суффиксов)
 - API версия: v2
-- productType: usdt-futures
+- productType: umcbl (USDT-M Futures)
 - Если COINUSDT не найден → считаем, что инструмента нет
 """
-from typing import Dict, Optional, List
+from typing import Dict, Optional, Set
 import logging
 from .async_base_exchange import AsyncBaseExchange
+from .coin_list_fetchers import fetch_bitget_coins
 
 logger = logging.getLogger(__name__)
 
 
 class AsyncBitgetExchange(AsyncBaseExchange):
     BASE_URL = "https://api.bitget.com"
-    PRODUCT_TYPE = "usdt-futures"
+    PRODUCT_TYPE = "umcbl"  # USDT-M Futures (Perpetual)
 
     def __init__(self, pool_limit: int = 100):
         super().__init__("Bitget", pool_limit)
@@ -197,44 +198,11 @@ class AsyncBitgetExchange(AsyncBaseExchange):
             logger.error(f"Bitget: ошибка при получении orderbook для {coin}: {e}", exc_info=True)
             return None
 
-    async def get_all_futures_coins(self) -> List[str]:
+    async def get_all_futures_coins(self) -> Set[str]:
         """
-        Возвращает список монет, доступных во фьючерсах на Bitget.
+        Возвращает множество монет, доступных во фьючерсах на Bitget.
         
         Returns:
-            Список монет без суффиксов (например, ["BTC", "ETH", "SOL", ...])
+            Множество монет без суффиксов (например, {"BTC", "ETH", "SOL", ...})
         """
-        try:
-            url = "/api/v2/mix/market/contracts"
-            params = {"productType": self.PRODUCT_TYPE}
-            
-            data = await self._request_json("GET", url, params=params)
-            if not data or self._is_api_error(data):
-                logger.warning("Bitget: не удалось получить список контрактов")
-                return []
-            
-            contracts_data = data.get("data")
-            if isinstance(contracts_data, list) and contracts_data:
-                contracts_data = contracts_data[0]
-            if not isinstance(contracts_data, dict):
-                contracts_list = data.get("data") or []
-            else:
-                contracts_list = contracts_data.get("data") or []
-            
-            if not isinstance(contracts_list, list):
-                contracts_list = []
-            
-            coins = []
-            for contract in contracts_list:
-                if isinstance(contract, dict):
-                    symbol = contract.get("symbol", "")
-                    # Извлекаем монету из символа (например, "BTCUSDT" -> "BTC")
-                    if symbol.endswith("USDT"):
-                        coin = symbol[:-4]  # Убираем "USDT"
-                        if coin:
-                            coins.append(coin)
-            
-            return sorted(set(coins))
-        except Exception as e:
-            logger.error(f"Bitget: ошибка при получении списка монет: {e}", exc_info=True)
-            return []
+        return await fetch_bitget_coins(self)
