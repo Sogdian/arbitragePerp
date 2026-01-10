@@ -233,13 +233,13 @@ class PerpArbitrageBot:
             price_long = long_data.get("price")
             funding_long = long_data.get("funding_rate")
             
-            logger.info(f"({long_exchange} Long) ({coin}) Цена: {price_long}")
+            logger.info(f"(Long {long_exchange}) ({coin}) Цена: {price_long}")
             
             if funding_long is not None:
                 funding_long_pct = funding_long * 100
-                logger.info(f"({long_exchange} Long) ({coin}) Фандинг: {funding_long_pct:.6f}%")
+                logger.info(f"(Long {long_exchange}) ({coin}) Фандинг: {funding_long_pct:.6f}%")
             else:
-                logger.info(f"({long_exchange} Long) ({coin}) Фандинг: недоступно")
+                logger.info(f"(Long {long_exchange}) ({coin}) Фандинг: недоступно")
         else:
             logger.error(f"Не удалось получить данные с {long_exchange}")
             price_long = None
@@ -250,13 +250,13 @@ class PerpArbitrageBot:
             price_short = short_data.get("price")
             funding_short = short_data.get("funding_rate")
             
-            logger.info(f"({short_exchange} Short) ({coin}) Цена: {price_short}")
+            logger.info(f"(Short {short_exchange}) ({coin}) Цена: {price_short}")
             
             if funding_short is not None:
                 funding_short_pct = funding_short * 100
-                logger.info(f"({short_exchange} Short) ({coin}) Фандинг: {funding_short_pct:.6f}%")
+                logger.info(f"(Short {short_exchange}) ({coin}) Фандинг: {funding_short_pct:.6f}%")
             else:
-                logger.info(f"({short_exchange} Short) ({coin}) Фандинг: недоступно")
+                logger.info(f"(Short {short_exchange}) ({coin}) Фандинг: недоступно")
         else:
             logger.error(f"Не удалось получить данные с {short_exchange}")
             price_short = None
