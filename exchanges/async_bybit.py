@@ -9,7 +9,7 @@
 - USDC / inverse / альтернативные категории - НЕ поддерживаются
 - Если COINUSDT не найден → считаем, что инструмента нет
 """
-from typing import Dict, Optional
+from typing import Dict, Optional, List
 import logging
 from .async_base_exchange import AsyncBaseExchange
 
@@ -196,5 +196,39 @@ class AsyncBybitExchange(AsyncBaseExchange):
         except Exception as e:
             logger.error(f"Bybit: ошибка при получении orderbook для {coin}: {e}", exc_info=True)
             return None
-    
+
+    async def get_all_futures_coins(self) -> List[str]:
+        """
+        Возвращает список монет, доступных во фьючерсах на Bybit.
+        
+        Returns:
+            Список монет без суффиксов (например, ["BTC", "ETH", "SOL", ...])
+        """
+        try:
+            url = "/v5/market/instruments-info"
+            params = {"category": "linear"}
+            
+            data = await self._request_json("GET", url, params=params)
+            if not data or data.get("retCode") != 0:
+                logger.warning("Bybit: не удалось получить список инструментов")
+                return []
+            
+            result = data.get("result")
+            if not result:
+                return []
+            
+            list_data = result.get("list") or []
+            coins = []
+            for item in list_data:
+                symbol = item.get("symbol", "")
+                # Извлекаем монету из символа (например, "BTCUSDT" -> "BTC")
+                if symbol.endswith("USDT"):
+                    coin = symbol[:-4]  # Убираем "USDT"
+                    if coin:
+                        coins.append(coin)
+            
+            return sorted(set(coins))
+        except Exception as e:
+            logger.error(f"Bybit: ошибка при получении списка монет: {e}", exc_info=True)
+            return []
 

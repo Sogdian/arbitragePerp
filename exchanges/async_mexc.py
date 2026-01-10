@@ -324,3 +324,46 @@ class AsyncMexcExchange(AsyncBaseExchange):
         except Exception as e:
             logger.error(f"MEXC: ошибка при получении orderbook для {coin}: {e}", exc_info=True)
             return None
+
+    async def get_all_futures_coins(self) -> List[str]:
+        """
+        Возвращает список монет, доступных во фьючерсах на MEXC.
+        
+        Returns:
+            Список монет без суффиксов (например, ["BTC", "ETH", "SOL", ...])
+        """
+        try:
+            url = "/api/v1/contract/symbols"
+            
+            data = await self._request_json_with_domain_fallback(
+                "GET",
+                url,
+                params=None,
+                retries_per_domain=1,
+                backoff_s=0.25,
+            )
+            if not data or (isinstance(data, dict) and data.get("code") != 0):
+                logger.warning("MEXC: не удалось получить список символов")
+                return []
+            
+            # MEXC может вернуть data как список или как dict с полем data
+            symbols_list = data if isinstance(data, list) else (data.get("data") or [])
+            
+            coins = []
+            for symbol_item in symbols_list:
+                if isinstance(symbol_item, dict):
+                    symbol = symbol_item.get("symbol", "")
+                else:
+                    symbol = str(symbol_item)
+                
+                # Извлекаем монету из символа (например, "BTC_USDT" -> "BTC" или "BTCUSDT" -> "BTC")
+                symbol_clean = symbol.replace("_", "").replace("-", "").upper()
+                if symbol_clean.endswith("USDT"):
+                    coin = symbol_clean[:-4]  # Убираем "USDT"
+                    if coin:
+                        coins.append(coin)
+            
+            return sorted(set(coins))
+        except Exception as e:
+            logger.error(f"MEXC: ошибка при получении списка монет: {e}", exc_info=True)
+            return []

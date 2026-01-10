@@ -253,6 +253,16 @@ class AsyncBaseExchange(ABC):
         """Преобразует монету в формат биржи для фьючерсов"""
         pass
 
+    @abstractmethod
+    async def get_all_futures_coins(self) -> List[str]:
+        """
+        Возвращает список монет, доступных во фьючерсах на этой бирже.
+        
+        Returns:
+            Список монет без суффиксов (например, ["BTC", "ETH", "SOL", ...])
+        """
+        pass
+
     async def get_orderbook(self, coin: str, limit: int = 50) -> Optional[Dict]:
         """
         Получить orderbook (книгу заявок) для монеты

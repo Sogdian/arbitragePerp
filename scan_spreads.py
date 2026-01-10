@@ -45,9 +45,8 @@ MIN_SPREAD = float(os.getenv("MIN_SPREAD", "2"))  # в процентах, на�
 SCAN_INTERVAL_SEC = float(os.getenv("SCAN_INTERVAL_SEC", "5"))  # каждые N секунд
 EXCLUDE_EXCHANGES = {"lbank"}  # не использовать
 
-# Монеты: можно задать в .env как COINS=BTC,ETH,SOL
-COINS_ENV = os.getenv("COINS", "").strip()
-COINS = [c.strip().upper() for c in COINS_ENV.split(",") if c.strip()] or ["BTC", "ETH", "SOL"]
+# Монеты теперь собираются автоматически со всех бирж
+# COINS из .env больше не используется
 
 
 # ----------------------------
@@ -85,14 +84,42 @@ async def fetch(bot: PerpArbitrageBot, ex: str, coin: str) -> Optional[Dict[str,
     return await bot.get_futures_data(ex, coin)
 
 
-async def scan_once(bot: PerpArbitrageBot, exchanges: List[str]) -> List[Tuple[str, str, str, float]]:
+async def collect_all_coins(bot: PerpArbitrageBot, exchanges: List[str]) -> List[str]:
+    """
+    Собирает список всех монет со всех бирж и возвращает их объединение.
+    
+    Returns:
+        Отсортированный список всех монет, доступных хотя бы на одной бирже
+    """
+    tasks = []
+    for ex in exchanges:
+        ex_obj = bot.exchanges[ex]
+        tasks.append(ex_obj.get_all_futures_coins())
+    
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    
+    sets = []
+    for ex, res in zip(exchanges, results):
+        if isinstance(res, Exception) or not res:
+            continue
+        sets.append(set(res))
+    
+    # берем объединение всех монет со всех бирж
+    if not sets:
+        return []
+    
+    common = set.union(*sets)   # все монеты со всех бирж
+    return sorted(common)
+
+
+async def scan_once(bot: PerpArbitrageBot, exchanges: List[str], coins: List[str]) -> List[Tuple[str, str, str, float]]:
     """
     Возвращает список найденных возможностей в виде:
     (coin, long_exchange, short_exchange, open_spread_pct)
     """
     found: List[Tuple[str, str, str, float]] = []
 
-    for coin in COINS:
+    for coin in coins:
         # 1) Запрашиваем все биржи параллельно
         tasks = {ex: asyncio.create_task(fetch(bot, ex, coin)) for ex in exchanges}
         results = await asyncio.gather(*tasks.values(), return_exceptions=True)
@@ -136,14 +163,18 @@ async def main():
     bot = PerpArbitrageBot()
     try:
         exchanges = [ex for ex in bot.exchanges.keys() if ex not in EXCLUDE_EXCHANGES]
+        
+        # Собираем все монеты со всех бирж
+        coins = await collect_all_coins(bot, exchanges)
+        logger.info(f"Всего монет для сканирования: {len(coins)}")
 
         logger.info(
             f"scan_spreads started | MIN_SPREAD={MIN_SPREAD:.2f}% | interval={SCAN_INTERVAL_SEC}s | "
-            f"exchanges={exchanges} | coins={COINS}"
+            f"exchanges={exchanges} | coins_count={len(coins)}"
         )
 
         while True:
-            found = await scan_once(bot, exchanges)
+            found = await scan_once(bot, exchanges, coins)
 
             # Пишем в лог ТОЛЬКО если нашли
             if found:

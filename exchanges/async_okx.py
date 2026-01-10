@@ -7,7 +7,7 @@
 - API версия: v5
 - Если COIN-USDT-SWAP не найден → считаем, что инструмента нет
 """
-from typing import Dict, Optional
+from typing import Dict, Optional, List
 import logging
 from .async_base_exchange import AsyncBaseExchange
 
@@ -255,4 +255,39 @@ class AsyncOkxExchange(AsyncBaseExchange):
         except Exception as e:
             logger.error(f"OKX: ошибка при получении orderbook для {coin}: {e}", exc_info=True)
             return None
+
+    async def get_all_futures_coins(self) -> List[str]:
+        """
+        Возвращает список монет, доступных во фьючерсах на OKX.
+        
+        Returns:
+            Список монет без суффиксов (например, ["BTC", "ETH", "SOL", ...])
+        """
+        try:
+            url = "/api/v5/public/instruments"
+            params = {"instType": "SWAP"}
+            
+            data = await self._request_json("GET", url, params=params)
+            if not data or self._is_api_error(data):
+                logger.warning("OKX: не удалось получить список инструментов")
+                return []
+            
+            data_list = data.get("data")
+            if not isinstance(data_list, list):
+                return []
+            
+            coins = []
+            for inst in data_list:
+                if isinstance(inst, dict):
+                    inst_id = inst.get("instId", "")
+                    # Извлекаем монету из instId (например, "BTC-USDT-SWAP" -> "BTC")
+                    if inst_id.endswith("-USDT-SWAP"):
+                        coin = inst_id[:-10]  # Убираем "-USDT-SWAP"
+                        if coin:
+                            coins.append(coin)
+            
+            return sorted(set(coins))
+        except Exception as e:
+            logger.error(f"OKX: ошибка при получении списка монет: {e}", exc_info=True)
+            return []
 

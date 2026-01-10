@@ -8,7 +8,7 @@
 - productType: usdt-futures
 - Если COINUSDT не найден → считаем, что инструмента нет
 """
-from typing import Dict, Optional
+from typing import Dict, Optional, List
 import logging
 from .async_base_exchange import AsyncBaseExchange
 
@@ -196,3 +196,45 @@ class AsyncBitgetExchange(AsyncBaseExchange):
         except Exception as e:
             logger.error(f"Bitget: ошибка при получении orderbook для {coin}: {e}", exc_info=True)
             return None
+
+    async def get_all_futures_coins(self) -> List[str]:
+        """
+        Возвращает список монет, доступных во фьючерсах на Bitget.
+        
+        Returns:
+            Список монет без суффиксов (например, ["BTC", "ETH", "SOL", ...])
+        """
+        try:
+            url = "/api/v2/mix/market/contracts"
+            params = {"productType": self.PRODUCT_TYPE}
+            
+            data = await self._request_json("GET", url, params=params)
+            if not data or self._is_api_error(data):
+                logger.warning("Bitget: не удалось получить список контрактов")
+                return []
+            
+            contracts_data = data.get("data")
+            if isinstance(contracts_data, list) and contracts_data:
+                contracts_data = contracts_data[0]
+            if not isinstance(contracts_data, dict):
+                contracts_list = data.get("data") or []
+            else:
+                contracts_list = contracts_data.get("data") or []
+            
+            if not isinstance(contracts_list, list):
+                contracts_list = []
+            
+            coins = []
+            for contract in contracts_list:
+                if isinstance(contract, dict):
+                    symbol = contract.get("symbol", "")
+                    # Извлекаем монету из символа (например, "BTCUSDT" -> "BTC")
+                    if symbol.endswith("USDT"):
+                        coin = symbol[:-4]  # Убираем "USDT"
+                        if coin:
+                            coins.append(coin)
+            
+            return sorted(set(coins))
+        except Exception as e:
+            logger.error(f"Bitget: ошибка при получении списка монет: {e}", exc_info=True)
+            return []
