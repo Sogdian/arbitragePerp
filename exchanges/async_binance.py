@@ -23,89 +23,95 @@ class AsyncBinanceExchange(AsyncBaseExchange):
         """Преобразует монету в формат Binance для фьючерсов (например, CVC -> CVCUSDT)"""
         return f"{coin.upper()}USDT"
 
+    def _safe_px(self, raw: object, fallback: float) -> float:
+        """
+        Безопасное преобразование цены с проверками на разумность
+
+        Args:
+            raw: Сырое значение цены (может быть строкой, числом, None, или мусором)
+            fallback: Значение по умолчанию (обычно last_price)
+
+        Returns:
+            Валидная цена или fallback
+        """
+        try:
+            v = float(raw)
+        except (TypeError, ValueError):
+            return fallback
+
+        if v <= 0:
+            return fallback
+
+        # Sanity check: если отличается от fallback больше чем в 10 раз — считаем мусором
+        if v > fallback * 10 or v < fallback / 10:
+            return fallback
+
+        return v
+
+    def _is_api_error(self, data: object) -> bool:
+        """
+        Binance возвращает ошибки в формате {"code": -1121, "msg": "Invalid symbol."}
+        Успешные ответы (для этих эндпоинтов) не должны содержать поле "code".
+        """
+        return isinstance(data, dict) and "code" in data
+
     async def get_futures_ticker(self, coin: str) -> Optional[Dict]:
         """
         Получить тикер фьючерса для монеты
-        
-        Args:
-            coin: Название монеты без /USDT (например, "CVC")
-            
+
         Returns:
-            Словарь с данными тикера:
             {
-                "price": float,  # Текущая цена
-                "bid": float,     # Лучшая цена покупки
-                "ask": float,     # Лучшая цена продажи
+                "price": float,  # Текущая цена (last)
+                "bid": float,    # Лучшая цена покупки
+                "ask": float,    # Лучшая цена продажи
             }
-            или None если ошибка
+            или None если ошибка/символ не найден
         """
         try:
             symbol = self._normalize_symbol(coin)
             url = "/fapi/v1/ticker/24hr"
             params = {"symbol": symbol}
-            
+
             data = await self._request_json("GET", url, params=params)
             if not data:
-                logger.warning(f"Binance: тикер для {coin} не найден")
+                logger.warning(f"Binance: пустой ответ ticker для {coin} (symbol={symbol})")
                 return None
-            
-            # Binance возвращает ошибки в формате {"code": -1121, "msg": "Invalid symbol."}
-            # Успешные ответы не содержат поле "code", ошибки содержат отрицательные коды
-            if isinstance(data, dict) and "code" in data:
-                logger.warning(f"Binance: тикер для {coin} не найден (code: {data.get('code')}, msg: {data.get('msg')})")
+
+            if self._is_api_error(data):
+                logger.warning(
+                    f"Binance: тикер для {coin} не найден "
+                    f"(symbol={symbol}, code={data.get('code')}, msg={data.get('msg')})"
+                )
                 return None
-            
-            # Binance возвращает словарь напрямую
-            last_price = data.get("lastPrice")
-            if last_price is None:
+
+            if not isinstance(data, dict):
+                logger.warning(f"Binance: неожиданный формат ticker для {coin}: {type(data)}")
                 return None
-            
-            last = float(last_price)
-            
-            # Проверка, что last_price тоже валиден (не мусор)
+
+            last_price_raw = data.get("lastPrice")
+            if last_price_raw is None:
+                logger.warning(f"Binance: нет lastPrice в ticker для {coin} (symbol={symbol})")
+                return None
+
+            try:
+                last = float(last_price_raw)
+            except (TypeError, ValueError) as e:
+                logger.warning(f"Binance: lastPrice не число для {coin} (symbol={symbol}): {e}")
+                return None
+
             if last <= 0:
                 return None
-            
-            def _safe_px(raw: object, fallback: float) -> float:
-                """
-                Безопасное преобразование цены с проверками на разумность
-                
-                Args:
-                    raw: Сырое значение цены (может быть строкой, числом, None, или мусором)
-                    fallback: Значение по умолчанию (обычно last_price)
-                    
-                Returns:
-                    Валидная цена или fallback
-                """
-                try:
-                    v = float(raw)
-                except (TypeError, ValueError):
-                    return fallback
-                
-                if v <= 0:
-                    return fallback
-                
-                # Sanity check: если отличается от fallback больше чем в 10 раз — считаем мусором
-                # Порог 10x обычно достаточен; для очень волатильных инструментов можно сделать параметром (5x-20x)
-                if v > fallback * 10 or v < fallback / 10:
-                    return fallback
-                
-                return v
-            
-            bid = _safe_px(data.get("bidPrice"), last)
-            ask = _safe_px(data.get("askPrice"), last)
-            
-            # Если после проверок bid > ask (бывает на мусорных данных) — откатываем на last
+
+            bid = self._safe_px(data.get("bidPrice"), last)
+            ask = self._safe_px(data.get("askPrice"), last)
+
+            # Если после проверок bid > ask — откатываем на last
             if bid > ask:
                 bid = last
                 ask = last
-            
-            return {
-                "price": last,
-                "bid": bid,
-                "ask": ask,
-            }
-                
+
+            return {"price": last, "bid": bid, "ask": ask}
+
         except Exception as e:
             logger.error(f"Binance: ошибка при получении тикера для {coin}: {e}", exc_info=True)
             return None
@@ -113,85 +119,104 @@ class AsyncBinanceExchange(AsyncBaseExchange):
     async def get_funding_rate(self, coin: str) -> Optional[float]:
         """
         Получить текущую ставку фандинга для монеты
-        
-        Args:
-            coin: Название монеты без /USDT (например, "CVC")
-            
+
         Returns:
-            Ставка фандинга (например, 0.0001 = 0.01%) или None если ошибка
+            Ставка фандинга в decimal формате (например, 0.0001 = 0.01%) или None если ошибка
+            Примечание: bot.py умножает на 100 для отображения в процентах
         """
         try:
             symbol = self._normalize_symbol(coin)
             url = "/fapi/v1/premiumIndex"
             params = {"symbol": symbol}
-            
+
             data = await self._request_json("GET", url, params=params)
             if not data:
-                logger.warning(f"Binance: фандинг для {coin} не найден")
+                logger.warning(f"Binance: пустой ответ funding для {coin} (symbol={symbol})")
                 return None
-            
-            # Binance возвращает ошибки в формате {"code": -1121, "msg": "Invalid symbol."}
-            # Успешные ответы не содержат поле "code", ошибки содержат отрицательные коды
-            if isinstance(data, dict) and "code" in data:
-                logger.warning(f"Binance: фандинг для {coin} не найден (code: {data.get('code')}, msg: {data.get('msg')})")
+
+            if self._is_api_error(data):
+                logger.warning(
+                    f"Binance: фандинг для {coin} не найден "
+                    f"(symbol={symbol}, code={data.get('code')}, msg={data.get('msg')})"
+                )
                 return None
-            
+
+            if not isinstance(data, dict):
+                logger.warning(f"Binance: неожиданный формат funding для {coin}: {type(data)}")
+                return None
+
             funding_rate_raw = data.get("lastFundingRate")
             if funding_rate_raw is None:
+                logger.warning(f"Binance: нет lastFundingRate для {coin} (symbol={symbol})")
                 return None
-            
-            return float(funding_rate_raw)
-                
+
+            try:
+                return float(funding_rate_raw)
+            except (TypeError, ValueError) as e:
+                logger.warning(f"Binance: funding_rate не число для {coin} (symbol={symbol}): {e}")
+                return None
+
         except Exception as e:
             logger.error(f"Binance: ошибка при получении фандинга для {coin}: {e}", exc_info=True)
             return None
-    
+
     async def get_orderbook(self, coin: str, limit: int = 50) -> Optional[Dict]:
         """
         Получить книгу заявок (orderbook) для монеты
-        
-        Args:
-            coin: Название монеты без /USDT (например, "GPS")
-            limit: Количество уровней (по умолчанию 50, максимум 5000)
-            
+
         Returns:
-            Словарь с данными книги заявок:
             {
-                "bids": [[price, size], ...],  # Заявки на покупку
-                "asks": [[price, size], ...]    # Заявки на продажу
+                "bids": [[price, size], ...],
+                "asks": [[price, size], ...]
             }
-            или None если ошибка
+            или None если ошибка/символ не найден
         """
         try:
             symbol = self._normalize_symbol(coin)
             url = "/fapi/v1/depth"
+
             # Binance принимает limit от 5 до 5000
-            limit = max(5, min(int(limit), 5000))
-            params = {
-                "symbol": symbol,
-                "limit": limit,
-            }
-            
+            limit_i = max(5, min(int(limit), 5000))
+            params = {"symbol": symbol, "limit": limit_i}
+
             data = await self._request_json("GET", url, params=params)
             if not data:
-                logger.warning(f"Binance: orderbook error for {coin}")
+                logger.warning(f"Binance: пустой ответ orderbook для {coin} (symbol={symbol})")
                 return None
-            
-            # Binance возвращает ошибки в формате {"code": -1121, "msg": "Invalid symbol."}
-            # Успешные ответы не содержат поле "code", ошибки содержат отрицательные коды
-            if isinstance(data, dict) and "code" in data:
-                logger.warning(f"Binance: orderbook error for {coin} (code: {data.get('code')}, msg: {data.get('msg')})")
+
+            if self._is_api_error(data):
+                logger.warning(
+                    f"Binance: orderbook error for {coin} "
+                    f"(symbol={symbol}, code={data.get('code')}, msg={data.get('msg')})"
+                )
                 return None
-            
-            bids = data.get("bids") or []  # [[price, size], ...]
+
+            if not isinstance(data, dict):
+                logger.warning(f"Binance: неожиданный формат orderbook для {coin}: {type(data)}")
+                return None
+
+            bids = data.get("bids") or []  # [[price, size], ...] (обычно строки)
             asks = data.get("asks") or []
-            
+
             if not bids or not asks:
+                logger.warning(f"Binance: пустой bids/asks для {coin} (symbol={symbol})")
                 return None
-            
+
+            # Минимальная валидация top-of-book (как в LBank/MEXC)
+            if (not isinstance(bids[0], (list, tuple)) or len(bids[0]) < 2 or
+                    not isinstance(asks[0], (list, tuple)) or len(asks[0]) < 2):
+                logger.warning(f"Binance: неверный формат orderbook уровней для {coin} (symbol={symbol})")
+                return None
+
+            try:
+                float(bids[0][0]); float(bids[0][1])
+                float(asks[0][0]); float(asks[0][1])
+            except (TypeError, ValueError, IndexError) as e:
+                logger.warning(f"Binance: top level bids/asks not numeric for {coin} (symbol={symbol}): {e}")
+                return None
+
             return {"bids": bids, "asks": asks}
-                
+
         except Exception as e:
             logger.error(f"Binance: ошибка при получении orderbook для {coin}: {e}", exc_info=True)
             return None
-
