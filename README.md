@@ -44,6 +44,7 @@ python bot.py
 - **LBank** (lbank) ✅
 - **XT.com** (xt) ✅
 - **Binance** (binance) ✅
+- **Bitget** (bitget) ✅
 
 ## Вывод
 

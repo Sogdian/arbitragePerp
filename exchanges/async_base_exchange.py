@@ -19,8 +19,10 @@ class AsyncBaseExchange(ABC):
     def __init__(self, name: str, pool_limit: int = 100):
         self.name = name
         # Один AsyncClient на биржу – повторно используем TCP-соединения
+        # Используем BASE_URL из класса наследника, а не из базового класса
+        base_url = getattr(self.__class__, "BASE_URL", "") or ""
         self.client = httpx.AsyncClient(
-            base_url=self.BASE_URL,
+            base_url=base_url,
             limits=httpx.Limits(max_connections=pool_limit, max_keepalive_connections=pool_limit),
             timeout=httpx.Timeout(5.0, connect=3.0)
         )
