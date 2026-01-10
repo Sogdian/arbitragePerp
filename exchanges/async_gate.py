@@ -45,7 +45,14 @@ class AsyncGateExchange(AsyncBaseExchange):
                 return None
             
             # Gate.io возвращает список или словарь
-            item = data[0] if isinstance(data, list) and data else (data if isinstance(data, dict) else None)
+            # Если список - ищем точный контракт, иначе берем первый элемент
+            if isinstance(data, list) and data:
+                # Попробуем найти точный контракт
+                item = next((x for x in data if isinstance(x, dict) and x.get("contract") == symbol), data[0])
+            elif isinstance(data, dict):
+                item = data
+            else:
+                item = None
             
             if not item:
                 logger.warning(f"Gate: тикер для {coin} не найден")
@@ -62,13 +69,15 @@ class AsyncGateExchange(AsyncBaseExchange):
             if last <= 0:
                 return None
             
-            def _safe_px(raw: object, fallback: float) -> float:
+            def _safe_px(raw: object, fallback: float, sanity_mult: float = 20.0) -> float:
                 """
                 Безопасное преобразование цены с проверками на разумность
                 
                 Args:
                     raw: Сырое значение цены (может быть строкой, числом, None, или мусором)
                     fallback: Значение по умолчанию (обычно last_price)
+                    sanity_mult: Множитель для sanity-check (по умолчанию 20x)
+                                 Для микро-альтов с очень маленькой ценой можно увеличить или отключить
                     
                 Returns:
                     Валидная цена или fallback
@@ -81,10 +90,12 @@ class AsyncGateExchange(AsyncBaseExchange):
                 if v <= 0:
                     return fallback
                 
-                # Sanity check: если отличается от fallback больше чем в 10 раз — считаем мусором
-                # Порог 10x обычно достаточен; для очень волатильных инструментов можно сделать параметром (5x-20x)
-                if v > fallback * 10 or v < fallback / 10:
-                    return fallback
+                # Sanity check: если отличается от fallback больше чем в sanity_mult раз — считаем мусором
+                # Для микро-альтов с ценой < 0.0001 отключаем sanity-check (могут быть реальные скачки)
+                # Порог по умолчанию 20x (можно увеличить для волатильных инструментов)
+                if fallback >= 0.0001:  # Для нормальных цен применяем sanity-check
+                    if v > fallback * sanity_mult or v < fallback / sanity_mult:
+                        return fallback
                 
                 return v
             
@@ -192,6 +203,16 @@ class AsyncGateExchange(AsyncBaseExchange):
             
             if asks and (not isinstance(asks[0], (list, tuple)) or len(asks[0]) != 2):
                 logger.warning(f"Gate: неверный формат asks для {coin}: ожидается [[price, size], ...]")
+                return None
+            
+            # Проверяем, что элементы можно конвертировать в float (защита от объектов/невалидных типов)
+            try:
+                float(bids[0][0])
+                float(bids[0][1])
+                float(asks[0][0])
+                float(asks[0][1])
+            except (TypeError, ValueError, IndexError) as e:
+                logger.warning(f"Gate: неверный тип данных в orderbook для {coin}: элементы не конвертируются в float: {e}")
                 return None
             
             return {"bids": bids, "asks": asks}
