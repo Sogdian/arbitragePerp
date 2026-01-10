@@ -43,6 +43,7 @@ python bot.py
 - **MEXC** (mexc) ✅
 - **LBank** (lbank) ✅
 - **XT.com** (xt) ✅
+- **Binance** (binance) ✅
 
 ## Вывод
 

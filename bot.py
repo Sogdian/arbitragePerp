@@ -10,6 +10,7 @@ from exchanges.async_gate import AsyncGateExchange
 from exchanges.async_mexc import AsyncMexcExchange
 from exchanges.async_lbank import AsyncLbankExchange
 from exchanges.async_xt import AsyncXtExchange
+from exchanges.async_binance import AsyncBinanceExchange
 from input_parser import parse_input
 from news_monitor import NewsMonitor
 import config
@@ -39,12 +40,14 @@ class PerpArbitrageBot:
         self.mexc = AsyncMexcExchange()
         self.lbank = AsyncLbankExchange()
         self.xt = AsyncXtExchange()
+        self.binance = AsyncBinanceExchange()
         self.exchanges = {
             "bybit": self.bybit,
             "gate": self.gate,
             "mexc": self.mexc,
             "lbank": self.lbank,
-            "xt": self.xt
+            "xt": self.xt,
+            "binance": self.binance
         }
         self.news_monitor = NewsMonitor()
     
@@ -56,6 +59,7 @@ class PerpArbitrageBot:
             self.mexc.close(),
             self.lbank.close(),
             self.xt.close(),
+            self.binance.close(),
             return_exceptions=True
         )
     
