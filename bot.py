@@ -278,7 +278,7 @@ class PerpArbitrageBot:
         if funding_long is not None and funding_short is not None:
             funding_spread = self.calculate_funding_spread(funding_long, funding_short)
             if funding_spread is not None:
-                logger.info(f"({long_exchange} и {short_exchange}) Спред на фандинги: {funding_spread:.6f}%")
+                logger.info(f"({long_exchange} и {short_exchange}) Спред на фандинги: {funding_spread:.6f}% (откр: ≥0.18%, закр: ≤0.05%)")
             else:
                 logger.info(f"({long_exchange} и {short_exchange}) Спред на фандинги: невозможно вычислить")
         else:
@@ -508,7 +508,10 @@ class PerpArbitrageBot:
                     
                     long_fr_str = f"{funding_long_pct:.2f}" if funding_long_pct is not None else "N/A"
                     short_fr_str = f"{funding_short_pct:.2f}" if funding_short_pct is not None else "N/A"
-                    fr_spread_str = f"{fr_spread:.3f}" if fr_spread is not None else "N/A"
+                    if fr_spread is not None:
+                        fr_spread_str = f"{fr_spread:.3f} (откр: ≥0.18%, закр: ≤0.05%)"
+                    else:
+                        fr_spread_str = "N/A"
                     
                     # Выводим одной строкой (фандинг выводится один раз, так как он одинаковый для обоих спредов)
                     logger.info(f"{closing_str} | {opening_str} | long_fr: {long_fr_str} | short_fr: {short_fr_str} | fr_spread: {fr_spread_str}")
