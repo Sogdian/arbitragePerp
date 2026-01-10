@@ -147,32 +147,40 @@ class AsyncGateExchange(AsyncBaseExchange):
     async def get_funding_rate(self, coin: str) -> Optional[float]:
         """
         Получить текущую ставку фандинга для монеты
+        
+        Gate:
+        - /futures/usdt/contracts/{contract} -> текущая/индикативная ставка (UI "Текущая")
+        - /futures/usdt/funding_rate -> история (UI "Предыдущая")
         """
         try:
             symbol = self._normalize_symbol(coin)
+
+            # 1) CURRENT (contract info)
+            url = f"/api/v4/futures/usdt/contracts/{symbol}"
+            data = await self._request_json("GET", url)
+
+            if isinstance(data, dict):
+                # приоритет: funding_rate (обычно то, что UI показывает как текущую)
+                r = data.get("funding_rate")
+                if r is None:
+                    # иногда полезно взять indicative
+                    r = data.get("funding_rate_indicative")
+                if r is not None:
+                    return float(r)
+
+            # 2) FALLBACK: HISTORY (previous applied)
             url = "/api/v4/futures/usdt/funding_rate"
             params = {"contract": symbol, "limit": 1}
-
             data = await self._request_json("GET", url, params=params)
-            if not data:
-                logger.warning(f"Gate: не удалось получить фандинг для {coin}")
-                return None
 
-            # Обычно list вида [{"t": ..., "r": "0.000157"}]
             if isinstance(data, list) and data:
                 item = data[0]
-            elif isinstance(data, dict) and ("r" in data or "funding_rate" in data or "rate" in data):
-                item = data
-            else:
-                logger.warning(f"Gate: неожиданный формат funding_rate ответа для {coin}: {type(data)}")
-                return None
+                r = item.get("r") or item.get("funding_rate") or item.get("rate")
+                if r is not None:
+                    return float(r)
 
-            r = item.get("r") or item.get("funding_rate") or item.get("rate")
-            if r is None:
-                logger.warning(f"Gate: нет поля funding rate в ответе: {item}")
-                return None
-
-            return float(r)
+            logger.warning(f"Gate: не удалось получить funding_rate для {coin} (symbol={symbol})")
+            return None
 
         except Exception as e:
             logger.error(f"Gate: ошибка при получении фандинга для {coin}: {e}", exc_info=True)
