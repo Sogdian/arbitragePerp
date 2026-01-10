@@ -29,10 +29,10 @@ class AsyncBaseExchange(ABC):
         """Закрывает HTTP клиент"""
         await self.client.aclose()
 
-    async def _request_json(self, method: str, url: str, *, params: Optional[dict] = None) -> Optional[dict]:
+    async def _request_json(self, method: str, url: str, *, params: Optional[dict] = None, headers: Optional[dict] = None) -> Optional[dict]:
         """Обертка с обработкой ошибок и логированием"""
         try:
-            resp = await self.client.request(method, url, params=params)
+            resp = await self.client.request(method, url, params=params, headers=headers)
             resp.raise_for_status()
             result = resp.json()
             return result
@@ -40,9 +40,7 @@ class AsyncBaseExchange(ABC):
             status = e.response.status_code
             # Для LBank и 404 ошибок - это означает, что публичный API недоступен
             if self.name == "LBank" and status == 404:
-                # Не логируем каждую 404 ошибку отдельно, чтобы не засорять лог
-                # Основное сообщение будет в методах get_futures_ticker/get_funding_rate
-                pass
+                logger.warning(f"{self.name}: HTTP 404 для {url} с params {params}. Публичный endpoint недоступен или неверные params.")
             else:
                 try:
                     error_body = e.response.text[:200]

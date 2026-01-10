@@ -275,7 +275,7 @@ class AsyncLbankExchange(AsyncBaseExchange):
         if not item:
             return None
         
-        # Для depth эндпоинта: bids и asks - это массивы [цена, количество]
+        # Для ответов, где bids/asks уже есть в тикере (если API возвращает их напрямую)
         if "bids" in item and "asks" in item:
             bids = item.get("bids", [])
             asks = item.get("asks", [])
@@ -442,7 +442,12 @@ class AsyncLbankExchange(AsyncBaseExchange):
 
     async def get_orderbook(self, coin: str, limit: int = 50) -> Optional[Dict]:
         """
-        Получить orderbook (книгу заявок) для монеты
+        Получить orderbook (книгу заявок) для фьючерсов LBank.
+
+        ВАЖНО:
+        - endpoint /pub/depth часто даёт 403 (Cloudflare)
+        - endpoint /pub/marketOrder реально отдаёт стакан (как вы проверили curl.exe)
+        - формат asks/bids: list[dict] с ключами price/volume
         
         Args:
             coin: Название монеты без /USDT (например, "GPS")
@@ -456,67 +461,73 @@ class AsyncLbankExchange(AsyncBaseExchange):
             }
             или None если ошибка
         """
+        symbol = await self.resolve_symbol(coin)
+
+        # marketOrder использует параметр depth (кол-во уровней)
+        depth = max(1, min(int(limit), 200))
+
+        url = "/cfd/openApi/v1/pub/marketOrder"
+        params = {"symbol": symbol, "depth": depth}
+
+        # Минимальный набор заголовков (часто помогает не попасть под CF-эвристику)
+        headers = {
+            "User-Agent": "Mozilla/5.0",
+            "Accept": "application/json,text/plain,*/*",
+            "Referer": "https://www.lbank.com/",
+            "Origin": "https://www.lbank.com",
+        }
+
         try:
-            # Разрешаем правильный символ (с кешем инструментов)
-            symbol = await self.resolve_symbol(coin)
-            
-            # LBank использует эндпоинт depth для получения orderbook
-            url = "/cfd/openApi/v1/pub/depth"
-            params = {
-                "productGroup": self.PRODUCT_GROUP,
-                "symbol": symbol,
-                "limit": limit
-            }
-            
-            data = await self._request_json("GET", url, params=params)
-            if not data:
-                logger.warning(f"LBank: не удалось получить orderbook для {coin}")
-                return None
-            
-            # Проверяем ошибки API
-            if isinstance(data, dict) and self._check_api_error(data, "orderbook"):
-                return None
-            
-            # LBank возвращает данные в поле "data"
-            result = data.get("data")
-            if not result:
-                logger.warning(f"LBank: пустой ответ orderbook для {coin}")
-                return None
-            
-            # Если result - это список, берем первый элемент
-            if isinstance(result, list) and result:
-                result = result[0]
-            
-            if not isinstance(result, dict):
-                logger.warning(f"LBank: неожиданный формат orderbook для {coin}")
-                return None
-            
-            bids = result.get("bids", [])
-            asks = result.get("asks", [])
-            
-            if not bids or not asks:
-                logger.warning(f"LBank: пустой orderbook для {coin}")
-                return None
-            
-            # Валидация формата уровней: убеждаемся, что bids[0] и asks[0] - это список/кортеж длины >= 2
-            if (not isinstance(bids[0], (list, tuple)) or len(bids[0]) < 2 or
-                not isinstance(asks[0], (list, tuple)) or len(asks[0]) < 2):
-                logger.warning(f"LBank: неверный формат orderbook уровней для {coin}: ожидается [[price, size], ...]")
-                return None
-            
-            # Проверяем, что элементы можно конвертировать в float (защита от объектов/невалидных типов)
-            try:
-                float(bids[0][0])
-                float(bids[0][1])
-                float(asks[0][0])
-                float(asks[0][1])
-            except (TypeError, ValueError, IndexError) as e:
-                logger.warning(f"LBank: bids/asks top level not numeric for {coin}: {e}")
-                return None
-            
-            return {"bids": bids, "asks": asks}
-                
+            data = await self._request_json("GET", url, params=params, headers=headers)
         except Exception as e:
-            logger.error(f"LBank: ошибка при получении orderbook для {coin}: {e}", exc_info=True)
+            logger.warning(f"LBank: не удалось получить orderbook для {coin}: {e}")
             return None
+
+        if not data:
+            logger.warning(f"LBank: не удалось получить orderbook для {coin} (empty response)")
+            return None
+
+        if isinstance(data, dict) and self._check_api_error(data, "orderbook"):
+            return None
+
+        payload = data.get("data")
+        if not isinstance(payload, dict):
+            logger.warning(f"LBank: неожиданный формат orderbook payload для {coin}: data is not dict")
+            return None
+
+        bids_raw = payload.get("bids") or []
+        asks_raw = payload.get("asks") or []
+
+        if not bids_raw or not asks_raw:
+            logger.warning(f"LBank: пустой orderbook для {coin}")
+            return None
+
+        # marketOrder формат: [{"volume":"..","price":"..","orders":".."}, ...]
+        def _convert_side(levels: list) -> list:
+            out = []
+            for it in levels:
+                if not isinstance(it, dict):
+                    continue
+                px = it.get("price")
+                vol = it.get("volume")
+                if px is None or vol is None:
+                    continue
+                try:
+                    out.append([float(px), float(vol)])
+                except (TypeError, ValueError):
+                    continue
+            return out
+
+        bids = _convert_side(bids_raw)
+        asks = _convert_side(asks_raw)
+
+        if not bids or not asks:
+            logger.warning(f"LBank: orderbook {coin} не удалось конвертировать в числовой формат bids/asks")
+            return None
+
+        # Важно: нормализуем сортировку (на всякий случай)
+        bids.sort(key=lambda x: x[0], reverse=True)  # price desc
+        asks.sort(key=lambda x: x[0])               # price asc
+
+        return {"bids": bids[:depth], "asks": asks[:depth]}
 
