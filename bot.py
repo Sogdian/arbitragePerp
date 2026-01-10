@@ -425,6 +425,20 @@ class PerpArbitrageBot:
         spread = ((bid_long - ask_short) / ask_short) * 100
         return spread
     
+    def get_exit_threshold_pct(self) -> float:
+        """
+        Порог выхода в процентах.
+        Используем дефолтные значения:
+        - закрытие long: 0.04%
+        - закрытие short: 0.04%
+        - запас: 0.10%
+        """
+        close_long_fee_pct = 0.04
+        close_short_fee_pct = 0.04
+        buffer_pct = 0.10
+
+        return close_long_fee_pct + close_short_fee_pct + buffer_pct
+    
     async def monitor_spreads(self, coin: str, long_exchange: str, short_exchange: str):
         """
         Мониторинг спредов открытия и закрытия каждую секунду
@@ -485,7 +499,11 @@ class PerpArbitrageBot:
                     fr_spread = self.calculate_funding_spread(funding_long, funding_short)
                     
                     # Формируем строку вывода
-                    closing_str = f"Закр (min): {closing_spread:.2f}%" if closing_spread is not None else "Закр (min): N/A"
+                    exit_threshold = self.get_exit_threshold_pct()
+                    if closing_spread is not None:
+                        closing_str = f"Закр (min): {closing_spread:.2f}% ({exit_threshold:.2f}%)"
+                    else:
+                        closing_str = f"Закр (min): N/A ({exit_threshold:.2f}%)"
                     opening_str = f"Откр (max): {opening_spread:.2f}%" if opening_spread is not None else "Откр (max): N/A"
                     
                     long_fr_str = f"{funding_long_pct:.2f}" if funding_long_pct is not None else "N/A"
