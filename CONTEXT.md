@@ -111,12 +111,15 @@
 
 ### MEXC:
 - **Базовый URL:** `https://contract.mexc.com` (отдельный домен для фьючерсов)
+- **Fallback URL:** `https://futures.mexc.com` (часто более стабильный домен для futures)
 - **Тикер фьючерса:** `/api/v1/contract/ticker` - публичный API
-- **Фандинг:** `/api/v1/contract/funding_rate` - публичный API
+- **Фандинг:** `/api/v1/contract/funding_rate/{symbol}` - публичный API (символ в path)
+- **Orderbook:** `/api/v1/contract/depth/{symbol}` - публичный API (символ в path)
 - **Обязательные параметры:**
-  - Тикер: `symbol=COIN_USDT` (с fallback на `COINUSDT` без подчеркивания)
-  - Фандинг: `symbol=COIN_USDT` (с fallback на `COINUSDT` без подчеркивания)
-  - Orderbook: `symbol=COIN_USDT` (с fallback на `COINUSDT` без подчеркивания)
+  - Тикер: `symbol=COIN_USDT` (query параметр, с fallback на `COINUSDT` без подчеркивания)
+  - Фандинг: `{symbol}` в path (например, `/api/v1/contract/funding_rate/DN_USDT`), с fallback на `COINUSDT` без подчеркивания
+  - Orderbook: `{symbol}` в path (например, `/api/v1/contract/depth/DN_USDT`), `limit` в query (от 1 до 200), с fallback на `COINUSDT` без подчеркивания
+- **ВАЖНО:** По Contract V1 API, `funding_rate` и `depth` используют символ в path-параметре, а не в query параметрах. Это критично для корректной работы API.
 - **Формат символов:** `COIN_USDT` (с подчеркиванием, например, `CVC_USDT`, `BTC_USDT`)
   - Если запрос с `_USDT` не дал данных, вернул ошибку (`code != 0`), или вернул dict без полезных полей (`data`, `result`, `code`), автоматически пробуется формат без подчеркивания (`COINUSDT`)
   - Fallback применяется во всех методах (ticker, funding, orderbook) для совместимости с разными версиями API
@@ -157,11 +160,19 @@
   - **Валидация symbol после fallback:** После получения `item` проверяется, что `item.get("symbol")` (с канонизацией) совпадает с запрошенным `symbol_to_find`. Это особенно важно после fallback, чтобы убедиться, что получен фандинг для правильной монеты
   - **Улучшенное логирование валидации:** В warning показываются и raw, и canon версии символов для лучшей диагностики: `получен фандинг для {item_symbol} (canon={got_symbol}) вместо {symbol} (want raw) / {symbol_to_find} (want canon)`
   - Это предотвращает получение фандинга от неправильной монеты и ускоряет диагностику проблем
-- **Валидация orderbook:**
-  - Проверка формата уровней: убеждается, что `bids[0]` и `asks[0]` - это список/кортеж длины >= 2
-  - Проверка конвертации в float: убеждается, что элементы `bids[0][0]`, `bids[0][1]`, `asks[0][0]`, `asks[0][1]` можно конвертировать в `float`
-  - Защита от строк, объектов или невалидных типов данных
-  - Это предотвращает падения в `check_liquidity` при неверном формате данных
+- **Парсинг orderbook (поддержка разных форматов и доменов):**
+  - Реализован метод `_parse_ob_levels()` для нормализации форматов orderbook
+  - MEXC может возвращать уровни в разных форматах:
+    1. **Списки:** `[["price","size"], ...]` или `[[price, size], ...]` (обычный формат)
+    2. **Словари:** `[{"price":"...","quantity":"..."}, ...]` (реже, но встречается)
+  - Метод нормализует оба формата к единому виду: `[[price(float), size(float)], ...]`
+  - Обработка ошибок: проверка типов, конвертация в float, валидация значений
+  - Нормализация размера: если `size < 0`, применяется `abs(size)` (на всякий случай)
+  - **Fallback на альтернативный домен:** Реализован метод `_request_json_with_domain_fallback()` для автоматического переключения между доменами при ошибках соединения
+  - При ошибке соединения на основном домене (`contract.mexc.com`) автоматически пробуется fallback домен (`futures.mexc.com`)
+  - Короткий backoff (0.25 секунды) между попытками для снижения нагрузки
+  - Ограничение `limit`: автоматически ограничивается в диапазоне 1-200 (`limit_i = max(1, min(int(limit), 200))`)
+  - Это предотвращает ошибки соединения и корректно обрабатывает оба формата ответов MEXC
 
 ### LBank:
 - **Базовый URL:** `https://lbkperp.lbank.com` (отдельный домен для фьючерсов)
@@ -537,7 +548,7 @@
 ### Поддерживаемые биржи
 - **Bybit** - через официальный API orderbook (`/v5/market/orderbook`)
 - **Gate.io** - через официальный API orderbook (`/api/v4/futures/usdt/order_book`)
-- **MEXC** - через официальный API orderbook (`/api/v1/contract/depth`)
+- **MEXC** - через официальный API orderbook (`/api/v1/contract/depth/{symbol}`)
 - **XT.com** - через официальный API orderbook (`/future/market/v1/public/cg/orderbook`)
 - **LBank** - через официальный API orderbook (`/cfd/openApi/v1/pub/depth`)
 - **Binance** - через официальный API orderbook (`/fapi/v1/depth`)
@@ -723,9 +734,10 @@ sell_impact_bps = |bid1 - sell_vwap| / mid * 10_000
 - Возвращает: `{"bids": [[price, size], ...], "asks": [[price, size], ...]}`
 
 **MEXC:**
-- `GET /api/v1/contract/depth`
-- Параметры: `symbol=COIN_USDT`, `limit=50`
+- `GET /api/v1/contract/depth/{symbol}`
+- Параметры: `{symbol}` в path (например, `/api/v1/contract/depth/DN_USDT`), `limit=50` в query (от 1 до 200)
 - Возвращает: `{"code": 0, "data": {"bids": [[price, size], ...], "asks": [[price, size], ...]}}`
+- **ВАЖНО:** Символ должен быть в path, а не в query параметрах
 
 **XT.com:**
 - `GET /future/market/v1/public/cg/orderbook`
