@@ -383,7 +383,8 @@ class PerpArbitrageBot:
         """
         Вычислить спред открытия позиции (max)
         
-        Формула: (ask_long - bid_short) / bid_short * 100
+        Формула: (bid_short - ask_long) / ask_long * 100
+        Положительное значение = выгодный арбитраж (bid_short > ask_long)
         
         Args:
             ask_long: Цена ask на бирже Long
@@ -391,14 +392,15 @@ class PerpArbitrageBot:
             
         Returns:
             Спред открытия в процентах или None
+            Положительное значение = выгодно открывать, отрицательное = невыгодно
         """
         if ask_long is None or bid_short is None:
             return None
         
-        if bid_short == 0:
+        if ask_long == 0:
             return None
         
-        spread = ((ask_long - bid_short) / bid_short) * 100
+        spread = ((bid_short - ask_long) / ask_long) * 100
         return spread
     
     def calculate_closing_spread(self, bid_long: Optional[float], ask_short: Optional[float]) -> Optional[float]:
@@ -466,31 +468,32 @@ class PerpArbitrageBot:
                     ask_short = short_data.get("ask")
                     funding_short = short_data.get("funding_rate")
                     
+                    # DEBUG: выводим bid/ask для диагностики
+                    logger.info(
+                        f"DEBUG prices: {long_exchange} bid={bid_long}, ask={ask_long} | {short_exchange} bid={bid_short}, ask={ask_short}"
+                    )
+                    
                     # Рассчитываем спреды
                     opening_spread = self.calculate_opening_spread(ask_long, bid_short)
                     closing_spread = self.calculate_closing_spread(bid_long, ask_short)
-                    
                     
                     # Форматируем фандинги в проценты
                     funding_long_pct = funding_long * 100 if funding_long is not None else None
                     funding_short_pct = funding_short * 100 if funding_short is not None else None
                     
-                    # Рассчитываем спред на фандинг
-                    fr_spread = None
-                    if funding_long_pct is not None and funding_short_pct is not None:
-                        fr_spread = funding_long_pct - funding_short_pct
+                    # Рассчитываем спред на фандинг (используем тот же метод, что и в process_input)
+                    fr_spread = self.calculate_funding_spread(funding_long, funding_short)
                     
                     # Формируем строку вывода
-                    closing_str = f"Закрытие (min): {closing_spread:.2f}" if closing_spread is not None else "Закрытие (min): N/A"
-                    opening_str = f"Открытие (max): {opening_spread:.2f}" if opening_spread is not None else "Открытие (max): N/A"
+                    closing_str = f"Закр (min): {closing_spread:.2f}%" if closing_spread is not None else "Закр (min): N/A"
+                    opening_str = f"Откр (max): {opening_spread:.2f}%" if opening_spread is not None else "Откр (max): N/A"
                     
-                    coin_str = coin
                     long_fr_str = f"{funding_long_pct:.2f}" if funding_long_pct is not None else "N/A"
                     short_fr_str = f"{funding_short_pct:.2f}" if funding_short_pct is not None else "N/A"
                     fr_spread_str = f"{fr_spread:.3f}" if fr_spread is not None else "N/A"
                     
                     # Выводим одной строкой (фандинг выводится один раз, так как он одинаковый для обоих спредов)
-                    logger.info(f"{closing_str} {coin_str} | {opening_str} {coin_str} | long fr {long_fr_str}, short fr {short_fr_str}, fr spread {fr_spread_str}")
+                    logger.info(f"{closing_str} | {opening_str} | long_fr: {long_fr_str} | short_fr: {short_fr_str} | fr_spread: {fr_spread_str}")
                 
                 # Ждем 1 секунду перед следующей итерацией
                 await asyncio.sleep(1)
