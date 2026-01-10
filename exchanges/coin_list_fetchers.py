@@ -124,67 +124,51 @@ async def fetch_mexc_coins(exchange) -> Set[str]:
 
 
 async def fetch_xt_coins(exchange) -> Set[str]:
-    """Получить список монет с XT.com (USDT perpetual)"""
+    """Получить список монет с XT.com (USDT-M Perpetual)"""
     coins: Set[str] = set()
     
     try:
-        # Актуальный список символов у XT — в MarketData v3 (symbol list)
-        # (v1/q/instruments у тебя сейчас возвращает failure)
-        url = "/future/market/v3/public/symbol/list"
+        # Важно: у XT для фьючерсов часто используется fapi.xt.com и endpoint cg/contracts
+        # https://fapi.xt.com/future/market/v1/public/cg/contracts
+        data = await exchange._request_json(
+            "GET",
+            "/future/market/v1/public/cg/contracts",
+            params={}
+        )
         
-        data = await exchange._request_json("GET", url, params={})
-        if not data:
-            logger.warning("XT: пустой ответ при получении symbol list")
-            return coins
+        # Вариант A: API вернул список (как часто и бывает)
+        if isinstance(data, list):
+            items = data
         
-        # XT часто возвращает returnCode (int) + result (list)
-        rc = data.get("returnCode")
-        if rc is None:
-            # иногда встречается return_code / code
-            rc = data.get("return_code", data.get("code"))
-        
-        if str(rc) != "0":
-            logger.warning(f"XT: не удалось получить список инструментов (returnCode={rc}, msg={data.get('msg')})")
-            return coins
-        
-        items = data.get("result")
-        if not isinstance(items, list):
-            # иногда data может лежать в "data"
-            items = data.get("data")
-        
-        if not isinstance(items, list):
-            logger.warning("XT: result/data не список")
+        # Вариант B: API вернул dict-обертку
+        elif isinstance(data, dict):
+            # некоторые ответы: {"returnCode":0,"result":[...]}
+            if data.get("returnCode") not in (0, "0", None):
+                logger.warning(f"XT: не удалось получить список инструментов (returnCode={data.get('returnCode')}, msg={data.get('msg')})")
+                return coins
+            items = data.get("result") or data.get("data") or []
+            if not isinstance(items, list):
+                return coins
+        else:
             return coins
         
         for it in items:
             if not isinstance(it, dict):
                 continue
-            
-            # Варианты ключей, встречающиеся в разных версиях/ответах:
-            sym = it.get("symbol") or it.get("contractSymbol") or ""
-            if not isinstance(sym, str):
+            symbol = it.get("symbol") or it.get("contractCode") or ""
+            if not isinstance(symbol, str):
                 continue
             
-            s = sym.lower()
-            
-            # нормализуем только USDT
-            # часто формат: btc_usdt
+            s = symbol.lower()
+            # типично: "btc_usdt"
             if s.endswith("_usdt"):
                 coin = s[:-5].upper()
                 if coin:
                     coins.add(coin)
-                continue
-            
-            # иногда могут отдавать BTCUSDT
-            s_up = sym.upper()
-            if s_up.endswith("USDT"):
-                coin = s_up[:-4]
-                if coin:
-                    coins.add(coin)
         
         return coins
-    except Exception:
-        logger.exception("XT: ошибка при получении списка монет")
+    except Exception as e:
+        logger.error(f"XT: ошибка при получении списка монет: {e}", exc_info=True)
         return set()
 
 
@@ -220,55 +204,36 @@ async def fetch_binance_coins(exchange) -> Set[str]:
 
 
 async def fetch_bitget_coins(exchange) -> Set[str]:
-    """Получить список монет с Bitget (USDT-M perpetual)"""
+    """Получить список монет с Bitget (USDT-M Perpetual) через tickers"""
     coins: Set[str] = set()
     
     try:
-        url = "/api/v2/mix/market/contracts"
+        url = "/api/v2/mix/market/tickers"
+        params = {"productType": "USDT-FUTURES"}
         
-        # Для v2 Bitget productType: USDT-FUTURES (официальное значение)
-        # Иногда биржи принимают и lower-case, но лучше сначала canonical.
-        product_types = ["USDT-FUTURES", "usdt-futures"]
+        data = await exchange._request_json("GET", url, params=params)
+        if not data or exchange._is_api_error(data):
+            return coins
         
-        for pt in product_types:
-            params = {"productType": pt}
-            data = await exchange._request_json("GET", url, params=params)
-            
-            if not data or exchange._is_api_error(data):
+        items = data.get("data") or []
+        if not isinstance(items, list):
+            return coins
+        
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            sym = it.get("symbol")
+            if not isinstance(sym, str):
                 continue
             
-            items = data.get("data")
-            if not isinstance(items, list) or not items:
-                continue
+            s = sym.upper()
+            # иногда встречается суффикс старого формата
+            if s.endswith("_UMCBL"):
+                s = s[:-6]
             
-            for it in items:
-                if not isinstance(it, dict):
-                    continue
-                
-                sym = (
-                    it.get("symbol")
-                    or it.get("symbolName")
-                    or it.get("instId")
-                    or ""
-                )
-                if not isinstance(sym, str) or not sym:
-                    continue
-                
-                s = sym.upper()
-                
-                # На Bitget встречается BTCUSDT_UMCBL — нормализуем
-                if s.endswith("_UMCBL"):
-                    s = s[:-6]
-                
-                # Оставляем только USDT контракты
-                if s.endswith("USDT"):
-                    coin = s[:-4]
-                    if coin:
-                        coins.add(coin)
-            
-            # если получили хоть что-то — выходим
-            if coins:
-                break
+            # основной формат: BTCUSDT
+            if s.endswith("USDT") and len(s) > 4:
+                coins.add(s[:-4])
         
         return coins
     except Exception:
