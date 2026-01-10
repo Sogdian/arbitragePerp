@@ -46,6 +46,7 @@ python bot.py
 - **Binance** (binance) ✅
 - **Bitget** (bitget) ✅
 - **OKX** (okx) ✅
+- **BingX** (bingx) ✅
 
 ## Вывод
 
