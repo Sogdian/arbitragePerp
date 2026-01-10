@@ -3,7 +3,7 @@
 Использует httpx.AsyncClient, должен наследоваться всеми async-* биржами.
 """
 from abc import ABC, abstractmethod
-from typing import Dict, Optional, List, Tuple, Sequence, Union
+from typing import Dict, Optional, List, Tuple, Sequence, Union, Any
 import httpx
 import asyncio
 import logging
@@ -42,7 +42,12 @@ class AsyncBaseExchange(ABC):
             if self.name == "LBank" and status == 404:
                 logger.warning(f"{self.name}: HTTP 404 для {url} с params {params}. Публичный endpoint недоступен или неверные params.")
             elif self.name == "LBank" and status in (403, 429):
-                logger.warning(f"{self.name}: HTTP {status} для {url} с params {params}. Похоже на Cloudflare/rate-limit.")
+                full_url = str(e.response.request.url)
+                logger.warning(f"{self.name}: HTTP {status} для {full_url} с params {params}. Похоже на Cloudflare/rate-limit.")
+                try:
+                    logger.debug(f"{self.name}: HTTP {status} response body: {e.response.text[:200]}")
+                except:
+                    pass
             else:
                 try:
                     error_body = e.response.text[:200]
@@ -64,7 +69,7 @@ class AsyncBaseExchange(ABC):
         Вычисляет VWAP для заданного номинала (notional) в USDT
         
         Args:
-            levels: Список уровней [[price, size], ...] как строки
+            levels: Список уровней [[price, size], ...] как строки или числа (float)
             target_usdt: Целевой номинал в USDT
             
         Returns:
@@ -74,7 +79,10 @@ class AsyncBaseExchange(ABC):
         filled_usdt = 0.0
         filled_base = 0.0
         
-        for p_raw, sz_raw in levels:
+        for lvl in levels:
+            if not isinstance(lvl, (list, tuple)) or len(lvl) < 2:
+                continue
+            p_raw, sz_raw = lvl[0], lvl[1]
             p = float(p_raw)
             sz = float(sz_raw)
             level_notional = p * sz
@@ -105,7 +113,7 @@ class AsyncBaseExchange(ABC):
         max_spread_bps: float = 30.0,
         max_impact_bps: float = 50.0,
         mode: str = "roundtrip",
-    ) -> Optional[Dict]:
+    ) -> Optional[Dict[str, Any]]:
         """
         Проверка ликвидности под сделку notional_usdt
         
@@ -147,9 +155,19 @@ class AsyncBaseExchange(ABC):
             bids = ob["bids"]
             asks = ob["asks"]
             
+            if not bids or not asks:
+                return None
+            
             bid1 = float(bids[0][0])
             ask1 = float(asks[0][0])
+            
+            if bid1 <= 0 or ask1 <= 0:
+                logger.warning(f"{self.name}: некорректные bid/ask для {coin}: bid1={bid1}, ask1={ask1}")
+                return None
+            
             mid = (bid1 + ask1) / 2.0
+            if mid <= 0:
+                return None
             
             spread_bps = (ask1 - bid1) / mid * 10_000
             
