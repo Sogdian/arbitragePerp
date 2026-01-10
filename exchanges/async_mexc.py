@@ -14,6 +14,9 @@ class AsyncMexcExchange(AsyncBaseExchange):
     def __init__(self, pool_limit: int = 100):
         super().__init__("MEXC", pool_limit)
 
+    def _normalize_symbol(self, coin: str) -> str:
+        """Преобразует монету в формат MEXC для фьючерсов (например, CVC -> CVC_USDT)"""
+        return f"{coin.upper()}_USDT"
     
     def _canon(self, sym: str) -> str:
         """
