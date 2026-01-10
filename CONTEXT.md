@@ -264,19 +264,19 @@
 
 ### Bitget:
 - **Базовый URL:** `https://api.bitget.com`
-- **Тикер фьючерса:** `/api/mix/v1/market/ticker` - публичный API
-- **Фандинг:** `/api/mix/v1/market/current-fundRate` - публичный API
-- **Orderbook:** `/api/mix/v1/market/depth` - публичный API
+- **Тикер фьючерса:** `/api/v2/mix/market/ticker` - публичный API
+- **Фандинг:** `/api/v2/mix/market/current-fund-rate` - публичный API
+- **Orderbook:** `/api/v2/mix/market/merge-depth` - публичный API
 - **Обязательные параметры:**
-  - Тикер: `symbol=COINUSDT`, `productType=umcbl` (USDT-M perpetual)
-  - Фандинг: `symbol=COINUSDT`, `productType=umcbl`
-  - Orderbook: `symbol=COINUSDT`, `productType=umcbl`, `limit` (от 1 до 200)
-- **Формат символов:** `COINUSDT` (без подчеркивания, например, `CVCUSDT`, `BTCUSDT`)
+  - Тикер: `symbol=COINUSDT`, `productType=usdt-futures` (USDT-M perpetual)
+  - Фандинг: `symbol=COINUSDT`, `productType=usdt-futures`
+  - Orderbook: `symbol=COINUSDT`, `productType=usdt-futures`, `limit` (строка "50" или "max")
+- **Формат символов:** `COINUSDT` (без подчеркивания и суффиксов, например, `CVCUSDT`, `BTCUSDT`)
 - **Примечание:**
   - API полностью публичный, **API ключи не требуются**
   - Возвращает данные в формате `{"code": "00000", "msg": "success", "data": {...}}`
   - Успешные ответы имеют `code: "00000"` или `code: 0`
-  - Тикер возвращает `last`, `bestBid`, `bestAsk` в поле `data`
+  - Тикер возвращает `lastPr`, `bidPr`, `askPr` в поле `data` (v2 API)
   - Фандинг возвращает `fundingRate` в поле `data` (в десятичном формате, например, 0.0001 = 0.01%)
   - Orderbook возвращает `bids` и `asks` как списки `[[price, size], ...]` в поле `data`
   - Если данные не получены или символ не найден, монета недоступна или произошла ошибка

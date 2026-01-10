@@ -3,7 +3,9 @@
 
 Фиксированная логика:
 - Рынок: USDT-M Futures (Perpetual)
-- Символ: COINUSDT (без подчеркивания)
+- Символ: COINUSDT (без подчеркивания и суффиксов)
+- API версия: v2
+- productType: usdt-futures
 - Если COINUSDT не найден → считаем, что инструмента нет
 """
 from typing import Dict, Optional
@@ -15,6 +17,7 @@ logger = logging.getLogger(__name__)
 
 class AsyncBitgetExchange(AsyncBaseExchange):
     BASE_URL = "https://api.bitget.com"
+    PRODUCT_TYPE = "usdt-futures"
 
     def __init__(self, pool_limit: int = 100):
         super().__init__("Bitget", pool_limit)
@@ -55,8 +58,9 @@ class AsyncBitgetExchange(AsyncBaseExchange):
         """
         if not isinstance(data, dict):
             return False
-        code = data.get("code")
-        return code is not None and code != "00000" and code != 0
+        # Нормализуем code в строку для надежного сравнения
+        code = str(data.get("code")) if data.get("code") is not None else None
+        return code is not None and code != "00000"
 
     async def get_futures_ticker(self, coin: str) -> Optional[Dict]:
         """
@@ -72,49 +76,25 @@ class AsyncBitgetExchange(AsyncBaseExchange):
         """
         try:
             symbol = self._normalize_symbol(coin)
-            url = "/api/mix/v1/market/ticker"
-            params = {"symbol": symbol, "productType": "umcbl"}  # umcbl = USDT-M perpetual
+            url = "/api/v2/mix/market/ticker"
+            params = {"symbol": symbol, "productType": self.PRODUCT_TYPE}
 
             data = await self._request_json("GET", url, params=params)
-            if not data:
-                logger.warning(f"Bitget: пустой ответ ticker для {coin} (symbol={symbol})")
+            if not data or self._is_api_error(data):
                 return None
 
-            if self._is_api_error(data):
-                logger.warning(
-                    f"Bitget: тикер для {coin} не найден "
-                    f"(symbol={symbol}, code={data.get('code')}, msg={data.get('msg')})"
-                )
+            d = data.get("data")
+            if isinstance(d, list) and d:
+                d = d[0]
+            if not isinstance(d, dict):
                 return None
 
-            if not isinstance(data, dict):
-                logger.warning(f"Bitget: неожиданный формат ticker для {coin}: {type(data)}")
-                return None
-
-            # Bitget возвращает данные в поле "data"
-            ticker_data = data.get("data")
-            if not isinstance(ticker_data, dict):
-                logger.warning(f"Bitget: нет data в ticker для {coin} (symbol={symbol})")
-                return None
-
-            last_price_raw = ticker_data.get("last")
-            if last_price_raw is None:
-                logger.warning(f"Bitget: нет last в ticker для {coin} (symbol={symbol})")
-                return None
-
-            try:
-                last = float(last_price_raw)
-            except (TypeError, ValueError) as e:
-                logger.warning(f"Bitget: last не число для {coin} (symbol={symbol}): {e}")
-                return None
-
+            last = float(d.get("lastPr"))
             if last <= 0:
                 return None
 
-            bid = self._safe_px(ticker_data.get("bestBid"), last)
-            ask = self._safe_px(ticker_data.get("bestAsk"), last)
-
-            # Если после проверок bid > ask — откатываем на last
+            bid = self._safe_px(d.get("bidPr"), last)
+            ask = self._safe_px(d.get("askPr"), last)
             if bid > ask:
                 bid = last
                 ask = last
@@ -135,46 +115,21 @@ class AsyncBitgetExchange(AsyncBaseExchange):
         """
         try:
             symbol = self._normalize_symbol(coin)
-            url = "/api/mix/v1/market/current-fundRate"
-            params = {"symbol": symbol, "productType": "umcbl"}  # umcbl = USDT-M perpetual
+            url = "/api/v2/mix/market/current-fund-rate"
+            params = {"symbol": symbol, "productType": self.PRODUCT_TYPE}
 
             data = await self._request_json("GET", url, params=params)
-            if not data:
-                logger.warning(f"Bitget: пустой ответ funding для {coin} (symbol={symbol})")
+            if not data or self._is_api_error(data):
                 return None
 
-            if self._is_api_error(data):
-                logger.warning(
-                    f"Bitget: фандинг для {coin} не найден "
-                    f"(symbol={symbol}, code={data.get('code')}, msg={data.get('msg')})"
-                )
+            d = data.get("data")
+            if isinstance(d, list) and d:
+                d = d[0]
+            if not isinstance(d, dict):
                 return None
 
-            if not isinstance(data, dict):
-                logger.warning(f"Bitget: неожиданный формат funding для {coin}: {type(data)}")
-                return None
-
-            # Bitget возвращает данные в поле "data"
-            funding_data = data.get("data")
-            
-            # Иногда Bitget может вернуть data как list (редко, но бывает)
-            if isinstance(funding_data, list) and funding_data:
-                funding_data = funding_data[0]
-            
-            if not isinstance(funding_data, dict):
-                logger.warning(f"Bitget: нет data в funding для {coin} (symbol={symbol}), data type: {type(funding_data)}")
-                return None
-
-            funding_rate_raw = funding_data.get("fundingRate") or funding_data.get("fundingRateRound")
-            if funding_rate_raw is None:
-                logger.warning(f"Bitget: нет fundingRate/fundingRateRound для {coin} (symbol={symbol})")
-                return None
-
-            try:
-                return float(funding_rate_raw)
-            except (TypeError, ValueError) as e:
-                logger.warning(f"Bitget: funding_rate не число для {coin} (symbol={symbol}): {e}")
-                return None
+            fr = d.get("fundingRate")
+            return None if fr is None else float(fr)
 
         except Exception as e:
             logger.error(f"Bitget: ошибка при получении фандинга для {coin}: {e}", exc_info=True)
@@ -193,39 +148,23 @@ class AsyncBitgetExchange(AsyncBaseExchange):
         """
         try:
             symbol = self._normalize_symbol(coin)
-            url = "/api/mix/v1/market/depth"
+            url = "/api/v2/mix/market/merge-depth"
             
-            # Bitget принимает limit от 1 до 200
-            limit_i = max(1, min(int(limit), 200))
-            params = {"symbol": symbol, "productType": "umcbl", "limit": limit_i}
+            # Bitget принимает limit как строку "50" или "max"
+            limit_str = "50" if limit <= 50 else "max"
+            params = {"symbol": symbol, "productType": self.PRODUCT_TYPE, "limit": limit_str}
 
             data = await self._request_json("GET", url, params=params)
-            if not data:
-                logger.warning(f"Bitget: пустой ответ orderbook для {coin} (symbol={symbol})")
+            if not data or self._is_api_error(data):
                 return None
 
-            if self._is_api_error(data):
-                logger.warning(
-                    f"Bitget: orderbook error for {coin} "
-                    f"(symbol={symbol}, code={data.get('code')}, msg={data.get('msg')})"
-                )
+            d = data.get("data")
+            if not isinstance(d, dict):
                 return None
 
-            if not isinstance(data, dict):
-                logger.warning(f"Bitget: неожиданный формат orderbook для {coin}: {type(data)}")
-                return None
-
-            # Bitget возвращает данные в поле "data"
-            ob_data = data.get("data")
-            if not isinstance(ob_data, dict):
-                logger.warning(f"Bitget: нет data в orderbook для {coin} (symbol={symbol})")
-                return None
-
-            bids = ob_data.get("bids") or []  # [[price, size], ...] (обычно строки)
-            asks = ob_data.get("asks") or []
-
+            bids = d.get("bids") or []
+            asks = d.get("asks") or []
             if not bids or not asks:
-                logger.warning(f"Bitget: пустой bids/asks для {coin} (symbol={symbol})")
                 return None
 
             # Минимальная валидация top-of-book (как в других биржах)
@@ -250,9 +189,10 @@ class AsyncBitgetExchange(AsyncBaseExchange):
                 bids_sorted = bids
                 asks_sorted = asks
 
-            return {"bids": bids_sorted, "asks": asks_sorted}
+            # Обрезаем до limit, если API вернул больше уровней
+            limit_i = min(limit, len(bids_sorted), len(asks_sorted))
+            return {"bids": bids_sorted[:limit_i], "asks": asks_sorted[:limit_i]}
 
         except Exception as e:
             logger.error(f"Bitget: ошибка при получении orderbook для {coin}: {e}", exc_info=True)
             return None
-
