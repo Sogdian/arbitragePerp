@@ -45,38 +45,66 @@ class AsyncGateExchange(AsyncBaseExchange):
                 return None
             
             # Gate.io возвращает список или словарь
-            item = None
-            if isinstance(data, list) and data:
-                item = data[0]
-            elif isinstance(data, dict):
-                item = data
+            item = data[0] if isinstance(data, list) and data else (data if isinstance(data, dict) else None)
             
             if not item:
                 logger.warning(f"Gate: тикер для {coin} не найден")
                 return None
             
-            # Извлекаем цены
-            last_price_raw = item.get("last")
-            bid_raw = item.get("bid")
-            ask_raw = item.get("ask")
-            
-            if not last_price_raw:
-                logger.warning(f"Gate: нет цены для {coin}")
+            last_raw = item.get("last")
+            if last_raw is None:
+                logger.warning(f"Gate: нет last для {coin}: {item}")
                 return None
             
-            try:
-                price = float(last_price_raw)
-                bid = float(bid_raw) if bid_raw else price
-                ask = float(ask_raw) if ask_raw else price
+            last = float(last_raw)
+            
+            # Проверка, что last_price тоже валиден (не мусор)
+            if last <= 0:
+                return None
+            
+            def _safe_px(raw: object, fallback: float) -> float:
+                """
+                Безопасное преобразование цены с проверками на разумность
                 
-                return {
-                    "price": price,
-                    "bid": bid,
-                    "ask": ask,
-                }
-            except (ValueError, TypeError) as e:
-                logger.warning(f"Gate: ошибка парсинга цен для {coin}: {e}")
-                return None
+                Args:
+                    raw: Сырое значение цены (может быть строкой, числом, None, или мусором)
+                    fallback: Значение по умолчанию (обычно last_price)
+                    
+                Returns:
+                    Валидная цена или fallback
+                """
+                try:
+                    v = float(raw)
+                except (TypeError, ValueError):
+                    return fallback
+                
+                if v <= 0:
+                    return fallback
+                
+                # Sanity check: если отличается от fallback больше чем в 10 раз — считаем мусором
+                # Порог 10x обычно достаточен; для очень волатильных инструментов можно сделать параметром (5x-20x)
+                if v > fallback * 10 or v < fallback / 10:
+                    return fallback
+                
+                return v
+            
+            # Поддерживаем разные названия bid/ask
+            bid_raw = item.get("bid") or item.get("highest_bid")
+            ask_raw = item.get("ask") or item.get("lowest_ask")
+            
+            bid = _safe_px(bid_raw, last)
+            ask = _safe_px(ask_raw, last)
+            
+            # Если после проверок bid > ask (бывает на мусорных данных) — откатываем на last
+            if bid > ask:
+                bid = last
+                ask = last
+            
+            return {
+                "price": last,
+                "bid": bid,
+                "ask": ask,
+            }
                 
         except Exception as e:
             logger.error(f"Gate: ошибка при получении тикера для {coin}: {e}", exc_info=True)
@@ -94,47 +122,30 @@ class AsyncGateExchange(AsyncBaseExchange):
         """
         try:
             symbol = self._normalize_symbol(coin)
-            # Gate.io использует эндпоинт для получения текущей ставки фандинга
             url = "/api/v4/futures/usdt/funding_rate"
-            params = {"contract": symbol}
-            data = await self._request_json("GET", url, params=params)
+            params = {"contract": symbol, "limit": 1}
             
+            data = await self._request_json("GET", url, params=params)
             if not data:
                 logger.warning(f"Gate: не удалось получить фандинг для {coin}")
                 return None
             
-            # Gate.io возвращает список или словарь
-            item = None
+            # ВАЖНО: API возвращает list вида [{"t": 1543968000, "r": "0.000157"}]
             if isinstance(data, list) and data:
                 item = data[0]
-            elif isinstance(data, dict):
-                # Если это словарь, проверяем наличие поля "result"
-                if "result" in data:
-                    result = data["result"]
-                    if isinstance(result, list) and result:
-                        item = result[0]
-                    elif isinstance(result, dict):
-                        item = result
-                else:
-                    item = data
-            
-            if not item:
-                logger.warning(f"Gate: фандинг для {coin} не найден")
+            elif isinstance(data, dict) and "r" in data:
+                # на всякий случай, если вдруг вернули dict
+                item = data
+            else:
+                logger.warning(f"Gate: неожиданный формат funding_rate ответа для {coin}: {type(data)}")
                 return None
             
-            # Gate.io может возвращать ставку в разных полях
-            funding_rate_raw = item.get("r") or item.get("funding_rate") or item.get("rate")
-            
-            if funding_rate_raw is None:
-                logger.warning(f"Gate: нет ставки фандинга для {coin} в ответе: {item}")
+            r = item.get("r") or item.get("funding_rate") or item.get("rate")
+            if r is None:
+                logger.warning(f"Gate: нет поля funding rate в ответе: {item}")
                 return None
             
-            try:
-                funding_rate = float(funding_rate_raw)
-                return funding_rate
-            except (ValueError, TypeError) as e:
-                logger.warning(f"Gate: ошибка парсинга фандинга для {coin}: {e}")
-                return None
+            return float(r)
                 
         except Exception as e:
             logger.error(f"Gate: ошибка при получении фандинга для {coin}: {e}", exc_info=True)
@@ -172,6 +183,15 @@ class AsyncGateExchange(AsyncBaseExchange):
             
             if not bids or not asks:
                 logger.warning(f"Gate: пустой orderbook для {coin}")
+                return None
+            
+            # Валидация формата уровней: убеждаемся, что bids[0] и asks[0] - это список/кортеж длины 2
+            if bids and (not isinstance(bids[0], (list, tuple)) or len(bids[0]) != 2):
+                logger.warning(f"Gate: неверный формат bids для {coin}: ожидается [[price, size], ...]")
+                return None
+            
+            if asks and (not isinstance(asks[0], (list, tuple)) or len(asks[0]) != 2):
+                logger.warning(f"Gate: неверный формат asks для {coin}: ожидается [[price, size], ...]")
                 return None
             
             return {"bids": bids, "asks": asks}
