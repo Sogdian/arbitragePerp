@@ -50,7 +50,8 @@ def parse_input(input_text: str) -> Optional[Dict]:
     short_exchange = match.group(3).lower()
     
     # Проверяем, что биржи поддерживаются
-    supported_exchanges = {"bybit", "gate", "mexc", "lbank", "xt", "binance"}
+    # LBank временно отключен для арбитража (код не удален)
+    supported_exchanges = {"bybit", "gate", "mexc", "xt", "binance"}
     if long_exchange not in supported_exchanges:
         logger.error(f"Неподдерживаемая биржа для Long: {long_exchange}. Поддерживаются: {supported_exchanges}")
         return None
