@@ -16,6 +16,7 @@ from exchanges.async_okx import AsyncOkxExchange
 from exchanges.async_bingx import AsyncBingxExchange
 from input_parser import parse_input
 from news_monitor import NewsMonitor
+from announcements_monitor import AnnouncementsMonitor
 import config
 
 # Настройка логирования
@@ -59,6 +60,7 @@ class PerpArbitrageBot:
             "bingx": self.bingx
         }
         self.news_monitor = NewsMonitor()
+        self.announcements_monitor = AnnouncementsMonitor(news_monitor=self.news_monitor)
     
     async def close(self):
         """Закрывает соединения с биржами"""
@@ -390,6 +392,22 @@ class PerpArbitrageBot:
             
             if not delisting_news:
                 logger.info(f"✓ Новостей о делистинге {coin} ({exchanges_str}) за последние {days_back} дней не найдено")
+
+                # Доп. проверка: security/hack новости по монете на тех же биржах
+                security_news = await self.announcements_monitor.check_security_for_coin(
+                    coin_symbol=coin,
+                    exchanges=exchanges,
+                    days_back=days_back,
+                )
+                if not security_news:
+                    logger.info(
+                        f"✓ Новостей о взломах/безопасности {coin} ({exchanges_str}) за последние {days_back} дней не найдено"
+                    )
+                else:
+                    for n in security_news[:5]:
+                        title = (n.get("title") or "")[:120]
+                        url = n.get("url") or "N/A"
+                        logger.warning(f"⚠️ Security news {coin}: {title} | URL: {url}")
         except Exception as e:
             logger.warning(f"Ошибка при проверке делистинга для {coin}: {e}")
     
