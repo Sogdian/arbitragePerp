@@ -3,6 +3,7 @@
 """
 import asyncio
 import logging
+import os
 import sys
 from typing import Optional, Dict, List
 from exchanges.async_bybit import AsyncBybitExchange
@@ -406,6 +407,14 @@ class PerpArbitrageBot:
                     logger.info(
                         f"✓ Новостей о взломах/безопасности {coin} ({exchanges_str}) за последние {days_back} дней не найдено"
                     )
+                    # Binance может быть недоступен из-за AWS WAF без cookie, тогда вывод "не найдено" может быть ложным.
+                    if any(str(x).lower() == "binance" for x in (exchanges or [])) and not (os.getenv("BINANCE_COOKIE") or "").strip():
+                        logger.warning(
+                            "⚠️ Binance security-monitor может быть неполным из-за AWS WAF. "
+                            "Если хотите ловить Binance Square/Risk Warning посты (например, как в `%s`), "
+                            "добавьте BINANCE_COOKIE в .env (cookie из браузера).",
+                            "https://www.binance.com/ru/square/post/34279029732634",
+                        )
                 else:
                     for n in security_news[:5]:
                         title = (n.get("title") or "")[:120]
@@ -568,9 +577,15 @@ async def main():
     
     try:
         # Читаем вводные данные из командной строки или stdin
-        if len(sys.argv) > 1:
-            # Вводные данные переданы как аргумент командной строки
-            input_text = " ".join(sys.argv[1:])
+        raw_args = [a.strip() for a in sys.argv[1:]]
+        # Флаги управления интерактивностью/мониторингом
+        monitor_forced = ("--monitor" in raw_args)
+        monitor_disabled = ("--no-monitor" in raw_args) or ("--no-prompt" in raw_args)
+        filtered_args = [a for a in raw_args if a not in ("--monitor", "--no-monitor", "--no-prompt")]
+
+        if filtered_args:
+            # Вводные данные переданы как аргументы командной строки
+            input_text = " ".join(filtered_args)
         else:
             # Читаем из stdin
             print("Введите данные в формате: 'монета Long (биржа), Short (биржа) размер'")
@@ -585,12 +600,24 @@ async def main():
         monitoring_data = await bot.process_input(input_text)
         
         if monitoring_data:
-            # Спрашиваем про ручное открытие позиций
-            print("\nБыло ли ручное открытие позиций (long и short)?")
-            print("Введите 'Да' или 'Нет':")
-            answer = input().strip().lower()
+            should_monitor = False
+
+            if monitor_forced:
+                should_monitor = True
+            elif monitor_disabled:
+                should_monitor = False
+            else:
+                # Спрашиваем про ручное открытие позиций
+                print("\nБыло ли ручное открытие позиций (long и short)?")
+                print("Введите 'Да' или 'Нет':")
+                # Если запуск не интерактивный — не блокируемся.
+                if not sys.stdin or not sys.stdin.isatty() or os.getenv("BOT_NO_PROMPT") == "1":
+                    should_monitor = False
+                else:
+                    answer = input().strip().lower()
+                    should_monitor = answer in ("да", "yes", "y")
             
-            if answer == "да" or answer == "yes" or answer == "y":
+            if should_monitor:
                 # Запускаем мониторинг
                 await bot.monitor_spreads(
                     monitoring_data["coin"],

@@ -5,6 +5,7 @@
 import asyncio
 import httpx
 import json
+import os
 from typing import List, Dict, Optional, Union
 from datetime import datetime, timedelta, timezone
 import logging
@@ -74,6 +75,20 @@ class NewsMonitor:
             "okx": "OKX",
             "bingx": "BingX",
         }
+
+        # Binance часто защищён AWS WAF (JS challenge). Можно передать cookie из браузера, чтобы httpx смог
+        # получать страницы/посты. Формат: "key1=value1; key2=value2" (например, содержит aws-waf-token).
+        self._binance_cookie = (os.getenv("BINANCE_COOKIE") or "").strip()
+        self._warned_binance_waf = False
+
+    def _extra_headers_for_url(self, url: str) -> Optional[Dict[str, str]]:
+        try:
+            host = (urlparse(url).netloc or "").lower()
+        except Exception:
+            host = ""
+        if self._binance_cookie and host.endswith("binance.com"):
+            return {"Cookie": self._binance_cookie}
+        return None
     
     @staticmethod
     def _dedupe_by_url(items: List[Dict]) -> List[Dict]:
@@ -293,8 +308,23 @@ class NewsMonitor:
 
                 for url in urls_to_fetch:
                     try:
-                        r = await shared_client.get(url)
+                        r = await shared_client.get(url, headers=self._extra_headers_for_url(url))
                         if r.status_code != 200:
+                            # Binance: AWS WAF часто отдаёт 202 + HTML со скриптом (challenge) или 403.
+                            # Без cookie мы не сможем скрапить Binance, поэтому логируем 1 раз как WARNING,
+                            # иначе пользователь думает, что "новостей нет", хотя мы просто не смогли загрузить страницу.
+                            if exchange_name == "Binance" and not self._warned_binance_waf:
+                                txt = (r.text or "")[:4000]
+                                # 202/403 на Binance почти всегда означает WAF (иногда тело пустое),
+                                # поэтому не завязываемся строго на наличие текста.
+                                if r.status_code in (202, 403):
+                                    self._warned_binance_waf = True
+                                    logger.warning(
+                                        "Binance announcements недоступны из-за AWS WAF (status=%s). "
+                                        "Чтобы мониторинг видел новости (включая security/risk posts), "
+                                        "передайте cookie из браузера через BINANCE_COOKIE в .env.",
+                                        r.status_code,
+                                    )
                             logger.debug("🔍 %s: announcements %s вернул статус %s", exchange_name, url, r.status_code)
                             continue
                         
@@ -302,7 +332,8 @@ class NewsMonitor:
                         articles: List = []
                         
                         # Общая логика для других бирж
-                        articles.extend(soup.find_all("a", href=re.compile(r"article|announcement|support|help", re.I)))
+                        # Важно: Binance и некоторые другие площадки могут публиковать посты в формате /square/post/...
+                        articles.extend(soup.find_all("a", href=re.compile(r"article|announcement|support|help|square|post", re.I)))
                         articles.extend(soup.find_all(["article", "div"], class_=re.compile(r"article|announcement|news|support", re.I)))
                         
                         # Жёсткий потолок для обработки статей (производительность)
@@ -551,7 +582,7 @@ class NewsMonitor:
                             try:
                                 # Сначала пробуем оригинальный URL (query может быть важен для локали/маршрутизации),
                                 # затем fallback на нормализованный (если original 4xx/5xx).
-                                r = await client.get(article_url)
+                                r = await client.get(article_url, headers=self._extra_headers_for_url(article_url))
                                 fetch_count += 1
 
                                 if (
@@ -559,7 +590,7 @@ class NewsMonitor:
                                     and fetch_count < fetch_limit
                                     and article_url_normalized != article_url
                                 ):
-                                    r = await client.get(article_url_normalized)
+                                    r = await client.get(article_url_normalized, headers=self._extra_headers_for_url(article_url_normalized))
                                     fetch_count += 1
                                 
                                 if r.status_code == 200:
