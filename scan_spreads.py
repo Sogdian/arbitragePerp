@@ -403,7 +403,7 @@ def _format_telegram_message(
     lines.append("")
     
     # Стратегия
-    lines.append(f'💎 <b>Strategy:</b> {coin} Long ({long_ex_capitalized}) / Short ({short_ex_capitalized})')
+    lines.append(f'💎 <b>Strategy:</b> {coin} Long ({long_ex_capitalized}), Short ({short_ex_capitalized})')
     
     return "\n".join(lines)
 
