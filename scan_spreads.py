@@ -130,11 +130,11 @@ def is_ignored_coin(coin: str) -> bool:
 
 
 async def fetch(bot: PerpArbitrageBot, ex: str, coin: str, sem: asyncio.Semaphore) -> Optional[Dict[str, Any]]:
-    """Запрос данных с ограничением параллелизма через семафор и таймаутом (только тикер, без funding)"""
+    """Запрос данных с ограничением параллелизма через семафор и таймаутом (тикер + funding)"""
     async with sem:
         try:
             return await asyncio.wait_for(
-                bot.get_futures_data(ex, coin, need_funding=False),
+                bot.get_futures_data(ex, coin, need_funding=True),
                 timeout=REQ_TIMEOUT_SEC
             )
         except asyncio.TimeoutError:
@@ -291,7 +291,7 @@ def _format_telegram_message(
     security_news: List[Dict[str, Any]],
 ) -> str:
     """Форматирует сообщение для Telegram на английском языке, используя только данные из сканера"""
-    lines = [f"🔔Pair: {coin}\n"]
+    lines = [f"🔔Pair: {coin} (Liq {SCAN_COIN_INVEST:.1f} USDT)\n"]
     
     # Long данные - используем price, если есть, иначе среднее от bid/ask
     if long_data:
@@ -325,6 +325,8 @@ def _format_telegram_message(
             funding_short_pct = funding_short * 100
             lines.append(f"📉 (Short {short_ex}) ({coin}) Funding: {funding_short_pct:.6f}%")
     
+    lines.append("")  # Пустая строка перед спредами
+    
     # Спред на цену
     lines.append(f"📊 Price spread: {open_spread_pct:.4f}%")
     
@@ -335,30 +337,6 @@ def _format_telegram_message(
         if funding_long is not None and funding_short is not None:
             funding_spread = (funding_short - funding_long) * 100
             lines.append(f"📊 Funding spread: {funding_spread:.6f}% (open: ≥0.18%, close: ≤0.05%)")
-    
-    lines.append("")  # Пустая строка
-    
-    # Ликвидность
-    if long_liq and long_liq.get("ok"):
-        spread_bps = long_liq.get("spread_bps", 0)
-        buy_impact = long_liq.get("buy_impact_bps", 0)
-        lines.append(f"✅ ✓ Liquidity {long_ex} Long ({coin}): {SCAN_COIN_INVEST:.1f} USDT | spread={spread_bps:.1f}bps, buy_impact={buy_impact:.1f}bps")
-    
-    if short_liq and short_liq.get("ok"):
-        spread_bps = short_liq.get("spread_bps", 0)
-        sell_impact = short_liq.get("sell_impact_bps", 0)
-        lines.append(f"✅ ✓ Liquidity {short_ex} Short ({coin}): {SCAN_COIN_INVEST:.1f} USDT | spread={spread_bps:.1f}bps, sell_impact={sell_impact:.1f}bps")
-    
-    # Новости
-    if not delisting_news:
-        lines.append(f"✅ ✓ No delisting news for {coin} ({long_ex}, {short_ex}) in the last 60 days")
-    else:
-        lines.append(f"❌ ✗ Delisting news found for {coin}")
-    
-    if not security_news:
-        lines.append(f"✅ ✓ No security/hack news for {coin} ({long_ex}, {short_ex}) in the last 60 days")
-    else:
-        lines.append(f"❌ ✗ Security news found for {coin}")
     
     lines.append("")  # Пустая строка
     lines.append(f"{coin} Long ({long_ex}), Short ({short_ex})")
