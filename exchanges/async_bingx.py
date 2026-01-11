@@ -15,6 +15,20 @@ from .coin_list_fetchers import fetch_bingx_coins
 logger = logging.getLogger(__name__)
 
 
+def _to_int(x) -> Optional[int]:
+    try:
+        return int(x)
+    except Exception:
+        return None
+
+
+# "нет инструмента" / "символ не существует"
+_BINGX_NOT_FOUND_CODES = {109425}
+
+# "инструмент существует, но торги приостановлены" (is pause currently)
+_BINGX_PAUSED_CODES = {109415}
+
+
 class AsyncBingxExchange(AsyncBaseExchange):
     BASE_URL = "https://open-api.bingx.com"
 
@@ -60,16 +74,16 @@ class AsyncBingxExchange(AsyncBaseExchange):
 
         return v
 
-    def _is_api_error(self, data: object) -> bool:
+    def _get_code_int(self, data: object) -> Optional[int]:
         """
-        BingX возвращает ошибки в формате {"code": 100001, "msg": "...", "data": null}
-        Успешные ответы содержат "code": 0 или "0" и "data" с данными.
+        Извлекает код ответа API как int для дальнейшей обработки.
+        
+        Returns:
+            Код ответа как int, или None если код отсутствует или не является числом
         """
         if not isinstance(data, dict):
-            return False
-        code = data.get("code")
-        # Успех: 0 или "0"
-        return code is not None and str(code) != "0"
+            return None
+        return _to_int(data.get("code"))
 
     async def get_futures_ticker(self, coin: str) -> Optional[Dict[str, Any]]:
         """
@@ -93,11 +107,15 @@ class AsyncBingxExchange(AsyncBaseExchange):
                 logger.warning(f"BingX: пустой ответ ticker для {coin} (symbol={symbol})")
                 return None
             
-            if self._is_api_error(data):
-                logger.warning(
-                    f"BingX: ticker API error для {coin} "
-                    f"(symbol={symbol}, code={data.get('code')}, msg={data.get('msg', '')})"
-                )
+            code_int = self._get_code_int(data)
+            if code_int is not None and code_int != 0:
+                msg = data.get("msg", "")
+                if code_int in _BINGX_NOT_FOUND_CODES or code_int in _BINGX_PAUSED_CODES:
+                    # это "не торгуется/недоступно" — не шумим WARNING
+                    logger.debug(f"BingX: ticker unavailable for {coin} (symbol={symbol}, code={code_int}, msg={msg})")
+                else:
+                    # реально интересные ошибки
+                    logger.warning(f"BingX: ticker API error для {coin} (symbol={symbol}, code={code_int}, msg={msg})")
                 return None
 
             # BingX возвращает данные в поле "data"
@@ -155,11 +173,13 @@ class AsyncBingxExchange(AsyncBaseExchange):
                 logger.warning(f"BingX: пустой ответ premiumIndex для {coin} (symbol={symbol})")
                 return None
             
-            if self._is_api_error(data):
-                logger.warning(
-                    f"BingX: premiumIndex API error для {coin} "
-                    f"(symbol={symbol}, code={data.get('code')}, msg={data.get('msg', '')})"
-                )
+            code_int = self._get_code_int(data)
+            if code_int is not None and code_int != 0:
+                msg = data.get("msg", "")
+                if code_int in _BINGX_NOT_FOUND_CODES or code_int in _BINGX_PAUSED_CODES:
+                    logger.debug(f"BingX: premiumIndex unavailable for {coin} (symbol={symbol}, code={code_int}, msg={msg})")
+                else:
+                    logger.warning(f"BingX: premiumIndex API error для {coin} (symbol={symbol}, code={code_int}, msg={msg})")
                 return None
 
             # BingX возвращает данные в поле "data"
@@ -213,11 +233,13 @@ class AsyncBingxExchange(AsyncBaseExchange):
                 logger.warning(f"BingX: пустой ответ orderbook для {coin} (symbol={symbol})")
                 return None
             
-            if self._is_api_error(data):
-                logger.warning(
-                    f"BingX: orderbook API error для {coin} "
-                    f"(symbol={symbol}, code={data.get('code')}, msg={data.get('msg', '')})"
-                )
+            code_int = self._get_code_int(data)
+            if code_int is not None and code_int != 0:
+                msg = data.get("msg", "")
+                if code_int in _BINGX_NOT_FOUND_CODES or code_int in _BINGX_PAUSED_CODES:
+                    logger.debug(f"BingX: orderbook unavailable for {coin} (symbol={symbol}, code={code_int}, msg={msg})")
+                else:
+                    logger.warning(f"BingX: orderbook API error для {coin} (symbol={symbol}, code={code_int}, msg={msg})")
                 return None
 
             # BingX возвращает данные в поле "data"
