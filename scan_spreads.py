@@ -238,6 +238,7 @@ async def main():
         )
 
         while True:
+            logger.info("🔄 Новый цикл поиска")
             t0 = time.perf_counter()
             await scan_once(bot, exchanges, coins, sem, coins_by_exchange)
             dt = time.perf_counter() - t0
