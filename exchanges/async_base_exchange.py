@@ -4,6 +4,7 @@
 """
 from abc import ABC, abstractmethod
 from typing import Dict, Optional, List, Tuple, Sequence, Union, Any, Set
+import os
 import httpx
 import asyncio
 import logging
@@ -18,13 +19,20 @@ class AsyncBaseExchange(ABC):
 
     def __init__(self, name: str, pool_limit: int = 100):
         self.name = name
+        # Таймауты и ретраи (тюним через .env при необходимости)
+        self._connect_timeout_s = float(os.getenv("EXCHANGE_CONNECT_TIMEOUT_SEC", "5"))
+        self._rw_timeout_s = float(os.getenv("EXCHANGE_RW_TIMEOUT_SEC", "8"))
+        self._pool_timeout_s = float(os.getenv("EXCHANGE_POOL_TIMEOUT_SEC", "5"))
+        self._request_retries = int(os.getenv("EXCHANGE_HTTP_RETRIES", "1"))  # число повторов после первой попытки
+        self._retry_backoff_s = float(os.getenv("EXCHANGE_HTTP_RETRY_BACKOFF_SEC", "0.35"))
+
         # Один AsyncClient на биржу – повторно используем TCP-соединения
         # Используем BASE_URL из класса наследника, а не из базового класса
         base_url = getattr(self.__class__, "BASE_URL", "") or ""
         self.client = httpx.AsyncClient(
             base_url=base_url,
             limits=httpx.Limits(max_connections=pool_limit, max_keepalive_connections=pool_limit),
-            timeout=httpx.Timeout(5.0, connect=3.0)
+            timeout=httpx.Timeout(self._rw_timeout_s, connect=self._connect_timeout_s, pool=self._pool_timeout_s)
         )
 
     async def close(self):
@@ -33,42 +41,54 @@ class AsyncBaseExchange(ABC):
 
     async def _request_json(self, method: str, url: str, *, params: Optional[dict] = None, headers: Optional[dict] = None) -> Optional[dict]:
         """Обертка с обработкой ошибок и логированием"""
-        try:
-            resp = await self.client.request(method, url, params=params, headers=headers)
-            resp.raise_for_status()
-            result = resp.json()
-            return result
-        except httpx.HTTPStatusError as e:
-            status = e.response.status_code
-            # Для LBank и 404 ошибок - это означает, что публичный API недоступен
-            if self.name == "LBank" and status == 404:
-                logger.warning(f"{self.name}: HTTP 404 для {url} с params {params}. Публичный endpoint недоступен или неверные params.")
-            elif self.name == "LBank" and status in (403, 429):
-                full_url = str(e.response.request.url)
-                logger.warning(f"{self.name}: HTTP {status} для {full_url} с params {params}. Похоже на Cloudflare/rate-limit.")
-                try:
-                    logger.debug(f"{self.name}: HTTP {status} response body: {e.response.text[:200]}")
-                except:
-                    pass
-            else:
-                try:
-                    error_body = e.response.text[:200]
-                    logger.debug(f"{self.name}: HTTP {status} для {url} с params {params}: {error_body}")
-                except:
-                    logger.debug(f"{self.name}: HTTP {status} для {url} с params {params}")
-        except (httpx.RequestError, asyncio.TimeoutError) as e:
-            # Часто у таймаутов str(e) пустой -> добавляем тип исключения для читаемости
-            exc_name = type(e).__name__
-            msg = str(e) or repr(e)
-            full_url = url
+        attempts = max(1, 1 + int(self._request_retries))
+        for attempt_idx in range(attempts):
+            is_last = attempt_idx == attempts - 1
             try:
-                if isinstance(e, httpx.RequestError) and getattr(e, "request", None) is not None:
-                    full_url = str(e.request.url)
-            except Exception:
-                pass
-            logger.warning(f"{self.name}: Ошибка соединения для {full_url} с params {params}: {exc_name}: {msg}")
-        except Exception as e:
-            logger.warning(f"{self.name}: Неожиданная ошибка для {url} с params {params}: {e}")
+                resp = await self.client.request(method, url, params=params, headers=headers)
+                resp.raise_for_status()
+                result = resp.json()
+                return result
+            except httpx.HTTPStatusError as e:
+                status = e.response.status_code
+                # Для LBank и 404 ошибок - это означает, что публичный API недоступен
+                if self.name == "LBank" and status == 404:
+                    logger.warning(f"{self.name}: HTTP 404 для {url} с params {params}. Публичный endpoint недоступен или неверные params.")
+                elif self.name == "LBank" and status in (403, 429):
+                    full_url = str(e.response.request.url)
+                    logger.warning(f"{self.name}: HTTP {status} для {full_url} с params {params}. Похоже на Cloudflare/rate-limit.")
+                    try:
+                        logger.debug(f"{self.name}: HTTP {status} response body: {e.response.text[:200]}")
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        error_body = e.response.text[:200]
+                        logger.debug(f"{self.name}: HTTP {status} для {url} с params {params}: {error_body}")
+                    except Exception:
+                        logger.debug(f"{self.name}: HTTP {status} для {url} с params {params}")
+                return None
+            except (httpx.RequestError, asyncio.TimeoutError) as e:
+                # ретраи: первые попытки -> DEBUG, последняя -> WARNING
+                exc_name = type(e).__name__
+                msg = str(e) or repr(e)
+                full_url = url
+                try:
+                    if isinstance(e, httpx.RequestError) and getattr(e, "request", None) is not None:
+                        full_url = str(e.request.url)
+                except Exception:
+                    pass
+
+                log_msg = f"{self.name}: Ошибка соединения для {full_url} с params {params}: {exc_name}: {msg}"
+                if is_last:
+                    logger.warning(log_msg)
+                    return None
+                logger.debug(f"{log_msg} (retry {attempt_idx + 1}/{attempts - 1})")
+                await asyncio.sleep(self._retry_backoff_s * (attempt_idx + 1))
+            except Exception as e:
+                logger.warning(f"{self.name}: Неожиданная ошибка для {url} с params {params}: {e}")
+                return None
+
         return None
 
     @staticmethod
