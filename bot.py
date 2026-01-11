@@ -512,7 +512,8 @@ class PerpArbitrageBot:
         
         # Отслеживание времени последней отправки сообщения (ключ: (coin, long_exchange, short_exchange))
         last_sent_time: Dict[tuple, float] = {}
-        SEND_INTERVAL_SEC = 60  # Интервал между отправками: 1 минута
+        # Интервал между отправками сообщений о закрытии (секунды), читается из .env
+        SEND_INTERVAL_SEC = float(os.getenv("CLOSE_INTERVAL", "60"))  # По умолчанию 60 секунд (1 минута)
         
         try:
             while True:
@@ -611,7 +612,7 @@ class PerpArbitrageBot:
                                         short_ex_capitalized = short_exchange.capitalize()
                                         
                                         message_lines = [
-                                            f"🏁 <b>Close {coin}:</b> Long ({long_ex_capitalized}) / Short ({short_ex_capitalized})",
+                                            f"⏰ <b>Time to close {coin}:</b> Long ({long_ex_capitalized}) / Short ({short_ex_capitalized})",
                                         ]
                                         
                                         if opening_spread is not None:
