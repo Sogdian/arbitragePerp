@@ -65,19 +65,30 @@ async def fetch_gate_coins(exchange) -> Set[str]:
             return coins
         
         for it in data:
-            name = it.get("name")  # BTC_USDT
-            if not isinstance(name, str) or not name.endswith("_USDT"):
+            if not isinstance(it, dict):
                 continue
             
-            # если есть флаги делистинга/торгового статуса — фильтруем мягко
+            # контракт может называться "name" или "contract"
+            c = it.get("name") or it.get("contract")
+            if not isinstance(c, str):
+                continue
+            
+            # берем только *_USDT
+            if not c.endswith("_USDT"):
+                continue
+            
+            base = c.replace("_USDT", "")
+            if not base:
+                continue
+            
+            # опционально: отсев делистинга/паузы (если такие поля есть)
             if it.get("in_delisting") is True:
                 continue
-            # trade_status: пропускаем только явно закрытые, не делаем жесткий фильтр
             ts = str(it.get("trade_status", "")).lower()
             if ts in ("delisting", "suspend", "suspended", "closed"):
                 continue
             
-            coins.add(name.replace("_USDT", "").upper())
+            coins.add(base.upper())
         
         return coins
     except Exception as e:

@@ -99,30 +99,45 @@ class AsyncGateExchange(AsyncBaseExchange):
         Получить тикер фьючерса для монеты
         """
         try:
-            symbol = self._normalize_symbol(coin)
+            symbol = self._normalize_symbol(coin)  # e.g. TUT_USDT
             url = "/api/v4/futures/usdt/tickers"
             params = {"contract": symbol}
 
             data = await self._request_json("GET", url, params=params)
-            if not data:
-                logger.warning(f"Gate: не удалось получить тикер для {coin}")
+
+            # 1) Реальная проблема сети/HTTP/парсинга -> data == None (или Falsey не-list/dict)
+            if data is None:
+                logger.warning(f"Gate: тикер запрос вернул None для {coin} (contract={symbol})")
                 return None
 
-            # Gate.io возвращает список или словарь
-            if isinstance(data, list) and data:
-                item = next((x for x in data if isinstance(x, dict) and x.get("contract") == symbol), data[0])
+            # 2) Нормальная ситуация "контракт не найден / не активен": API вернул пустой список
+            if isinstance(data, list):
+                if not data:
+                    logger.debug(f"Gate: тикер не найден для {coin} (contract={symbol})")
+                    return None
+
+                # если contract-параметр сработал, обычно будет один элемент;
+                # но на всякий случай ищем точное совпадение и НЕ берем data[0], если совпадения нет
+                item = next((x for x in data if isinstance(x, dict) and x.get("contract") == symbol), None)
+                if item is None:
+                    logger.debug(f"Gate: тикер список без нужного contract для {coin} (contract={symbol})")
+                    return None
+
             elif isinstance(data, dict):
                 item = data
+                # Иногда Gate может вернуть dict с ошибкой вида {"label": "...", "message": "..."}
+                # Если видишь такие поля — лучше логировать warning.
+                if "message" in item and "label" in item and "contract" not in item:
+                    logger.warning(f"Gate: ticker API error для {coin}: {item}")
+                    return None
             else:
-                item = None
-
-            if not item or not isinstance(item, dict):
-                logger.warning(f"Gate: тикер для {coin} не найден / неверный формат")
+                logger.warning(f"Gate: неожиданный формат тикера для {coin}: {type(data)}")
                 return None
 
+            # дальше парсинг цены
             last_raw = item.get("last")
             if last_raw is None:
-                logger.warning(f"Gate: нет last для {coin}: {item}")
+                logger.debug(f"Gate: нет last для {coin} (contract={symbol})")
                 return None
 
             last = float(last_raw)
