@@ -87,11 +87,19 @@ def calc_open_spread_pct(ask_long: Optional[float], bid_short: Optional[float]) 
 # Семафор для ограничения параллелизма (создается в main() после загрузки настроек)
 
 
+def is_ignored_coin(coin: str) -> bool:
+    """Проверяет, нужно ли игнорировать монету (начинается с цифры)"""
+    return bool(coin) and coin[0].isdigit()
+
+
 async def fetch(bot: PerpArbitrageBot, ex: str, coin: str, sem: asyncio.Semaphore) -> Optional[Dict[str, Any]]:
-    """Запрос данных с ограничением параллелизма через семафор и таймаутом"""
+    """Запрос данных с ограничением параллелизма через семафор и таймаутом (только тикер, без funding)"""
     async with sem:
         try:
-            return await asyncio.wait_for(bot.get_futures_data(ex, coin), timeout=REQ_TIMEOUT_SEC)
+            return await asyncio.wait_for(
+                bot.get_futures_data(ex, coin, need_funding=False),
+                timeout=REQ_TIMEOUT_SEC
+            )
         except asyncio.TimeoutError:
             logger.warning(f"Timeout: {ex} {coin} get_futures_data > {REQ_TIMEOUT_SEC:.1f}s")
             return None
@@ -115,7 +123,9 @@ async def collect_coins_by_exchange(bot: PerpArbitrageBot, exchanges: List[str])
         if isinstance(res, Exception) or not res:
             out[ex] = set()
         else:
-            out[ex] = set(res)  # res уже является Set[str]
+            # фильтруем цифро-префиксные
+            filtered = {c for c in set(res) if not is_ignored_coin(c)}
+            out[ex] = filtered
     
     return out
 
@@ -133,11 +143,18 @@ async def process_coin(
     exchanges: List[str],
     coin: str,
     sem: asyncio.Semaphore,
+    coins_by_exchange: Dict[str, Set[str]],
 ) -> None:
     """
-    Обрабатывает одну монету: запрашивает данные со всех бирж, вычисляет спреды и логирует находки.
+    Обрабатывает одну монету: запрашивает данные только с бирж, где монета есть,
+    вычисляет спреды и логирует находки.
     """
-    tasks = {ex: asyncio.create_task(fetch(bot, ex, coin, sem)) for ex in exchanges}
+    # Берём только биржи, где coin есть в их списке
+    ex_list = [ex for ex in exchanges if coin in coins_by_exchange.get(ex, set())]
+    if len(ex_list) < 2:
+        return
+
+    tasks = {ex: asyncio.create_task(fetch(bot, ex, coin, sem)) for ex in ex_list}
     results = await asyncio.gather(*tasks.values(), return_exceptions=True)
 
     ex_data: Dict[str, Optional[Dict[str, Any]]] = {}
@@ -179,6 +196,7 @@ async def scan_once(
     exchanges: List[str],
     coins: List[str],
     sem: asyncio.Semaphore,
+    coins_by_exchange: Dict[str, Set[str]],
 ) -> None:
     """
     Один проход по всем монетам батчами.
@@ -191,7 +209,7 @@ async def scan_once(
     for i in range(0, total, COIN_BATCH_SIZE):
         batch = coins[i:i + COIN_BATCH_SIZE]
         await asyncio.gather(
-            *(process_coin(bot, exchanges, coin, sem) for coin in batch),
+            *(process_coin(bot, exchanges, coin, sem, coins_by_exchange) for coin in batch),
             return_exceptions=True
         )
         logger.info(f"Progress: {min(i + COIN_BATCH_SIZE, total)}/{total} coins processed")
@@ -221,7 +239,7 @@ async def main():
 
         while True:
             t0 = time.perf_counter()
-            await scan_once(bot, exchanges, coins, sem)
+            await scan_once(bot, exchanges, coins, sem, coins_by_exchange)
             dt = time.perf_counter() - t0
             logger.info(f"scan_once finished in {dt:.1f}s; sleeping {SCAN_INTERVAL_SEC:.1f}s")
             await asyncio.sleep(SCAN_INTERVAL_SEC)

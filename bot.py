@@ -75,13 +75,14 @@ class PerpArbitrageBot:
             return_exceptions=True
         )
     
-    async def get_futures_data(self, exchange_name: str, coin: str) -> Optional[Dict]:
+    async def get_futures_data(self, exchange_name: str, coin: str, need_funding: bool = True) -> Optional[Dict]:
         """
         Получить данные о фьючерсе (цена и фандинг) для монеты на бирже
         
         Args:
             exchange_name: Название биржи ("bybit" или "gate")
             coin: Название монеты (например, "CVC")
+            need_funding: Запрашивать ли фандинг (по умолчанию True)
             
         Returns:
             Словарь с данными:
@@ -89,7 +90,7 @@ class PerpArbitrageBot:
                 "price": float,
                 "bid": float,
                 "ask": float,
-                "funding_rate": float
+                "funding_rate": float (если need_funding=True)
             }
             или None если ошибка
         """
@@ -98,33 +99,34 @@ class PerpArbitrageBot:
             logger.error(f"Неизвестная биржа: {exchange_name}")
             return None
         
-        # Получаем тикер и фандинг параллельно
-        ticker_task = exchange.get_futures_ticker(coin)
-        funding_task = exchange.get_funding_rate(coin)
-        
-        ticker, funding_rate = await asyncio.gather(
-            ticker_task,
-            funding_task,
-            return_exceptions=True
-        )
+        # Всегда тянем bid/ask
+        ticker = await exchange.get_futures_ticker(coin)
         
         if isinstance(ticker, Exception):
             logger.error(f"{exchange_name}: ошибка при получении тикера для {coin}: {ticker}")
             ticker = None
         
-        if isinstance(funding_rate, Exception):
-            logger.error(f"{exchange_name}: ошибка при получении фандинга для {coin}: {funding_rate}")
-            funding_rate = None
-        
         if not ticker:
             return None
         
-        return {
+        out = {
             "price": ticker.get("price"),
             "bid": ticker.get("bid"),
             "ask": ticker.get("ask"),
-            "funding_rate": funding_rate
         }
+        
+        # Funding — только если нужно
+        if need_funding:
+            funding_rate = await exchange.get_funding_rate(coin)
+            
+            if isinstance(funding_rate, Exception):
+                logger.error(f"{exchange_name}: ошибка при получении фандинга для {coin}: {funding_rate}")
+                funding_rate = None
+            
+            if funding_rate is not None:
+                out["funding_rate"] = funding_rate
+        
+        return out
     
     def calculate_spread(self, price_short: Optional[float], price_long: Optional[float]) -> Optional[float]:
         """
