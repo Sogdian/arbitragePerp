@@ -340,8 +340,6 @@ def _format_telegram_message(
     # Заголовок
     lines = [f'🔔 <b>Signal: {coin}</b> (Liq: {SCAN_COIN_INVEST:.1f} USDT)']
     lines.append("")
-    lines.append("━━━━━━━━━━━━━━━━━━")
-    lines.append("")
     
     # Long данные - используем price, если есть, иначе среднее от bid/ask
     price_long = None
@@ -379,9 +377,6 @@ def _format_telegram_message(
         if price_long is not None:
             lines.append('└ Funding: <code>N/A</code>')
     
-    lines.append("")
-    lines.append("")
-    
     # SHORT секция
     short_ex_capitalized = short_ex.capitalize()
     lines.append(f'🔴 <b>SHORT</b> ({short_ex_capitalized})')
@@ -395,23 +390,19 @@ def _format_telegram_message(
             lines.append('└ Funding: <code>N/A</code>')
     
     lines.append("")
-    lines.append("━━━━━━━━━━━━━━━━━━")
-    lines.append("")
     
     # Спреды
     lines.append('<b>📊 Spreads:</b>')
     lines.append(f'• Price Spread: <b>{open_spread_pct:.4f}%</b>')
     
-    # Спред на фандинги
+    # Спред на фандинги с порогами
     if funding_long is not None and funding_short is not None:
         funding_spread = (funding_short - funding_long) * 100
-        lines.append(f'• Funding Spread: <b>{funding_spread:.6f}%</b>')
+        lines.append(f'• Funding Spread: <b>{funding_spread:.6f}%</b> (open ≥ 0.18% | close ≤ 0.05%)')
     
     lines.append("")
-    lines.append("")
     
-    # Настройки и стратегия
-    lines.append('<i>⚙️ Settings: Open ≥ 0.18% | Close ≤ 0.05%</i>')
+    # Стратегия
     lines.append(f'💎 <b>Strategy:</b> {coin} Long ({long_ex_capitalized}) / Short ({short_ex_capitalized})')
     
     return "\n".join(lines)
