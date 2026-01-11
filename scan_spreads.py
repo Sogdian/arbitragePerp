@@ -51,6 +51,10 @@ SCAN_INTERVAL_SEC = float(os.getenv("SCAN_INTERVAL_SEC", "5"))  # каждые N
 MAX_CONCURRENCY = int(os.getenv("SCAN_MAX_CONCURRENCY", "40"))  # сколько одновременных http запросов
 COIN_BATCH_SIZE = int(os.getenv("SCAN_COIN_BATCH_SIZE", "50"))  # сколько монет обрабатывать за пачку
 REQ_TIMEOUT_SEC = float(os.getenv("SCAN_REQ_TIMEOUT_SEC", "12"))  # таймаут на запрос к бирже (8-12 норм)
+TICKER_TIMEOUT_SEC = float(os.getenv("SCAN_TICKER_TIMEOUT_SEC", str(REQ_TIMEOUT_SEC)))  # таймаут только на ticker (сек)
+FUNDING_TIMEOUT_SEC = float(os.getenv("SCAN_FUNDING_TIMEOUT_SEC", str(REQ_TIMEOUT_SEC)))  # таймаут только на funding (сек)
+FETCH_RETRIES = int(os.getenv("SCAN_FETCH_RETRIES", "1"))  # сколько доп. попыток на ticker при timeout (0-2 разумно)
+FETCH_RETRY_BACKOFF_SEC = float(os.getenv("SCAN_FETCH_RETRY_BACKOFF_SEC", "0.6"))  # backoff между попытками ticker
 SCAN_COIN_INVEST = float(os.getenv("SCAN_COIN_INVEST", "50"))  # размер позиции (USDT) для проверки ликвидности в сканере
 NEWS_CACHE_TTL_SEC = float(os.getenv("SCAN_NEWS_CACHE_TTL_SEC", "180"))  # TTL кеша новостей (сек), по умолчанию 3 минуты
 ANALYSIS_MAX_CONCURRENCY = int(os.getenv("SCAN_ANALYSIS_MAX_CONCURRENCY", "2"))  # параллелизм "глубокого" анализа спредов
@@ -130,19 +134,62 @@ def is_ignored_coin(coin: str) -> bool:
 
 
 async def fetch(bot: PerpArbitrageBot, ex: str, coin: str, sem: asyncio.Semaphore) -> Optional[Dict[str, Any]]:
-    """Запрос данных с ограничением параллелизма через семафор и таймаутом (тикер + funding)"""
-    async with sem:
+    """
+    Запрос данных с ограничением параллелизма через семафор.
+
+    Важно: тикер (bid/ask) и funding запрашиваем отдельно.
+    Если funding завис/затупил — мы всё равно возвращаем тикер, чтобы не терять данные по монете.
+    """
+    exchange = bot.exchanges.get(ex)
+    if not exchange:
+        return None
+
+    # Пер-эксчейндж override таймаутов/ретраев (если нужно точечно подправить MEXC/Gate)
+    ex_up = ex.upper()
+    ticker_timeout = float(os.getenv(f"SCAN_TICKER_TIMEOUT_SEC_{ex_up}", str(TICKER_TIMEOUT_SEC)))
+    funding_timeout = float(os.getenv(f"SCAN_FUNDING_TIMEOUT_SEC_{ex_up}", str(FUNDING_TIMEOUT_SEC)))
+    ticker_retries = int(os.getenv(f"SCAN_FETCH_RETRIES_{ex_up}", str(FETCH_RETRIES)))
+
+    # 1) Тикер (важно для спреда): ретраим только timeouts.
+    # ВАЖНО: семафор держим только во время реального HTTP, не во время sleep/backoff.
+    ticker: Optional[Dict[str, Any]] = None
+    for attempt in range(max(0, ticker_retries) + 1):
         try:
-            return await asyncio.wait_for(
-                bot.get_futures_data(ex, coin, need_funding=True),
-                timeout=REQ_TIMEOUT_SEC
-            )
+            async with sem:
+                ticker = await asyncio.wait_for(exchange.get_futures_ticker(coin), timeout=ticker_timeout)
+            break
         except asyncio.TimeoutError:
-            logger.warning(f"Timeout: {ex} {coin} get_futures_data > {REQ_TIMEOUT_SEC:.1f}s")
-            return None
+            is_last = (attempt >= max(0, ticker_retries))
+            if is_last:
+                logger.warning(f"Timeout: {ex} {coin} ticker > {ticker_timeout:.1f}s")
+            else:
+                logger.debug(f"Timeout: {ex} {coin} ticker > {ticker_timeout:.1f}s (retry {attempt + 1})")
+            await asyncio.sleep(FETCH_RETRY_BACKOFF_SEC * (attempt + 1))
         except Exception as e:
-            logger.warning(f"Fetch error: {ex} {coin}: {e}", exc_info=True)
+            logger.warning(f"Fetch error: {ex} {coin} ticker: {e}", exc_info=True)
             return None
+
+    if not ticker:
+        return None
+
+    out: Dict[str, Any] = {
+        "price": ticker.get("price"),
+        "bid": ticker.get("bid"),
+        "ask": ticker.get("ask"),
+    }
+
+    # 2) Funding (не критично для спреда цены): таймаут/ошибка не должны "убивать" тикер.
+    try:
+        async with sem:
+            funding_rate = await asyncio.wait_for(exchange.get_funding_rate(coin), timeout=funding_timeout)
+        if funding_rate is not None:
+            out["funding_rate"] = funding_rate
+    except asyncio.TimeoutError:
+        logger.debug(f"Timeout: {ex} {coin} funding > {funding_timeout:.1f}s")
+    except Exception:
+        logger.debug(f"Fetch error: {ex} {coin} funding", exc_info=True)
+
+    return out
 
 
 async def _get_news_cached(
