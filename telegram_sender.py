@@ -27,10 +27,13 @@ class TelegramSender:
         self.free_channel_id = config.FREE_CHANNEL_ID
         self.enabled = config.ENABLE_TELEGRAM and bool(self.bot_token)
         
-        if self.enabled:
-            logger.info(f"Telegram интеграция включена (режим: {config.ENV_MODE})")
+        # Детальное логирование для диагностики
+        if not config.ENABLE_TELEGRAM:
+            logger.warning(f"Telegram интеграция отключена: ENABLE_TELEGRAM={config.ENABLE_TELEGRAM} (значение из config)")
+        elif not self.bot_token:
+            logger.warning(f"Telegram интеграция отключена: BOT_TOKEN не установлен (длина: {len(self.bot_token) if self.bot_token else 0})")
         else:
-            logger.info("Telegram интеграция отключена")
+            logger.info(f"Telegram интеграция включена (режим: {config.ENV_MODE}, канал: {self._get_channel_id() or 'не установлен'})")
     
     def _get_channel_id(self) -> str:
         """Возвращает ID канала в зависимости от режима (test/prod)"""

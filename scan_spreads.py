@@ -9,6 +9,8 @@ from itertools import combinations
 from typing import Any, Dict, Optional, List, Tuple, Set
 
 from bot import PerpArbitrageBot
+from telegram_sender import TelegramSender
+import config
 
 
 # ----------------------------
@@ -235,7 +237,32 @@ async def _analyze_and_log_opportunity(
             ok = False
 
         verdict = "✓ арбитражить" if ok else "✗ не арбитражить"
-        logger.info(f"💰 {coin} Long ({long_ex}), Short ({short_ex}) spread {open_spread_pct:.4f}% {verdict}")
+        log_message = f"💰 {coin} Long ({long_ex}), Short ({short_ex}) spread {open_spread_pct:.4f}% {verdict}"
+        logger.info(log_message)
+        
+        # Отправляем в Telegram, если вердикт "✓ арбитражить"
+        # Канал выбирается автоматически на основе ENV_MODE (test -> TEST_CHANNEL_ID, prod -> FREE_CHANNEL_ID)
+        if ok:
+            try:
+                telegram = TelegramSender()
+                if telegram.enabled:
+                    channel_id = telegram._get_channel_id()
+                    if channel_id:
+                        # Форматируем сообщение для Telegram
+                        telegram_message = (
+                            f"🔔 <b>Arbitrage Opportunity</b>\n\n"
+                            f"💰 <b>Pair:</b> {coin}\n"
+                            f"📊 <b>Spread:</b> {open_spread_pct:.4f}%\n"
+                            f"📈 <b>Long:</b> {long_ex}\n"
+                            f"📉 <b>Short:</b> {short_ex}\n\n"
+                            f"✅ <b>Status:</b> Ready to arbitrage"
+                        )
+                        await telegram.send_message(telegram_message, channel_id=channel_id)
+                        logger.debug(f"📱 Отправлено сообщение в Telegram для {coin} (режим: {config.ENV_MODE})")
+                    else:
+                        logger.warning(f"📱 Telegram включен, но канал не настроен для режима {config.ENV_MODE}")
+            except Exception as e:
+                logger.warning(f"Ошибка отправки в Telegram для {coin}: {e}", exc_info=True)
 
 
 async def collect_coins_by_exchange(bot: PerpArbitrageBot, exchanges: List[str]) -> Dict[str, Set[str]]:
@@ -369,11 +396,17 @@ async def main():
         sem = asyncio.Semaphore(MAX_CONCURRENCY)
         analysis_sem = asyncio.Semaphore(ANALYSIS_MAX_CONCURRENCY)
 
+        # Логируем режим работы и настройки Telegram
+        telegram = TelegramSender()
+        telegram_status = "enabled" if telegram.enabled else "disabled"
+        channel_info = f"channel={telegram._get_channel_id() or 'not set'}"
+        
         logger.info(
-            f"scan_spreads started | MIN_SPREAD={MIN_SPREAD:.2f}% | interval={SCAN_INTERVAL_SEC}s | "
+            f"scan_spreads started | mode={config.ENV_MODE} | MIN_SPREAD={MIN_SPREAD:.2f}% | interval={SCAN_INTERVAL_SEC}s | "
             f"exchanges={exchanges} | "
             f"max_concurrency={MAX_CONCURRENCY} | timeout={REQ_TIMEOUT_SEC:.1f}s | "
-            f"invest={SCAN_COIN_INVEST:.2f} | analysis_max_concurrency={ANALYSIS_MAX_CONCURRENCY} | news_cache_ttl={NEWS_CACHE_TTL_SEC:.0f}s"
+            f"invest={SCAN_COIN_INVEST:.2f} | analysis_max_concurrency={ANALYSIS_MAX_CONCURRENCY} | news_cache_ttl={NEWS_CACHE_TTL_SEC:.0f}s | "
+            f"telegram={telegram_status} | {channel_info}"
         )
 
         printed_stats = False
