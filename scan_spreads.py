@@ -189,14 +189,23 @@ async def _analyze_and_log_opportunity(
     short_ex: str,
     open_spread_pct: float,
     analysis_sem: asyncio.Semaphore,
+    long_data: Optional[Dict[str, Any]] = None,
+    short_data: Optional[Dict[str, Any]] = None,
 ) -> None:
     """
     Считает "как bot.py" (ликвидность + новости), но НЕ печатает подробные логи.
     В логи попадает только 1 строка: "💰 ... spread ... ✓/✗".
+    Использует только переданные данные (без дополнительных запросов).
     """
     async with analysis_sem:
         ok = False
+        long_liq = None
+        short_liq = None
+        delisting_news = []
+        security_news = []
+        
         try:
+            
             # 1) Ликвидность (тихо)
             long_obj = bot.exchanges.get(long_ex)
             short_obj = bot.exchanges.get(short_ex)
@@ -248,14 +257,18 @@ async def _analyze_and_log_opportunity(
                 if telegram.enabled:
                     channel_id = telegram._get_channel_id()
                     if channel_id:
-                        # Форматируем сообщение для Telegram
-                        telegram_message = (
-                            f"🔔 <b>Arbitrage Opportunity</b>\n\n"
-                            f"💰 <b>Pair:</b> {coin}\n"
-                            f"📊 <b>Spread:</b> {open_spread_pct:.4f}%\n"
-                            f"📈 <b>Long:</b> {long_ex}\n"
-                            f"📉 <b>Short:</b> {short_ex}\n\n"
-                            f"✅ <b>Status:</b> Ready to arbitrage"
+                        # Формируем детальное сообщение
+                        telegram_message = _format_telegram_message(
+                            coin=coin,
+                            long_ex=long_ex,
+                            short_ex=short_ex,
+                            long_data=long_data,
+                            short_data=short_data,
+                            open_spread_pct=open_spread_pct,
+                            long_liq=long_liq,
+                            short_liq=short_liq,
+                            delisting_news=delisting_news,
+                            security_news=security_news,
                         )
                         await telegram.send_message(telegram_message, channel_id=channel_id)
                         logger.debug(f"📱 Отправлено сообщение в Telegram для {coin} (режим: {config.ENV_MODE})")
@@ -263,6 +276,94 @@ async def _analyze_and_log_opportunity(
                         logger.warning(f"📱 Telegram включен, но канал не настроен для режима {config.ENV_MODE}")
             except Exception as e:
                 logger.warning(f"Ошибка отправки в Telegram для {coin}: {e}", exc_info=True)
+
+
+def _format_telegram_message(
+    coin: str,
+    long_ex: str,
+    short_ex: str,
+    long_data: Optional[Dict[str, Any]],
+    short_data: Optional[Dict[str, Any]],
+    open_spread_pct: float,
+    long_liq: Optional[Dict[str, Any]],
+    short_liq: Optional[Dict[str, Any]],
+    delisting_news: List[Dict[str, Any]],
+    security_news: List[Dict[str, Any]],
+) -> str:
+    """Форматирует сообщение для Telegram на английском языке, используя только данные из сканера"""
+    lines = [f"🔔Pair: {coin}\n"]
+    
+    # Long данные - используем price, если есть, иначе среднее от bid/ask
+    if long_data:
+        price_long = long_data.get("price")
+        if price_long is None:
+            bid_long = long_data.get("bid")
+            ask_long = long_data.get("ask")
+            if bid_long is not None and ask_long is not None:
+                price_long = (bid_long + ask_long) / 2.0
+        
+        funding_long = long_data.get("funding_rate")
+        if price_long is not None:
+            lines.append(f"📈 (Long {long_ex}) ({coin}) Price: {price_long:.4f}")
+        if funding_long is not None:
+            funding_long_pct = funding_long * 100
+            lines.append(f"📈 (Long {long_ex}) ({coin}) Funding: {funding_long_pct:.6f}%")
+    
+    # Short данные - используем price, если есть, иначе среднее от bid/ask
+    if short_data:
+        price_short = short_data.get("price")
+        if price_short is None:
+            bid_short = short_data.get("bid")
+            ask_short = short_data.get("ask")
+            if bid_short is not None and ask_short is not None:
+                price_short = (bid_short + ask_short) / 2.0
+        
+        funding_short = short_data.get("funding_rate")
+        if price_short is not None:
+            lines.append(f"📉 (Short {short_ex}) ({coin}) Price: {price_short:.4f}")
+        if funding_short is not None:
+            funding_short_pct = funding_short * 100
+            lines.append(f"📉 (Short {short_ex}) ({coin}) Funding: {funding_short_pct:.6f}%")
+    
+    # Спред на цену
+    lines.append(f"📊 Price spread: {open_spread_pct:.4f}%")
+    
+    # Спред на фандинги
+    if long_data and short_data:
+        funding_long = long_data.get("funding_rate")
+        funding_short = short_data.get("funding_rate")
+        if funding_long is not None and funding_short is not None:
+            funding_spread = (funding_short - funding_long) * 100
+            lines.append(f"📊 Funding spread: {funding_spread:.6f}% (open: ≥0.18%, close: ≤0.05%)")
+    
+    lines.append("")  # Пустая строка
+    
+    # Ликвидность
+    if long_liq and long_liq.get("ok"):
+        spread_bps = long_liq.get("spread_bps", 0)
+        buy_impact = long_liq.get("buy_impact_bps", 0)
+        lines.append(f"✅ ✓ Liquidity {long_ex} Long ({coin}): {SCAN_COIN_INVEST:.1f} USDT | spread={spread_bps:.1f}bps, buy_impact={buy_impact:.1f}bps")
+    
+    if short_liq and short_liq.get("ok"):
+        spread_bps = short_liq.get("spread_bps", 0)
+        sell_impact = short_liq.get("sell_impact_bps", 0)
+        lines.append(f"✅ ✓ Liquidity {short_ex} Short ({coin}): {SCAN_COIN_INVEST:.1f} USDT | spread={spread_bps:.1f}bps, sell_impact={sell_impact:.1f}bps")
+    
+    # Новости
+    if not delisting_news:
+        lines.append(f"✅ ✓ No delisting news for {coin} ({long_ex}, {short_ex}) in the last 60 days")
+    else:
+        lines.append(f"❌ ✗ Delisting news found for {coin}")
+    
+    if not security_news:
+        lines.append(f"✅ ✓ No security/hack news for {coin} ({long_ex}, {short_ex}) in the last 60 days")
+    else:
+        lines.append(f"❌ ✗ Security news found for {coin}")
+    
+    lines.append("")  # Пустая строка
+    lines.append(f"{coin} Long ({long_ex}), Short ({short_ex})")
+    
+    return "\n".join(lines)
 
 
 async def collect_coins_by_exchange(bot: PerpArbitrageBot, exchanges: List[str]) -> Dict[str, Set[str]]:
@@ -355,6 +456,8 @@ async def process_coin(
                     short_ex=short_ex,
                     open_spread_pct=spread,
                     analysis_sem=analysis_sem,
+                    long_data=available.get(long_ex),
+                    short_data=available.get(short_ex),
                 )
                 for long_ex, short_ex, spread in per_coin_found
             ),
