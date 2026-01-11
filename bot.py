@@ -206,7 +206,11 @@ class PerpArbitrageBot:
         coin = parsed["coin"]
         long_exchange = parsed["long_exchange"]
         short_exchange = parsed["short_exchange"]
+        notional_usdt = parsed.get("notional_usdt")
         
+        if notional_usdt is None:
+            logger.error("Размер инвестиций не указан. Формат: 'монета Long (биржа), Short (биржа) размер'")
+            return None
         
         # Получаем данные с обеих бирж параллельно
         long_data_task = self.get_futures_data(long_exchange, coin)
@@ -303,8 +307,8 @@ class PerpArbitrageBot:
         
         logger.info("=" * 60)
         
-        # Проверяем ликвидность на обеих биржах (для размеров 50, 100, 150 USDT)
-        await self.check_liquidity_for_coin(coin, long_exchange, short_exchange)
+        # Проверяем ликвидность на обеих биржах для указанного размера инвестиций
+        await self.check_liquidity_for_coin(coin, long_exchange, short_exchange, notional_usdt)
         
         # Проверяем делистинг на обеих биржах
         await self.check_delisting_for_coin(coin, exchanges=[long_exchange, short_exchange])
@@ -318,58 +322,57 @@ class PerpArbitrageBot:
             "short_data": short_data
         }
     
-    async def check_liquidity_for_coin(self, coin: str, long_exchange: str, short_exchange: str):
+    async def check_liquidity_for_coin(self, coin: str, long_exchange: str, short_exchange: str, notional_usdt: float):
         """
-        Проверяет ликвидность на обеих биржах для размера 150 USDT
+        Проверяет ликвидность на обеих биржах для указанного размера инвестиций
         
         Args:
             coin: Символ монеты
             long_exchange: Биржа для Long позиции
             short_exchange: Биржа для Short позиции
+            notional_usdt: Размер инвестиций в USDT (для каждой позиции: Long и Short)
         """
-        # Размер для проверки
-        notional_sizes = [150.0]
+        size = notional_usdt
         
-        for size in notional_sizes:
-            # Проверяем ликвидность на Long бирже (для покупки)
-            long_exchange_obj = self.exchanges.get(long_exchange)
-            if long_exchange_obj:
-                long_liquidity = await long_exchange_obj.check_liquidity(
-                    coin, 
-                    notional_usdt=size,
-                    ob_limit=50,
-                    max_spread_bps=30.0,
-                    max_impact_bps=50.0,
-                    mode="entry_long" # Проверяем только глубину на покупку
-                )
-                if long_liquidity:
-                    status = "✓" if long_liquidity["ok"] else "✗"
-                    buy_impact_str = f"{long_liquidity['buy_impact_bps']:.1f}bps" if long_liquidity['buy_impact_bps'] is not None else "N/A"
-                    reasons_str = f" (Причины: {', '.join(long_liquidity['reasons'])})" if not long_liquidity["ok"] else ""
-                    logger.info(f"{status} Ликвидность {long_exchange} Long ({coin}): {size} USDT | "
-                              f"spread={long_liquidity['spread_bps']:.1f}bps, buy_impact={buy_impact_str}{reasons_str}")
-                else:
-                    logger.warning(f"Не удалось проверить ликвидность {long_exchange} Long ({coin}) для {size} USDT")
-            
-            # Проверяем ликвидность на Short бирже (для продажи)
-            short_exchange_obj = self.exchanges.get(short_exchange)
-            if short_exchange_obj:
-                short_liquidity = await short_exchange_obj.check_liquidity(
-                    coin,
-                    notional_usdt=size,
-                    ob_limit=50,
-                    max_spread_bps=30.0,
-                    max_impact_bps=50.0,
-                    mode="entry_short" # Проверяем только глубину на продажу
-                )
-                if short_liquidity:
-                    status = "✓" if short_liquidity["ok"] else "✗"
-                    sell_impact_str = f"{short_liquidity['sell_impact_bps']:.1f}bps" if short_liquidity['sell_impact_bps'] is not None else "N/A"
-                    reasons_str = f" (Причины: {', '.join(short_liquidity['reasons'])})" if not short_liquidity["ok"] else ""
-                    logger.info(f"{status} Ликвидность {short_exchange} Short ({coin}): {size} USDT | "
-                              f"spread={short_liquidity['spread_bps']:.1f}bps, sell_impact={sell_impact_str}{reasons_str}")
-                else:
-                    logger.warning(f"Не удалось проверить ликвидность {short_exchange} Short ({coin}) для {size} USDT")
+        # Проверяем ликвидность на Long бирже (для покупки)
+        long_exchange_obj = self.exchanges.get(long_exchange)
+        if long_exchange_obj:
+            long_liquidity = await long_exchange_obj.check_liquidity(
+                coin, 
+                notional_usdt=size,
+                ob_limit=50,
+                max_spread_bps=30.0,
+                max_impact_bps=50.0,
+                mode="entry_long" # Проверяем только глубину на покупку
+            )
+            if long_liquidity:
+                status = "✓" if long_liquidity["ok"] else "✗"
+                buy_impact_str = f"{long_liquidity['buy_impact_bps']:.1f}bps" if long_liquidity['buy_impact_bps'] is not None else "N/A"
+                reasons_str = f" (Причины: {', '.join(long_liquidity['reasons'])})" if not long_liquidity["ok"] else ""
+                logger.info(f"{status} Ликвидность {long_exchange} Long ({coin}): {size} USDT | "
+                          f"spread={long_liquidity['spread_bps']:.1f}bps, buy_impact={buy_impact_str}{reasons_str}")
+            else:
+                logger.warning(f"Не удалось проверить ликвидность {long_exchange} Long ({coin}) для {size} USDT")
+        
+        # Проверяем ликвидность на Short бирже (для продажи)
+        short_exchange_obj = self.exchanges.get(short_exchange)
+        if short_exchange_obj:
+            short_liquidity = await short_exchange_obj.check_liquidity(
+                coin,
+                notional_usdt=size,
+                ob_limit=50,
+                max_spread_bps=30.0,
+                max_impact_bps=50.0,
+                mode="entry_short" # Проверяем только глубину на продажу
+            )
+            if short_liquidity:
+                status = "✓" if short_liquidity["ok"] else "✗"
+                sell_impact_str = f"{short_liquidity['sell_impact_bps']:.1f}bps" if short_liquidity['sell_impact_bps'] is not None else "N/A"
+                reasons_str = f" (Причины: {', '.join(short_liquidity['reasons'])})" if not short_liquidity["ok"] else ""
+                logger.info(f"{status} Ликвидность {short_exchange} Short ({coin}): {size} USDT | "
+                          f"spread={short_liquidity['spread_bps']:.1f}bps, sell_impact={sell_impact_str}{reasons_str}")
+            else:
+                logger.warning(f"Не удалось проверить ликвидность {short_exchange} Short ({coin}) для {size} USDT")
     
     async def check_delisting_for_coin(self, coin: str, exchanges: Optional[List[str]] = None, days_back: int = 60):
         """
@@ -570,8 +573,8 @@ async def main():
             input_text = " ".join(sys.argv[1:])
         else:
             # Читаем из stdin
-            print("Введите данные в формате: 'монета Long (биржа), Short (биржа)'")
-            print("Пример: CVC Long (bybit), Short (gate)")
+            print("Введите данные в формате: 'монета Long (биржа), Short (биржа) размер'")
+            print("Пример: CVC Long (bybit), Short (gate) 100")
             input_text = input().strip()
         
         if not input_text:
