@@ -4,6 +4,7 @@
 """
 import asyncio
 import httpx
+import json
 from typing import List, Dict, Optional, Union
 from datetime import datetime, timedelta, timezone
 import logging
@@ -95,8 +96,8 @@ class NewsMonitor:
         if not url:
             return url
         parts = urlsplit(url)
-        # Убираем query и fragment, нормализуем trailing slash
-        path = parts.path.rstrip("/") or "/"
+        # Убираем query и fragment, но сохраняем trailing slash (некоторые страницы различаются /foo vs /foo/)
+        path = parts.path or "/"
         return urlunsplit((parts.scheme, parts.netloc, path, "", ""))
     
     async def _fetch_bybit_announcements(
@@ -289,126 +290,130 @@ class NewsMonitor:
                 
                 # seen_urls на всю биржу (все категории), чтобы не дублировать работу
                 seen_urls = set()
-                
-                async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers=headers) as client:
-                    for url in urls_to_fetch:
-                        try:
-                            r = await client.get(url)
-                            if r.status_code != 200:
-                                logger.debug("🔍 %s: announcements %s вернул статус %s", exchange_name, url, r.status_code)
-                                continue
-                            
-                            soup = BeautifulSoup(r.text, "html.parser")
-                            articles: List = []
-                            
-                            # Общая логика для других бирж
-                            articles.extend(soup.find_all("a", href=re.compile(r"article|announcement|support|help", re.I)))
-                            articles.extend(soup.find_all(["article", "div"], class_=re.compile(r"article|announcement|news|support", re.I)))
-                            
-                            # Жёсткий потолок для обработки статей (производительность)
-                            max_articles = min(2000, max(200, limit * 10))
-                            for article in articles[:max_articles]:
-                                try:
-                                    url_elem = article if getattr(article, "name", None) == "a" else article.find("a")
-                                    if not url_elem:
-                                        continue
-                                    href = url_elem.get("href", "") or ""
-                                    if not href:
-                                        continue
-                                    if not href.startswith("http"):
-                                        # Используем urljoin для надёжной сборки URL (обрабатывает edge-cases)
-                                        href = urljoin(url, href)
-                                    href = href.split("?")[0]
-                                    href = self._normalize_url(href)
-                                    
-                                    # Фильтруем мусорные ссылки (категории, секции, поиск и т.п.)
-                                    # Применяем deny только к path, чтобы не выкинуть валидные /support/... или /help/...
-                                    parsed = urlparse(href)
-                                    if deny_re.search(parsed.path):
-                                        continue
-                                    
-                                    if href in seen_urls:
-                                        continue
-                                    seen_urls.add(href)
-                        
-                                    title_elem = article.find(["h1", "h2", "h3", "h4", "span", "div", "a"], class_=re.compile(r"title|heading|name", re.I))
-                                    if not title_elem:
-                                        title_elem = url_elem
-                                    title = (title_elem.get_text(strip=True) if title_elem else "").strip()
-                                    if not title or len(title) < 5:
-                                        continue
-                                    
-                                    body_elem = article.find(["p", "div", "span"], class_=re.compile(r"content|body|description|text|summary", re.I))
-                                    body = body_elem.get_text(strip=True)[:500] if body_elem else ""
-                                    
-                                    # Пытаемся извлечь дату публикации из статьи на странице списка
-                                    published_at = None
-                                    # Пробуем найти дату в time элементе рядом с article
-                                    time_elem = article.find("time")
-                                    if time_elem:
-                                        datetime_attr = time_elem.get("datetime")
-                                        if datetime_attr:
-                                            try:
-                                                # Парсим ISO формат: 2024-01-15T10:30:00Z или 2024-01-15T10:30:00+00:00
-                                                if "T" in datetime_attr:
-                                                    published_at = datetime.fromisoformat(datetime_attr.replace("Z", "+00:00"))
-                                                else:
-                                                    published_at = datetime.strptime(datetime_attr, "%Y-%m-%d")
-                                                    published_at = published_at.replace(tzinfo=timezone.utc)
-                                            except Exception:
-                                                pass
-                                    
-                                    # Если не нашли в time, ищем в тексте рядом (многие биржи показывают дату в span/div)
-                                    if published_at is None:
-                                        date_elem = article.find(["span", "div", "p"], class_=re.compile(r"date|time|published|created", re.I))
-                                        if date_elem:
-                                            date_text = date_elem.get_text(strip=True)
-                                            # Пробуем распарсить различные форматы дат
-                                            for fmt in ["%Y-%m-%d", "%d.%m.%Y", "%m/%d/%Y", "%Y/%m/%d"]:
-                                                try:
-                                                    published_at = datetime.strptime(date_text[:10], fmt)
-                                                    published_at = published_at.replace(tzinfo=timezone.utc)
-                                                    break
-                                                except Exception:
-                                                    continue
-                                    
-                                    # Нормализуем дату к UTC
-                                    published_at_inferred = False
-                                    if published_at is not None:
-                                        if published_at.tzinfo is not None:
-                                            published_at = published_at.astimezone(timezone.utc)
-                                        else:
-                                            # Если дата без timezone, считаем что UTC
-                                            published_at = published_at.replace(tzinfo=timezone.utc)
-                                    else:
-                                        # нет даты => оставляем, иначе days_back не работает на биржах без дат в листинге
-                                        # ставим now_utc чтобы элемент прошёл фильтр, дату попробуем получить при догрузе
-                                        published_at = datetime.now(timezone.utc)
-                                        published_at_inferred = True
-                                    
-                                    # Фильтруем по lookback сразу (оптимизация)
-                                    # Но пропускаем фильтр для inferred дат, чтобы не потерять новости без даты
-                                    if not published_at_inferred and published_at <= lookback:
-                                        continue
-                                    
-                                    local.append(
-                                        {
-                                            "title": title,
-                                            "body": body,
-                                            "url": href,
-                                            "source": exchange_name,
-                                            "published_at": published_at,
-                                            "published_at_inferred": published_at_inferred,
-                                            "tags": [exchange_name, "exchange", "announcement"],
-                                        }
-                                    )
-                                    if len(local) >= limit:
-                                        break
-                                except Exception:
-                                    continue
-                        except Exception as e:
-                            logger.debug(f"Ошибка при обработке URL {url} для {exchange_name}: {e}")
+
+                for url in urls_to_fetch:
+                    try:
+                        r = await shared_client.get(url)
+                        if r.status_code != 200:
+                            logger.debug("🔍 %s: announcements %s вернул статус %s", exchange_name, url, r.status_code)
                             continue
+                        
+                        soup = BeautifulSoup(r.text, "html.parser")
+                        articles: List = []
+                        
+                        # Общая логика для других бирж
+                        articles.extend(soup.find_all("a", href=re.compile(r"article|announcement|support|help", re.I)))
+                        articles.extend(soup.find_all(["article", "div"], class_=re.compile(r"article|announcement|news|support", re.I)))
+                        
+                        # Жёсткий потолок для обработки статей (производительность)
+                        max_articles = min(2000, max(200, limit * 10))
+                        for article in articles[:max_articles]:
+                            try:
+                                url_elem = article if getattr(article, "name", None) == "a" else article.find("a")
+                                if not url_elem:
+                                    continue
+                                href = url_elem.get("href", "") or ""
+                                if not href:
+                                    continue
+                                if not href.startswith("http"):
+                                    # Используем urljoin для надёжной сборки URL (обрабатывает edge-cases)
+                                    href = urljoin(url, href)
+
+                                # fragment не отправляется на сервер, поэтому убираем; query оставляем (может быть важен для локали/маршрутизации)
+                                href = href.split("#")[0].strip()
+                                if not href:
+                                    continue
+
+                                href_key = self._normalize_url(href)
+                                
+                                # Фильтруем мусорные ссылки (категории, секции, поиск и т.п.)
+                                # Применяем deny только к path, чтобы не выкинуть валидные /support/... или /help/...
+                                parsed = urlparse(href)
+                                if deny_re.search(parsed.path):
+                                    continue
+                                
+                                if href_key in seen_urls:
+                                    continue
+                                seen_urls.add(href_key)
+                    
+                                title_elem = article.find(["h1", "h2", "h3", "h4", "span", "div", "a"], class_=re.compile(r"title|heading|name", re.I))
+                                if not title_elem:
+                                    title_elem = url_elem
+                                title = (title_elem.get_text(strip=True) if title_elem else "").strip()
+                                if not title or len(title) < 5:
+                                    continue
+                                
+                                body_elem = article.find(["p", "div", "span"], class_=re.compile(r"content|body|description|text|summary", re.I))
+                                body = body_elem.get_text(strip=True)[:500] if body_elem else ""
+                                
+                                # Пытаемся извлечь дату публикации из статьи на странице списка
+                                published_at = None
+                                # Пробуем найти дату в time элементе рядом с article
+                                time_elem = article.find("time")
+                                if time_elem:
+                                    datetime_attr = time_elem.get("datetime")
+                                    if datetime_attr:
+                                        try:
+                                            # Парсим ISO формат: 2024-01-15T10:30:00Z или 2024-01-15T10:30:00+00:00
+                                            if "T" in datetime_attr:
+                                                published_at = datetime.fromisoformat(datetime_attr.replace("Z", "+00:00"))
+                                            else:
+                                                published_at = datetime.strptime(datetime_attr, "%Y-%m-%d")
+                                                published_at = published_at.replace(tzinfo=timezone.utc)
+                                        except Exception:
+                                            pass
+                                
+                                # Если не нашли в time, ищем в тексте рядом (многие биржи показывают дату в span/div)
+                                if published_at is None:
+                                    date_elem = article.find(["span", "div", "p"], class_=re.compile(r"date|time|published|created", re.I))
+                                    if date_elem:
+                                        date_text = date_elem.get_text(strip=True)
+                                        # Пробуем распарсить различные форматы дат
+                                        for fmt in ["%Y-%m-%d", "%d.%m.%Y", "%m/%d/%Y", "%Y/%m/%d"]:
+                                            try:
+                                                published_at = datetime.strptime(date_text[:10], fmt)
+                                                published_at = published_at.replace(tzinfo=timezone.utc)
+                                                break
+                                            except Exception:
+                                                continue
+                                
+                                # Нормализуем дату к UTC
+                                published_at_inferred = False
+                                if published_at is not None:
+                                    if published_at.tzinfo is not None:
+                                        published_at = published_at.astimezone(timezone.utc)
+                                    else:
+                                        # Если дата без timezone, считаем что UTC
+                                        published_at = published_at.replace(tzinfo=timezone.utc)
+                                else:
+                                    # нет даты => оставляем, иначе days_back не работает на биржах без дат в листинге
+                                    # ставим now_utc чтобы элемент прошёл фильтр, дату попробуем получить при догрузе
+                                    published_at = datetime.now(timezone.utc)
+                                    published_at_inferred = True
+                                
+                                # Фильтруем по lookback сразу (оптимизация)
+                                # Но пропускаем фильтр для inferred дат, чтобы не потерять новости без даты
+                                if not published_at_inferred and published_at <= lookback:
+                                    continue
+                                
+                                local.append(
+                                    {
+                                        "title": title,
+                                        "body": body,
+                                        "url": href,  # важно: сохраняем исходный URL (с query), дедуп делаем отдельно
+                                        "source": exchange_name,
+                                        "published_at": published_at,
+                                        "published_at_inferred": published_at_inferred,
+                                        "tags": [exchange_name, "exchange", "announcement"],
+                                    }
+                                )
+                                if len(local) >= limit:
+                                    break
+                            except Exception:
+                                continue
+                    except Exception as e:
+                        logger.debug(f"Ошибка при обработке URL {url} для {exchange_name}: {e}")
+                        continue
                 
                 if local:
                     logger.debug("  ✓ %s: загружено %s объявлений", exchange_name, len(local))
@@ -419,23 +424,44 @@ class NewsMonitor:
                 logger.warning("❌ %s: ошибка загрузки announcements: %s", exchange_name, e)
                 return []
         
-        tasks = [_fetch_one(name, url) for name, url in exchanges_to_check.items() if url is not None]
-        chunks = await asyncio.gather(*tasks, return_exceptions=False)
-        for chunk in chunks:
-            all_news.extend(chunk)
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers=headers) as shared_client:
+            tasks = [_fetch_one(name, url) for name, url in exchanges_to_check.items() if url is not None]
+            chunks = await asyncio.gather(*tasks, return_exceptions=False)
+            for chunk in chunks:
+                all_news.extend(chunk)
         
-        # Фильтруем по времени
-        all_news = [n for n in all_news if n["published_at"] > lookback]
+        # Фильтруем по времени (защита от naive datetime) + сортируем + дедуп
+        filtered: List[Dict] = []
+        for n in all_news:
+            dt = n.get("published_at")
+            if not isinstance(dt, datetime):
+                continue
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+                n["published_at"] = dt
+            if dt > lookback:
+                filtered.append(n)
         
-        return all_news[:limit]
+        # Сначала сортируем по времени (новые -> старые)
+        filtered.sort(
+            key=lambda x: x.get("published_at") or datetime.min.replace(tzinfo=timezone.utc),
+            reverse=True,
+        )
+        # Затем стабильной сортировкой убираем inferred ниже (не "выдавливаем" реальные даты)
+        filtered.sort(key=lambda x: bool(x.get("published_at_inferred", False)))
+        
+        # Дедуп по URL на уровне всех бирж (после сортировки, чтобы оставался самый свежий)
+        filtered = self._dedupe_by_url(filtered)
+        return filtered[:limit]
     
-    async def find_delisting_news(self, news: List[Dict], coin_symbol: str) -> List[Dict]:
+    async def find_delisting_news(self, news: List[Dict], coin_symbol: str, lookback: Optional[datetime] = None) -> List[Dict]:
         """
         Находит новости о делистинге монеты на биржах
         
         Args:
             news: Список новостей
             coin_symbol: Символ монеты (например, "FLOW", "BTC")
+            lookback: Дата для фильтрации по days_back (если None, фильтрация не применяется)
             
         Returns:
             Список релевантных новостей о делистинге
@@ -474,6 +500,22 @@ class NewsMonitor:
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers=headers) as client:
             fetch_count = 0
             for article in news:
+                # Ранний skip: если lookback задан и у статьи уже есть "твёрдая" дата (не inferred) и она старая
+                if lookback is not None and not article.get("published_at_inferred", False):
+                    published_at = article.get("published_at")
+                    if isinstance(published_at, datetime):
+                        # Защита: если published_at naive, считаем что UTC
+                        if published_at.tzinfo is None:
+                            published_at = published_at.replace(tzinfo=timezone.utc)
+                        if published_at <= lookback:
+                            continue
+                
+                # Локальные (без сайд-эффектов): актуальная дата/признак inferred для этой статьи
+                effective_published_at = article.get("published_at")
+                if isinstance(effective_published_at, datetime) and effective_published_at.tzinfo is None:
+                    effective_published_at = effective_published_at.replace(tzinfo=timezone.utc)
+                effective_published_at_inferred = bool(article.get("published_at_inferred", False))
+
                 title_body = (article.get("title", "") + " " + article.get("body", "")).upper()
                 tags_upper = [str(t).upper() for t in article.get("tags", [])]
                 
@@ -483,6 +525,10 @@ class NewsMonitor:
                 
                 # Проверяем наличие ключевых слов о делистинге в карточке
                 has_delisting_keywords_in_card = any(keyword.upper() in title_body for keyword in delisting_keywords)
+
+                # Сильный early-skip: если дата inferred и нет ни монеты, ни delist-ключей в карточке — смысла продолжать нет
+                if effective_published_at_inferred and (not coin_mentioned) and (not has_delisting_keywords_in_card):
+                    continue
                 
                 # Условный догруз: если монета упомянута ИЛИ есть delist-ключи в карточке (даже без монеты)
                 # Это позволяет находить "batch delisting" новости, где монета только внутри статьи
@@ -503,14 +549,26 @@ class NewsMonitor:
                                 coin_mentioned = coin_pattern.search(title_body) is not None
                         else:
                             try:
+                                # Сначала пробуем оригинальный URL (query может быть важен для локали/маршрутизации),
+                                # затем fallback на нормализованный (если original 4xx/5xx).
                                 r = await client.get(article_url)
-                                fetch_count += 1  # Инкрементируем после любого запроса, независимо от результата
+                                fetch_count += 1
+
+                                if (
+                                    r.status_code >= 400
+                                    and fetch_count < fetch_limit
+                                    and article_url_normalized != article_url
+                                ):
+                                    r = await client.get(article_url_normalized)
+                                    fetch_count += 1
                                 
                                 if r.status_code == 200:
                                     soup_article = BeautifulSoup(r.text, "html.parser")
                                     
                                     # Пытаемся извлечь дату из статьи (для улучшения days_back фильтрации)
                                     published_at_updated = None
+                                    
+                                    # 1) Пробуем <time datetime>
                                     time_elem = soup_article.find("time")
                                     if time_elem:
                                         datetime_attr = time_elem.get("datetime")
@@ -524,16 +582,67 @@ class NewsMonitor:
                                             except Exception:
                                                 pass
                                     
-                                    # Если не нашли в time, пробуем meta теги
+                                    # 2) Пробуем meta теги (article:published_time, og:published_time, publish-date и т.п.)
                                     if published_at_updated is None:
-                                        meta_published = soup_article.find("meta", property="article:published_time") or soup_article.find("meta", attrs={"name": "article:published_time"})
-                                        if meta_published:
-                                            content = meta_published.get("content", "")
-                                            if content:
-                                                try:
-                                                    published_at_updated = datetime.fromisoformat(content.replace("Z", "+00:00"))
-                                                except Exception:
-                                                    pass
+                                        for prop in ["article:published_time", "og:published_time", "publish-date", "datePublished"]:
+                                            meta_published = soup_article.find("meta", property=prop) or soup_article.find("meta", attrs={"name": prop})
+                                            if meta_published:
+                                                content = meta_published.get("content", "")
+                                                if content:
+                                                    try:
+                                                        published_at_updated = datetime.fromisoformat(content.replace("Z", "+00:00"))
+                                                        break
+                                                    except Exception:
+                                                        continue
+                                    
+                                    # 3) Пробуем JSON-LD (schema.org Article)
+                                    if published_at_updated is None:
+                                        json_ld_scripts = soup_article.find_all("script", type="application/ld+json")
+                                        for script in json_ld_scripts:
+                                            # script.string часто None, а JSON-LD бывает в script.get_text()
+                                            raw = (script.string or script.get_text() or "").strip()
+                                            if not raw:
+                                                continue
+                                            try:
+                                                data = json.loads(raw)
+                                            except Exception:
+                                                continue
+                                            
+                                            # Собираем все candidate-объекты (dict, list, @graph)
+                                            objs = []
+                                            if isinstance(data, dict):
+                                                objs.append(data)
+                                                if isinstance(data.get("@graph"), list):
+                                                    objs.extend([x for x in data["@graph"] if isinstance(x, dict)])
+                                            elif isinstance(data, list):
+                                                objs.extend([x for x in data if isinstance(x, dict)])
+                                                for x in data:
+                                                    if isinstance(x, dict) and isinstance(x.get("@graph"), list):
+                                                        objs.extend([y for y in x["@graph"] if isinstance(y, dict)])
+                                            
+                                            # Ищем дату в любом объекте (datePublished/dateCreated/dateModified).
+                                            for obj in objs:
+                                                obj_type_val = obj.get("@type")
+                                                obj_type = ""
+                                                if isinstance(obj_type_val, str):
+                                                    obj_type = obj_type_val.lower()
+                                                elif isinstance(obj_type_val, list):
+                                                    obj_type = " ".join(str(x).lower() for x in obj_type_val)
+
+                                                # Если @type указан, пропускаем явно не-статьи, чтобы не ловить "даты сайта"
+                                                if obj_type and not any(k in obj_type for k in ("article", "newsarticle", "blog", "posting")):
+                                                    continue
+
+                                                date_str = obj.get("datePublished") or obj.get("dateCreated") or obj.get("dateModified")
+                                                if date_str:
+                                                    try:
+                                                        published_at_updated = datetime.fromisoformat(str(date_str).replace("Z", "+00:00"))
+                                                        break
+                                                    except Exception:
+                                                        continue
+                                            
+                                            if published_at_updated is not None:
+                                                break
                                     
                                     # Обновляем published_at в статье, если нашли дату
                                     if published_at_updated is not None:
@@ -541,8 +650,12 @@ class NewsMonitor:
                                             published_at_updated = published_at_updated.astimezone(timezone.utc)
                                         else:
                                             published_at_updated = published_at_updated.replace(tzinfo=timezone.utc)
-                                        article["published_at"] = published_at_updated
-                                        article["published_at_inferred"] = False
+                                        effective_published_at = published_at_updated
+                                        effective_published_at_inferred = False
+                                        
+                                        # Фильтруем по lookback после обновления даты
+                                        if lookback is not None and published_at_updated <= lookback:
+                                            continue  # Пропускаем старую новость
                                     
                                     # Извлекаем полный текст статьи
                                     main_content = soup_article.find("main") or soup_article.find("article") or soup_article.find("div", class_=re.compile(r"content|article|body", re.I))
@@ -573,9 +686,13 @@ class NewsMonitor:
                     # Добавляем тег о делистинге
                     article_with_tag = article.copy()
                     if "delisting" not in article_with_tag.get("tags", []):
-                        tags = article_with_tag.get("tags", [])
+                        # Важно: не мутируем список tags в исходной статье (shallow copy)
+                        tags = list(article_with_tag.get("tags", []) or [])
                         tags.append("delisting")
                         article_with_tag["tags"] = tags
+                    # Не мутируем исходный article: сохраняем обновлённые поля только в результате
+                    article_with_tag["published_at"] = effective_published_at
+                    article_with_tag["published_at_inferred"] = effective_published_at_inferred
                     relevant_news.append(article_with_tag)
                     # Логируем найденный делистинг с URL
                     url = article.get('url', 'N/A')
@@ -602,8 +719,12 @@ class NewsMonitor:
         # Получаем объявления с бирж (None => все биржи)
         all_announcements = await self._fetch_exchange_announcements(limit=200, days_back=days_back, exchanges=exchanges)
         
+        # Вычисляем lookback для фильтрации после догруза даты
+        now_utc = datetime.now(timezone.utc)
+        lookback = now_utc - timedelta(days=days_back, hours=6) if days_back > 0 else None
+        
         # Ищем новости о делистинге (теперь async для условного догруза статей)
-        delisting_news = await self.find_delisting_news(all_announcements, coin_symbol)
+        delisting_news = await self.find_delisting_news(all_announcements, coin_symbol, lookback=lookback)
         
         return delisting_news
 

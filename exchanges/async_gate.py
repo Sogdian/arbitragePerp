@@ -107,7 +107,9 @@ class AsyncGateExchange(AsyncBaseExchange):
 
             # 1) Реальная проблема сети/HTTP/парсинга -> data == None (или Falsey не-list/dict)
             if data is None:
-                logger.warning(f"Gate: тикер запрос вернул None для {coin} (contract={symbol})")
+                # Причина чаще всего уже залогирована в AsyncBaseExchange._request_json (timeout/connection/HTTP status),
+                # поэтому здесь не дублируем WARNING.
+                logger.debug(f"Gate: тикер запрос вернул None для {coin} (contract={symbol})")
                 return None
 
             # 2) Нормальная ситуация "контракт не найден / не активен": API вернул пустой список

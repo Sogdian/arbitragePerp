@@ -57,7 +57,16 @@ class AsyncBaseExchange(ABC):
                 except:
                     logger.debug(f"{self.name}: HTTP {status} для {url} с params {params}")
         except (httpx.RequestError, asyncio.TimeoutError) as e:
-            logger.warning(f"{self.name}: Ошибка соединения для {url} с params {params}: {e}")
+            # Часто у таймаутов str(e) пустой -> добавляем тип исключения для читаемости
+            exc_name = type(e).__name__
+            msg = str(e) or repr(e)
+            full_url = url
+            try:
+                if isinstance(e, httpx.RequestError) and getattr(e, "request", None) is not None:
+                    full_url = str(e.request.url)
+            except Exception:
+                pass
+            logger.warning(f"{self.name}: Ошибка соединения для {full_url} с params {params}: {exc_name}: {msg}")
         except Exception as e:
             logger.warning(f"{self.name}: Неожиданная ошибка для {url} с params {params}: {e}")
         return None

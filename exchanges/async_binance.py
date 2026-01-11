@@ -75,11 +75,14 @@ class AsyncBinanceExchange(AsyncBaseExchange):
 
             data = await self._request_json("GET", url, params=params)
             if not data:
-                logger.warning(f"Binance: пустой ответ ticker для {coin} (symbol={symbol})")
+                # Причина чаще всего уже залогирована в AsyncBaseExchange._request_json (timeout/connection/HTTP status),
+                # поэтому здесь не дублируем WARNING.
+                logger.debug(f"Binance: пустой ответ ticker для {coin} (symbol={symbol})")
                 return None
 
             if self._is_api_error(data):
-                logger.warning(
+                # "Invalid symbol" / "not found" — это шум для сканера, опускаем в DEBUG
+                logger.debug(
                     f"Binance: тикер для {coin} не найден "
                     f"(symbol={symbol}, code={data.get('code')}, msg={data.get('msg')})"
                 )
