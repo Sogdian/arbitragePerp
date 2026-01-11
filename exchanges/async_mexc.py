@@ -4,11 +4,22 @@
 from typing import Dict, Optional, Any, Set, List
 import logging
 import asyncio
+import json
 import httpx
 from .async_base_exchange import AsyncBaseExchange
 from .coin_list_fetchers import fetch_mexc_coins
 
 logger = logging.getLogger(__name__)
+
+# Эти коды считаем "нет инструмента/тикера" => не WARNING
+_MEXC_NOT_FOUND_CODES = {510, 1001}
+
+
+def _to_int(x) -> Optional[int]:
+    try:
+        return int(x)
+    except Exception:
+        return None
 
 
 class AsyncMexcExchange(AsyncBaseExchange):
@@ -71,16 +82,26 @@ class AsyncMexcExchange(AsyncBaseExchange):
 
         for d_i, domain in enumerate(domains):
             for r in range(max(1, int(retries_per_domain))):
-                client = httpx.AsyncClient(
-                    base_url=domain,
-                    headers=headers,
-                    limits=httpx.Limits(max_connections=10, max_keepalive_connections=10),
-                    timeout=httpx.Timeout(8.0, connect=3.0),
-                )
                 try:
-                    resp = await client.request(method, url, params=params)
-                    resp.raise_for_status()
-                    return resp.json()
+                    async with httpx.AsyncClient(
+                        base_url=domain,
+                        headers=headers,
+                        limits=httpx.Limits(max_connections=10, max_keepalive_connections=10),
+                        timeout=httpx.Timeout(8.0, connect=3.0),
+                    ) as client:
+                        resp = await client.request(method, url, params=params)
+                        resp.raise_for_status()
+                        try:
+                            return resp.json()
+                        except json.JSONDecodeError:
+                            is_last = (d_i == len(domains) - 1) and (r == max(1, int(retries_per_domain)) - 1)
+                            msg = f"MEXC: non-JSON response for {domain}{url} status={resp.status_code}"
+                            if is_last:
+                                logger.warning(msg)
+                                return None
+                            logger.debug(msg)
+                            await asyncio.sleep(backoff_s * (1 + r + d_i))
+                            continue
                 except (httpx.RequestError, httpx.HTTPStatusError, asyncio.TimeoutError) as e:
                     # на последней попытке просто отдадим None
                     is_last = (d_i == len(domains) - 1) and (r == max(1, int(retries_per_domain)) - 1)
@@ -93,8 +114,6 @@ class AsyncMexcExchange(AsyncBaseExchange):
                     logger.debug(f"MEXC: unexpected error for {domain}{url}: {e}")
                     if not is_last:
                         await asyncio.sleep(backoff_s * (1 + r + d_i))
-                finally:
-                    await client.aclose()
 
         return None
 
@@ -142,30 +161,52 @@ class AsyncMexcExchange(AsyncBaseExchange):
         """
         try:
             c = coin.upper()
-            symbol = f"{c}_USDT"
             url = "/api/v1/contract/ticker"
-            params = {"symbol": symbol}
 
-            data = await self._request_json("GET", url, params=params)
+            # 1) основной формат COIN_USDT
+            symbol = f"{c}_USDT"
+            data = await self._request_json_with_domain_fallback("GET", url, params={"symbol": symbol})
 
-            bad_code = isinstance(data, dict) and ("code" in data) and data.get("code") != 0
+            # 2) если ответ странный/ошибочный — пробуем COINUSDT
+            code_int = _to_int(data.get("code")) if isinstance(data, dict) else None
             looks_empty = self._looks_empty_top(data)
 
-            if not data or bad_code or looks_empty:
+            if (not data) or looks_empty or (code_int is not None and code_int != 0):
                 symbol_fallback = f"{c}USDT"
                 logger.debug(f"MEXC: ticker fallback symbol {symbol_fallback} for {coin}")
-                data = await self._request_json("GET", url, params={"symbol": symbol_fallback})
-                if data and isinstance(data, dict) and data.get("code") == 0:
+                data2 = await self._request_json_with_domain_fallback("GET", url, params={"symbol": symbol_fallback})
+
+                # принимаем fallback только если он успешен
+                code2 = _to_int(data2.get("code")) if isinstance(data2, dict) else None
+                if data2 and isinstance(data2, dict) and code2 == 0 and not self._looks_empty_top(data2):
+                    data = data2
                     symbol = symbol_fallback
+                    code_int = code2
+                else:
+                    # оставляем исходный data (он нужен для корректной диагностики ниже)
+                    data = data2 if data2 is not None else data
+                    code_int = _to_int(data.get("code")) if isinstance(data, dict) else code_int
 
             if not data:
+                # это может быть сеть/домен/HTTP — но это уже залогировано в domain_fallback как debug,
+                # здесь дадим аккуратный WARNING
                 logger.warning(f"MEXC: не удалось получить тикер для {coin}")
                 return None
 
-            if isinstance(data, dict) and "code" in data and data.get("code") != 0:
-                logger.warning(f"MEXC: ticker API error {coin}: code={data.get('code')} msg={data.get('msg')}")
-                return None
+            if isinstance(data, dict) and "code" in data:
+                code_int = _to_int(data.get("code"))
 
+                if code_int in _MEXC_NOT_FOUND_CODES:
+                    # это "нет тикера/нет инструмента" — шум не нужен
+                    logger.debug(f"MEXC: ticker not found for {coin} (symbol={symbol}) code={code_int} msg={data.get('msg')}")
+                    return None
+
+                if code_int is not None and code_int != 0:
+                    # прочие коды — это уже реально интересно
+                    logger.warning(f"MEXC: ticker API error {coin}: code={data.get('code')} msg={data.get('msg')}")
+                    return None
+
+            # данные тикера
             item = None
             if isinstance(data, dict):
                 item = data.get("data") if data.get("data") is not None else data.get("result")
@@ -175,12 +216,13 @@ class AsyncMexcExchange(AsyncBaseExchange):
                 item = data[0]
 
             if not isinstance(item, dict):
-                logger.warning(f"MEXC: тикер для {coin} не найден/не dict")
+                logger.debug(f"MEXC: ticker for {coin} not dict (symbol={symbol})")
                 return None
 
             last_price_raw = item.get("lastPrice") or item.get("last")
             if not last_price_raw:
-                logger.warning(f"MEXC: нет lastPrice/last для {coin}")
+                # тоже не надо шуметь WARN — это частая ситуация для невалидных/пустых тикеров
+                logger.debug(f"MEXC: no lastPrice/last for {coin} (symbol={symbol}) item_keys={list(item.keys())[:10]}")
                 return None
 
             price = float(last_price_raw)
@@ -214,7 +256,8 @@ class AsyncMexcExchange(AsyncBaseExchange):
             data = await self._request_json_with_domain_fallback("GET", url1, params=None)
 
             # 2) fallback COINUSDT
-            if not data or (isinstance(data, dict) and ("code" in data) and data.get("code") != 0) or self._looks_empty_top(data):
+            code_int = _to_int(data.get("code")) if isinstance(data, dict) else None
+            if not data or (code_int is not None and code_int != 0) or self._looks_empty_top(data):
                 symbol2 = f"{c}USDT"
                 url2 = f"/api/v1/contract/funding_rate/{symbol2}"
                 data = await self._request_json_with_domain_fallback("GET", url2, params=None)
@@ -223,9 +266,14 @@ class AsyncMexcExchange(AsyncBaseExchange):
                 logger.warning(f"MEXC: не удалось получить фандинг для {coin}")
                 return None
 
-            if isinstance(data, dict) and "code" in data and data.get("code") != 0:
-                logger.warning(f"MEXC: funding API error {coin}: code={data.get('code')} msg={data.get('msg')}")
-                return None
+            if isinstance(data, dict) and "code" in data:
+                code_int = _to_int(data.get("code"))
+                if code_int in _MEXC_NOT_FOUND_CODES:
+                    logger.debug(f"MEXC: funding not found for {coin}: code={code_int} msg={data.get('msg')}")
+                    return None
+                if code_int is not None and code_int != 0:
+                    logger.warning(f"MEXC: funding API error {coin}: code={data.get('code')} msg={data.get('msg')}")
+                    return None
 
             # данные могут лежать в data/result или быть прямым dict
             item = None
@@ -275,7 +323,8 @@ class AsyncMexcExchange(AsyncBaseExchange):
             )
 
             # 2) fallback COINUSDT
-            if not data or (isinstance(data, dict) and ("code" in data) and data.get("code") != 0) or self._looks_empty_top(data):
+            code_int = _to_int(data.get("code")) if isinstance(data, dict) else None
+            if not data or (code_int is not None and code_int != 0) or self._looks_empty_top(data):
                 symbol2 = f"{c}USDT"
                 url2 = f"/api/v1/contract/depth/{symbol2}"
                 data = await self._request_json_with_domain_fallback(
@@ -290,9 +339,14 @@ class AsyncMexcExchange(AsyncBaseExchange):
                 logger.warning(f"MEXC: не удалось получить orderbook для {coin}")
                 return None
 
-            if isinstance(data, dict) and "code" in data and data.get("code") != 0:
-                logger.warning(f"MEXC: orderbook API error {coin}: code={data.get('code')} msg={data.get('msg')}")
-                return None
+            if isinstance(data, dict) and "code" in data:
+                code_int = _to_int(data.get("code"))
+                if code_int in _MEXC_NOT_FOUND_CODES:
+                    logger.debug(f"MEXC: orderbook not found for {coin}: code={code_int} msg={data.get('msg')}")
+                    return None
+                if code_int is not None and code_int != 0:
+                    logger.warning(f"MEXC: orderbook API error {coin}: code={data.get('code')} msg={data.get('msg')}")
+                    return None
 
             # MEXC: data/result или напрямую
             result = None
