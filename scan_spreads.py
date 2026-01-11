@@ -222,25 +222,24 @@ async def main():
         
         # Создаем семафор для ограничения параллелизма
         sem = asyncio.Semaphore(MAX_CONCURRENCY)
-        
-        # Собираем карту монет для каждой биржи
-        coins_by_exchange = await collect_coins_by_exchange(bot, exchanges)
-        coins = build_union(coins_by_exchange)
-        
-        logger.info(f"Всего монет (union по биржам): {len(coins)}")
-        for ex in exchanges:
-            logger.info(f"{ex}: {len(coins_by_exchange.get(ex, set()))} монет")
 
         logger.info(
             f"scan_spreads started | MIN_SPREAD={MIN_SPREAD:.2f}% | interval={SCAN_INTERVAL_SEC}s | "
-            f"exchanges={exchanges} | total_coins={len(coins)} | "
+            f"exchanges={exchanges} | "
             f"max_concurrency={MAX_CONCURRENCY} | timeout={REQ_TIMEOUT_SEC:.1f}s"
         )
 
         while True:
-            logger.info("🔄 Новый цикл поиска")
+            # Перед каждым глобальным циклом обновляем список монет по биржам
+            coins_by_exchange = await collect_coins_by_exchange(bot, exchanges)
+            coins = build_union(coins_by_exchange)
+
+            logger.info(f"🔄 Новый цикл поиска | total_coins={len(coins)}")
             t0 = time.perf_counter()
-            await scan_once(bot, exchanges, coins, sem, coins_by_exchange)
+            if coins:
+                await scan_once(bot, exchanges, coins, sem, coins_by_exchange)
+            else:
+                logger.warning("Нет монет для сканирования (все списки пустые); пропускаю scan_once")
             dt = time.perf_counter() - t0
             logger.info(f"scan_once finished in {dt:.1f}s; sleeping {SCAN_INTERVAL_SEC:.1f}s")
             await asyncio.sleep(SCAN_INTERVAL_SEC)
