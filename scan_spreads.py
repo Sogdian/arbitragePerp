@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import sys
+import time
 from itertools import combinations
 from typing import Any, Dict, Optional, List, Tuple, Set
 
@@ -45,6 +46,7 @@ MIN_SPREAD = float(os.getenv("MIN_SPREAD", "2"))  # в процентах, на�
 SCAN_INTERVAL_SEC = float(os.getenv("SCAN_INTERVAL_SEC", "5"))  # каждые N секунд
 MAX_CONCURRENCY = int(os.getenv("SCAN_MAX_CONCURRENCY", "40"))  # сколько одновременных http запросов
 COIN_BATCH_SIZE = int(os.getenv("SCAN_COIN_BATCH_SIZE", "50"))  # сколько монет обрабатывать за пачку
+REQ_TIMEOUT_SEC = float(os.getenv("SCAN_REQ_TIMEOUT_SEC", "12"))  # таймаут на запрос к бирже (8-12 норм)
 EXCLUDE_EXCHANGES = {"lbank"}  # не использовать
 
 # Монеты теперь собираются автоматически со всех бирж
@@ -86,9 +88,16 @@ def calc_open_spread_pct(ask_long: Optional[float], bid_short: Optional[float]) 
 
 
 async def fetch(bot: PerpArbitrageBot, ex: str, coin: str, sem: asyncio.Semaphore) -> Optional[Dict[str, Any]]:
-    """Запрос данных с ограничением параллелизма через семафор"""
+    """Запрос данных с ограничением параллелизма через семафор и таймаутом"""
     async with sem:
-        return await bot.get_futures_data(ex, coin)
+        try:
+            return await asyncio.wait_for(bot.get_futures_data(ex, coin), timeout=REQ_TIMEOUT_SEC)
+        except asyncio.TimeoutError:
+            logger.warning(f"Timeout: {ex} {coin} get_futures_data > {REQ_TIMEOUT_SEC:.1f}s")
+            return None
+        except Exception as e:
+            logger.warning(f"Fetch error: {ex} {coin}: {e}", exc_info=True)
+            return None
 
 
 async def collect_coins_by_exchange(bot: PerpArbitrageBot, exchanges: List[str]) -> Dict[str, Set[str]]:
@@ -119,93 +128,73 @@ def build_union(coins_by_exchange: Dict[str, Set[str]]) -> List[str]:
     return sorted(set.union(*sets))
 
 
-async def scan_coin(
+async def process_coin(
     bot: PerpArbitrageBot,
-    coin: str,
-    coins_by_exchange: Dict[str, Set[str]],
     exchanges: List[str],
+    coin: str,
     sem: asyncio.Semaphore,
-) -> List[Tuple[str, str, str, float]]:
+) -> None:
     """
-    Сканирует одну монету на всех биржах, где она реально есть.
-    
-    Returns:
-        Список найденных возможностей: (coin, long_exchange, short_exchange, open_spread_pct)
+    Обрабатывает одну монету: запрашивает данные со всех бирж, вычисляет спреды и логирует находки.
     """
-    # биржи где монета реально есть
-    present = [ex for ex in exchanges if coin in coins_by_exchange.get(ex, set())]
-    if len(present) < 2:
-        return []
-
-    # запрашиваем только present биржи
-    tasks = {ex: asyncio.create_task(fetch(bot, ex, coin, sem)) for ex in present}
+    tasks = {ex: asyncio.create_task(fetch(bot, ex, coin, sem)) for ex in exchanges}
     results = await asyncio.gather(*tasks.values(), return_exceptions=True)
 
-    available: Dict[str, Dict[str, Any]] = {}
+    ex_data: Dict[str, Optional[Dict[str, Any]]] = {}
     for ex, res in zip(tasks.keys(), results):
-        if isinstance(res, Exception) or not res:
-            continue
-        bid = res.get("bid")
-        ask = res.get("ask")
-        if bid is None or ask is None:
-            continue
-        available[ex] = res
+        if isinstance(res, Exception):
+            ex_data[ex] = None
+        else:
+            ex_data[ex] = res
+
+    available = {
+        ex: d for ex, d in ex_data.items()
+        if d and d.get("bid") is not None and d.get("ask") is not None
+    }
 
     if len(available) < 2:
-        return []
+        return
 
-    found: List[Tuple[str, str, str, float]] = []
+    per_coin_found: List[Tuple[str, str, float]] = []
     for ex1, ex2 in combinations(available.keys(), 2):
         d1 = available[ex1]
         d2 = available[ex2]
 
         s1 = calc_open_spread_pct(d1["ask"], d2["bid"])
         if s1 is not None and s1 >= MIN_SPREAD:
-            found.append((coin, ex1, ex2, s1))
+            per_coin_found.append((ex1, ex2, s1))
 
         s2 = calc_open_spread_pct(d2["ask"], d1["bid"])
         if s2 is not None and s2 >= MIN_SPREAD:
-            found.append((coin, ex2, ex1, s2))
+            per_coin_found.append((ex2, ex1, s2))
 
-    return found
+    if per_coin_found:
+        per_coin_found.sort(key=lambda x: x[2], reverse=True)
+        for long_ex, short_ex, spread in per_coin_found:
+            logger.info(f'{coin} Long ({long_ex}), Short ({short_ex}) spread {spread:.4f}%')
 
 
 async def scan_once(
     bot: PerpArbitrageBot,
     exchanges: List[str],
     coins: List[str],
-    coins_by_exchange: Dict[str, Set[str]],
     sem: asyncio.Semaphore,
-) -> List[Tuple[str, str, str, float]]:
+) -> None:
     """
-    Сканирует все монеты батчами с прогресс-логом.
+    Один проход по всем монетам батчами.
     
-    Returns:
-        Список найденных возможностей: (coin, long_exchange, short_exchange, open_spread_pct)
+    Обрабатывает монеты параллельно батчами размера COIN_BATCH_SIZE.
+    Логирует находки сразу после полной обработки каждой монеты.
+    Ничего не возвращает.
     """
-    found_all: List[Tuple[str, str, str, float]] = []
-
     total = len(coins)
-    processed = 0
-
     for i in range(0, total, COIN_BATCH_SIZE):
         batch = coins[i:i + COIN_BATCH_SIZE]
-
-        batch_tasks = [asyncio.create_task(scan_coin(bot, c, coins_by_exchange, exchanges, sem)) for c in batch]
-        batch_results = await asyncio.gather(*batch_tasks, return_exceptions=True)
-
-        for res in batch_results:
-            if isinstance(res, Exception) or not res:
-                continue
-            found_all.extend(res)
-
-        processed += len(batch)
-
-        # прогресс раз в пачку
-        logger.info(f"scan progress: {processed}/{total} coins")
-
-    found_all.sort(key=lambda x: x[3], reverse=True)
-    return found_all
+        await asyncio.gather(
+            *(process_coin(bot, exchanges, coin, sem) for coin in batch),
+            return_exceptions=True
+        )
+        logger.info(f"Progress: {min(i + COIN_BATCH_SIZE, total)}/{total} coins processed")
 
 
 async def main():
@@ -227,19 +216,14 @@ async def main():
         logger.info(
             f"scan_spreads started | MIN_SPREAD={MIN_SPREAD:.2f}% | interval={SCAN_INTERVAL_SEC}s | "
             f"exchanges={exchanges} | total_coins={len(coins)} | "
-            f"batch={COIN_BATCH_SIZE} | max_concurrency={MAX_CONCURRENCY}"
+            f"max_concurrency={MAX_CONCURRENCY} | timeout={REQ_TIMEOUT_SEC:.1f}s"
         )
 
         while True:
-            found = await scan_once(bot, exchanges, coins, coins_by_exchange, sem)
-
-            # Пишем в лог ТОЛЬКО если нашли
-            if found:
-                for coin, long_ex, short_ex, spread in found:
-                    # Формат ровно под copy-paste в bot.py
-                    # BTC Long (gate), Short (bingx) spread 2.34%
-                    logger.info(f'{coin} Long ({long_ex}), Short ({short_ex}) spread {spread:.4f}%')
-
+            t0 = time.perf_counter()
+            await scan_once(bot, exchanges, coins, sem)
+            dt = time.perf_counter() - t0
+            logger.info(f"scan_once finished in {dt:.1f}s; sleeping {SCAN_INTERVAL_SEC:.1f}s")
             await asyncio.sleep(SCAN_INTERVAL_SEC)
 
     except KeyboardInterrupt:
