@@ -338,9 +338,15 @@ def _format_telegram_message(
     security_news: List[Dict[str, Any]],
 ) -> str:
     """Форматирует сообщение для Telegram на английском языке, используя только данные из сканера"""
-    lines = [f"🔔Pair: {coin} (Liq {SCAN_COIN_INVEST:.1f} USDT)\n"]
+    # Заголовок
+    lines = [f'🔔 <b>Signal: {coin}</b> (Liq: {SCAN_COIN_INVEST:.1f} USDT)']
+    lines.append("")
+    lines.append("━━━━━━━━━━━━━━━━━━")
+    lines.append("")
     
     # Long данные - используем price, если есть, иначе среднее от bid/ask
+    price_long = None
+    funding_long = None
     if long_data:
         price_long = long_data.get("price")
         if price_long is None:
@@ -348,15 +354,11 @@ def _format_telegram_message(
             ask_long = long_data.get("ask")
             if bid_long is not None and ask_long is not None:
                 price_long = (bid_long + ask_long) / 2.0
-        
         funding_long = long_data.get("funding_rate")
-        if price_long is not None:
-            lines.append(f"📈 (Long {long_ex}) ({coin}) Price: {price_long:.4f}")
-        if funding_long is not None:
-            funding_long_pct = funding_long * 100
-            lines.append(f"📈 (Long {long_ex}) ({coin}) Funding: {funding_long_pct:.6f}%")
     
     # Short данные - используем price, если есть, иначе среднее от bid/ask
+    price_short = None
+    funding_short = None
     if short_data:
         price_short = short_data.get("price")
         if price_short is None:
@@ -364,29 +366,54 @@ def _format_telegram_message(
             ask_short = short_data.get("ask")
             if bid_short is not None and ask_short is not None:
                 price_short = (bid_short + ask_short) / 2.0
-        
         funding_short = short_data.get("funding_rate")
+    
+    # LONG секция
+    long_ex_capitalized = long_ex.capitalize()
+    lines.append(f'🟢 <b>LONG</b> ({long_ex_capitalized})')
+    if price_long is not None:
+        lines.append(f'├ Price: <code>{price_long:.4f}</code>')
+    if funding_long is not None:
+        funding_long_pct = funding_long * 100
+        lines.append(f'└ Funding: <code>{funding_long_pct:.6f}%</code>')
+    else:
+        if price_long is not None:
+            lines.append('└ Funding: <code>N/A</code>')
+    
+    lines.append("")
+    lines.append("")
+    
+    # SHORT секция
+    short_ex_capitalized = short_ex.capitalize()
+    lines.append(f'🔴 <b>SHORT</b> ({short_ex_capitalized})')
+    if price_short is not None:
+        lines.append(f'├ Price: <code>{price_short:.4f}</code>')
+    if funding_short is not None:
+        funding_short_pct = funding_short * 100
+        lines.append(f'└ Funding: <code>{funding_short_pct:.6f}%</code>')
+    else:
         if price_short is not None:
-            lines.append(f"📉 (Short {short_ex}) ({coin}) Price: {price_short:.4f}")
-        if funding_short is not None:
-            funding_short_pct = funding_short * 100
-            lines.append(f"📉 (Short {short_ex}) ({coin}) Funding: {funding_short_pct:.6f}%")
+            lines.append('└ Funding: <code>N/A</code>')
     
-    lines.append("")  # Пустая строка перед спредами
+    lines.append("")
+    lines.append("━━━━━━━━━━━━━━━━━━")
+    lines.append("")
     
-    # Спред на цену
-    lines.append(f"📊 Price spread: {open_spread_pct:.4f}%")
+    # Спреды
+    lines.append('<b>📊 Spreads:</b>')
+    lines.append(f'• Price Spread: <b>{open_spread_pct:.4f}%</b>')
     
     # Спред на фандинги
-    if long_data and short_data:
-        funding_long = long_data.get("funding_rate")
-        funding_short = short_data.get("funding_rate")
-        if funding_long is not None and funding_short is not None:
-            funding_spread = (funding_short - funding_long) * 100
-            lines.append(f"📊 Funding spread: {funding_spread:.6f}% (open: ≥0.18%, close: ≤0.05%)")
+    if funding_long is not None and funding_short is not None:
+        funding_spread = (funding_short - funding_long) * 100
+        lines.append(f'• Funding Spread: <b>{funding_spread:.6f}%</b>')
     
-    lines.append("")  # Пустая строка
-    lines.append(f"{coin} Long ({long_ex}), Short ({short_ex})")
+    lines.append("")
+    lines.append("")
+    
+    # Настройки и стратегия
+    lines.append('<i>⚙️ Settings: Open ≥ 0.18% | Close ≤ 0.05%</i>')
+    lines.append(f'💎 <b>Strategy:</b> {coin} Long ({long_ex_capitalized}) / Short ({short_ex_capitalized})')
     
     return "\n".join(lines)
 
