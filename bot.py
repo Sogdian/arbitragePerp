@@ -4,7 +4,9 @@
 import asyncio
 import logging
 import os
+import re
 import sys
+import time
 from typing import Optional, Dict, List, Any
 from exchanges.async_bybit import AsyncBybitExchange
 from exchanges.async_gate import AsyncGateExchange
@@ -18,6 +20,7 @@ from exchanges.async_bingx import AsyncBingxExchange
 from input_parser import parse_input
 from news_monitor import NewsMonitor
 from announcements_monitor import AnnouncementsMonitor
+from telegram_sender import TelegramSender
 import config
 
 # Настройка логирования
@@ -489,7 +492,7 @@ class PerpArbitrageBot:
 
         return close_long_fee_pct + close_short_fee_pct + buffer_pct
     
-    async def monitor_spreads(self, coin: str, long_exchange: str, short_exchange: str):
+    async def monitor_spreads(self, coin: str, long_exchange: str, short_exchange: str, close_threshold_pct: Optional[float] = None):
         """
         Мониторинг спредов открытия и закрытия каждую секунду
         
@@ -497,10 +500,19 @@ class PerpArbitrageBot:
             coin: Название монеты
             long_exchange: Биржа для Long позиции
             short_exchange: Биржа для Short позиции
+            close_threshold_pct: Порог закрытия в процентах (если указан, отправляет сообщение в Telegram при достижении)
         """
         logger.info("=" * 60)
         logger.info(f"Начало мониторинга спредов для {coin}")
+        if close_threshold_pct is not None:
+            logger.info(f"Порог закрытия для уведомлений: {close_threshold_pct:.2f}%")
+        else:
+            logger.info("Порог закрытия не установлен, уведомления отключены")
         logger.info("=" * 60)
+        
+        # Отслеживание времени последней отправки сообщения (ключ: (coin, long_exchange, short_exchange))
+        last_sent_time: Dict[tuple, float] = {}
+        SEND_INTERVAL_SEC = 60  # Интервал между отправками: 1 минута
         
         try:
             while True:
@@ -565,6 +577,71 @@ class PerpArbitrageBot:
                     
                     # Выводим одной строкой (фандинг выводится один раз, так как он одинаковый для обоих спредов)
                     logger.info(f"{closing_str} | {opening_str} | long_fr: {long_fr_str} | short_fr: {short_fr_str} | fr_spread: {fr_spread_str}")
+                    
+                    # Проверяем порог закрытия и отправляем сообщение в Telegram
+                    # Для отрицательных порогов: отправляем, когда спред становится хуже (меньше) порога
+                    # Для положительных порогов: отправляем, когда спред становится лучше (больше) порога
+                    threshold_met = False
+                    if close_threshold_pct is not None and closing_spread is not None:
+                        if close_threshold_pct < 0:
+                            # Для отрицательных порогов: спред хуже (меньше) порога
+                            threshold_met = closing_spread <= close_threshold_pct
+                            logger.info(f"Проверка порога: closing_spread={closing_spread:.2f}%, threshold={close_threshold_pct:.2f}%, условие: {closing_spread:.2f} <= {close_threshold_pct:.2f} = {threshold_met}")
+                        else:
+                            # Для положительных порогов: спред лучше (больше или равен) порога
+                            threshold_met = closing_spread >= close_threshold_pct
+                            logger.info(f"Проверка порога: closing_spread={closing_spread:.2f}%, threshold={close_threshold_pct:.2f}%, условие: {closing_spread:.2f} >= {close_threshold_pct:.2f} = {threshold_met}")
+                    elif close_threshold_pct is not None:
+                        logger.info(f"Проверка порога: close_threshold_pct={close_threshold_pct:.2f}%, но closing_spread=None")
+                    
+                    if threshold_met:
+                        # Проверяем интервал между отправками (раз в минуту)
+                        key = (coin, long_exchange, short_exchange)
+                        current_time = time.time()
+                        last_sent = last_sent_time.get(key, 0)
+                        
+                        if current_time - last_sent >= SEND_INTERVAL_SEC:
+                            try:
+                                telegram = TelegramSender()
+                                if telegram.enabled:
+                                    channel_id = telegram._get_channel_id()
+                                    if channel_id:
+                                        # Формируем сообщение в новом формате
+                                        long_ex_capitalized = long_exchange.capitalize()
+                                        short_ex_capitalized = short_exchange.capitalize()
+                                        
+                                        message_lines = [
+                                            f"🏁 <b>Close {coin}:</b> Long ({long_ex_capitalized}) / Short ({short_ex_capitalized})",
+                                        ]
+                                        
+                                        if opening_spread is not None:
+                                            message_lines.append(f"📊 <b>Price Spread:</b> {opening_spread:.4f}%")
+                                        else:
+                                            message_lines.append("📊 <b>Price Spread:</b> N/A")
+                                        
+                                        if fr_spread is not None:
+                                            message_lines.append(f"💰 <b>Funding Spread:</b> {fr_spread:.6f}%")
+                                        else:
+                                            message_lines.append("💰 <b>Funding Spread:</b> N/A")
+                                        
+                                        telegram_message = "\n".join(message_lines)
+                                        await telegram.send_message(telegram_message, channel_id=channel_id)
+                                        
+                                        # Обновляем время последней отправки
+                                        last_sent_time[key] = current_time
+                                        
+                                        if close_threshold_pct < 0:
+                                            logger.info(f"📱 Отправлено сообщение в Telegram: закрытие при спреде {closing_spread:.2f}% <= {close_threshold_pct:.2f}%")
+                                        else:
+                                            logger.info(f"📱 Отправлено сообщение в Telegram: закрытие при спреде {closing_spread:.2f}% >= {close_threshold_pct:.2f}%")
+                                    else:
+                                        logger.warning(f"📱 Telegram включен, но канал не настроен для режима {config.ENV_MODE}")
+                            except Exception as e:
+                                logger.warning(f"Ошибка отправки в Telegram: {e}", exc_info=True)
+                        else:
+                            # Интервал не прошел, пропускаем отправку
+                            remaining = SEND_INTERVAL_SEC - (current_time - last_sent)
+                            logger.debug(f"Пропуск отправки: интервал не прошел (осталось {remaining:.1f}с)")
                 
                 # Ждем 1 секунду перед следующей итерацией
                 await asyncio.sleep(1)
@@ -615,20 +692,39 @@ async def main():
             else:
                 # Спрашиваем про ручное открытие позиций
                 print("\nБыло ли ручное открытие позиций (long и short)?")
-                print("Введите 'Да' или 'Нет':")
+                print("Введите 'Да' или 'Нет': если 'Да', то введите min цену закр, для отправки сообщения в тг")
                 # Если запуск не интерактивный — не блокируемся.
                 if not sys.stdin or not sys.stdin.isatty() or os.getenv("BOT_NO_PROMPT") == "1":
                     should_monitor = False
+                    close_threshold_pct = None
                 else:
-                    answer = input().strip().lower()
-                    should_monitor = answer in ("да", "yes", "y")
+                    answer = input().strip()
+                    answer_lower = answer.lower()
+                    should_monitor = answer_lower.startswith("да") or answer_lower.startswith("yes") or answer_lower.startswith("y")
+                    
+                    # Парсим порог закрытия из ввода (формат: "Да, 2%" или "Да, 2.5%" или "Да, -1%")
+                    close_threshold_pct = None
+                    if should_monitor:
+                        # Ищем паттерн: число (может быть отрицательным) с опциональным знаком процента
+                        # Ищем после запятой или в любом месте строки
+                        match = re.search(r'([-]?\d+\.?\d*)\s*%?', answer)
+                        if match:
+                            try:
+                                close_threshold_pct = float(match.group(1))
+                                logger.info(f"Распарсен порог закрытия: {close_threshold_pct:.2f}% из ввода '{answer}'")
+                            except ValueError:
+                                close_threshold_pct = None
+                                logger.warning(f"Не удалось распарсить порог закрытия из '{answer}', мониторинг без уведомлений")
+                        else:
+                            logger.warning(f"Не найден порог закрытия в '{answer}', мониторинг без уведомлений")
             
             if should_monitor:
                 # Запускаем мониторинг
                 await bot.monitor_spreads(
                     monitoring_data["coin"],
                     monitoring_data["long_exchange"],
-                    monitoring_data["short_exchange"]
+                    monitoring_data["short_exchange"],
+                    close_threshold_pct=close_threshold_pct
                 )
             else:
                 logger.info("Мониторинг не запущен")
