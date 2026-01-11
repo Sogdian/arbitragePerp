@@ -144,11 +144,10 @@ async def fetch(bot: PerpArbitrageBot, ex: str, coin: str, sem: asyncio.Semaphor
     if not exchange:
         return None
 
-    # Пер-эксчейндж override таймаутов/ретраев (если нужно точечно подправить MEXC/Gate)
-    ex_up = ex.upper()
-    ticker_timeout = float(os.getenv(f"SCAN_TICKER_TIMEOUT_SEC_{ex_up}", str(TICKER_TIMEOUT_SEC)))
-    funding_timeout = float(os.getenv(f"SCAN_FUNDING_TIMEOUT_SEC_{ex_up}", str(FUNDING_TIMEOUT_SEC)))
-    ticker_retries = int(os.getenv(f"SCAN_FETCH_RETRIES_{ex_up}", str(FETCH_RETRIES)))
+    # Используем глобальные таймауты и ретраи для всех бирж
+    ticker_timeout = TICKER_TIMEOUT_SEC
+    funding_timeout = FUNDING_TIMEOUT_SEC
+    ticker_retries = FETCH_RETRIES
 
     # 1) Тикер (важно для спреда): ретраим только timeouts.
     # ВАЖНО: семафор держим только во время реального HTTP, не во время sleep/backoff.
