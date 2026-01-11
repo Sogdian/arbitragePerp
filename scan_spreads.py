@@ -188,7 +188,7 @@ async def process_coin(
     if per_coin_found:
         per_coin_found.sort(key=lambda x: x[2], reverse=True)
         for long_ex, short_ex, spread in per_coin_found:
-            logger.info(f'!!! {coin} Long ({long_ex}), Short ({short_ex}) spread {spread:.4f}%')
+            logger.info(f'💰 {coin} Long ({long_ex}), Short ({short_ex}) spread {spread:.4f}%')
 
 
 async def scan_once(
