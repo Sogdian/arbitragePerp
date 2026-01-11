@@ -407,14 +407,6 @@ class PerpArbitrageBot:
                     logger.info(
                         f"✓ Новостей о взломах/безопасности {coin} ({exchanges_str}) за последние {days_back} дней не найдено"
                     )
-                    # Binance может быть недоступен из-за AWS WAF без cookie, тогда вывод "не найдено" может быть ложным.
-                    if any(str(x).lower() == "binance" for x in (exchanges or [])) and not (os.getenv("BINANCE_COOKIE") or "").strip():
-                        logger.warning(
-                            "⚠️ Binance security-monitor может быть неполным из-за AWS WAF. "
-                            "Если хотите ловить Binance Square/Risk Warning посты (например, как в `%s`), "
-                            "добавьте BINANCE_COOKIE в .env (cookie из браузера).",
-                            "https://www.binance.com/ru/square/post/34279029732634",
-                        )
                 else:
                     for n in security_news[:5]:
                         title = (n.get("title") or "")[:120]

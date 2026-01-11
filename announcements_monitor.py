@@ -32,17 +32,6 @@ class AnnouncementsMonitor:
     def __init__(self, news_monitor: Optional[NewsMonitor] = None):
         # Переиспользуем существующий NewsMonitor (там уже много фиксов: дедуп, сортировка, догруз статей и т.д.)
         self.news_monitor = news_monitor or NewsMonitor()
-        self._binance_cookie = (os.getenv("BINANCE_COOKIE") or "").strip()
-        self._warned_binance_waf = False
-
-    def _extra_headers_for_url(self, url: str) -> Optional[Dict[str, str]]:
-        try:
-            netloc = urlsplit(url).netloc.lower()
-        except Exception:
-            netloc = ""
-        if self._binance_cookie and netloc.endswith("binance.com"):
-            return {"Cookie": self._binance_cookie}
-        return None
 
     @staticmethod
     def _coin_pattern(coin: str) -> re.Pattern:
@@ -152,7 +141,7 @@ class AnnouncementsMonitor:
                                 has_security = self._has_security_keywords(title_body_upper)
                         else:
                             try:
-                                r = await client.get(article_url, headers=self._extra_headers_for_url(article_url))
+                                r = await client.get(article_url)
                                 fetch_count += 1
 
                                 # fallback: если original 4xx/5xx — пробуем normalized (без query/fragment)
@@ -161,22 +150,8 @@ class AnnouncementsMonitor:
                                     and fetch_count < fetch_limit
                                     and url_norm != article_url
                                 ):
-                                    r = await client.get(url_norm, headers=self._extra_headers_for_url(url_norm))
+                                    r = await client.get(url_norm)
                                     fetch_count += 1
-
-                                # Binance может отдать AWS WAF challenge (часто 202) — логируем 1 раз.
-                                if (not self._warned_binance_waf) and r.status_code in (202, 403):
-                                    txt = (r.text or "")[:3000]
-                                    if "awsWafCookieDomainList" in txt or "gokuProps" in txt or r.status_code == 403:
-                                        # эвристика: если нет cookie, почти наверняка это WAF
-                                        if not self._binance_cookie:
-                                            self._warned_binance_waf = True
-                                            logger.warning(
-                                                "Binance/Square недоступны из-за AWS WAF (status=%s). "
-                                                "Security новости по Binance могут быть неполными. "
-                                                "Чтобы включить, добавьте BINANCE_COOKIE в .env (cookie из браузера).",
-                                                r.status_code,
-                                            )
 
                                 if r.status_code == 200 and r.text:
                                     soup = BeautifulSoup(r.text, "html.parser")
