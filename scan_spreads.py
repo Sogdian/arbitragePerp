@@ -3,6 +3,8 @@ import logging
 import os
 import sys
 import time
+import contextlib
+from datetime import datetime, timedelta, timezone
 from itertools import combinations
 from typing import Any, Dict, Optional, List, Tuple, Set
 
@@ -47,6 +49,9 @@ SCAN_INTERVAL_SEC = float(os.getenv("SCAN_INTERVAL_SEC", "5"))  # каждые N
 MAX_CONCURRENCY = int(os.getenv("SCAN_MAX_CONCURRENCY", "40"))  # сколько одновременных http запросов
 COIN_BATCH_SIZE = int(os.getenv("SCAN_COIN_BATCH_SIZE", "50"))  # сколько монет обрабатывать за пачку
 REQ_TIMEOUT_SEC = float(os.getenv("SCAN_REQ_TIMEOUT_SEC", "12"))  # таймаут на запрос к бирже (8-12 норм)
+SCAN_COIN_INVEST = float(os.getenv("SCAN_COIN_INVEST", "50"))  # размер позиции (USDT) для проверки ликвидности в сканере
+NEWS_CACHE_TTL_SEC = float(os.getenv("SCAN_NEWS_CACHE_TTL_SEC", "180"))  # TTL кеша новостей (сек), по умолчанию 3 минуты
+ANALYSIS_MAX_CONCURRENCY = int(os.getenv("SCAN_ANALYSIS_MAX_CONCURRENCY", "2"))  # параллелизм "глубокого" анализа спредов
 EXCLUDE_EXCHANGES = {"lbank"}  # не использовать
 
 # Монеты теперь собираются автоматически со всех бирж
@@ -70,6 +75,36 @@ logging.basicConfig(
 
 logger = logging.getLogger("scan_spreads")
 logging.getLogger("httpx").setLevel(logging.WARNING)
+# В scan_spreads не печатаем "подробные" логи из bot/news/бирж — только итоговую строку с ✓/✗
+logging.getLogger("bot").setLevel(logging.CRITICAL)
+logging.getLogger("news_monitor").setLevel(logging.CRITICAL)
+logging.getLogger("announcements_monitor").setLevel(logging.CRITICAL)
+logging.getLogger("exchanges").setLevel(logging.CRITICAL)
+
+
+# ----------------------------
+# News cache (only for scan_spreads)
+# ----------------------------
+# key=(coin,long_ex,short_ex) -> (expires_at_monotonic, delisting_news, security_news)
+_news_cache: Dict[Tuple[str, str, str], Tuple[float, List[Dict[str, Any]], List[Dict[str, Any]]]] = {}
+
+
+@contextlib.contextmanager
+def _temp_log_level(logger_names: List[str], level: int):
+    """
+    Вспомогательный контекст: временно меняет уровень логирования для набора логгеров.
+    (Сейчас в основном оставлен для гибкости; ключевые логгеры уже заглушены глобально.)
+    """
+    old_levels: Dict[str, int] = {}
+    for name in logger_names:
+        lg = logging.getLogger(name)
+        old_levels[name] = lg.level
+        lg.setLevel(level)
+    try:
+        yield
+    finally:
+        for name, old in old_levels.items():
+            logging.getLogger(name).setLevel(old)
 
 
 # ----------------------------
@@ -108,6 +143,101 @@ async def fetch(bot: PerpArbitrageBot, ex: str, coin: str, sem: asyncio.Semaphor
             return None
 
 
+async def _get_news_cached(
+    bot: PerpArbitrageBot,
+    coin: str,
+    long_ex: str,
+    short_ex: str,
+    days_back: int = 60,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], bool]:
+    """
+    Возвращает (delisting_news, security_news, cached) для ключа (coin,long,short).
+    TTL по умолчанию 3 минуты.
+    """
+    key = (coin, long_ex, short_ex)
+    now_m = time.monotonic()
+    cached = _news_cache.get(key)
+    if cached and cached[0] > now_m:
+        return cached[1], cached[2], True
+
+    # Один сетевой проход: достаём announcements один раз и прогоняем 2 фильтра.
+    # ВАЖНО: внутренние методы могут логировать; логгеры заглушены (см. выше).
+    anns = await bot.news_monitor._fetch_exchange_announcements(
+        limit=200,
+        days_back=days_back,
+        exchanges=[long_ex, short_ex],
+    )
+    now_utc = datetime.now(timezone.utc)
+    lookback = now_utc - timedelta(days=days_back, hours=6) if days_back > 0 else None
+
+    delisting_news = await bot.news_monitor.find_delisting_news(anns, coin_symbol=coin, lookback=lookback)
+    security_news: List[Dict[str, Any]] = []
+    # Как в bot.py: security проверяем только если делистинг не найден (экономим запросы/шум).
+    if not delisting_news:
+        security_news = await bot.announcements_monitor.find_security_news(anns, coin_symbol=coin, lookback=lookback)
+
+    _news_cache[key] = (now_m + NEWS_CACHE_TTL_SEC, delisting_news, security_news)
+    return delisting_news, security_news, False
+
+
+async def _analyze_and_log_opportunity(
+    bot: PerpArbitrageBot,
+    coin: str,
+    long_ex: str,
+    short_ex: str,
+    open_spread_pct: float,
+    analysis_sem: asyncio.Semaphore,
+) -> None:
+    """
+    Считает "как bot.py" (ликвидность + новости), но НЕ печатает подробные логи.
+    В логи попадает только 1 строка: "💰 ... spread ... ✓/✗".
+    """
+    async with analysis_sem:
+        ok = False
+        try:
+            # 1) Ликвидность (тихо)
+            long_obj = bot.exchanges.get(long_ex)
+            short_obj = bot.exchanges.get(short_ex)
+            liq_ok = False
+            if long_obj and short_obj:
+                long_liq = await long_obj.check_liquidity(
+                    coin,
+                    notional_usdt=SCAN_COIN_INVEST,
+                    ob_limit=50,
+                    max_spread_bps=30.0,
+                    max_impact_bps=50.0,
+                    mode="entry_long",
+                )
+                short_liq = await short_obj.check_liquidity(
+                    coin,
+                    notional_usdt=SCAN_COIN_INVEST,
+                    ob_limit=50,
+                    max_spread_bps=30.0,
+                    max_impact_bps=50.0,
+                    mode="entry_short",
+                )
+                liq_ok = bool(
+                    long_liq and long_liq.get("ok") is True and short_liq and short_liq.get("ok") is True
+                )
+
+            # 2) Новости (тихо, + кеш 3 минуты)
+            delisting_news, security_news, _cached = await _get_news_cached(
+                bot,
+                coin=coin,
+                long_ex=long_ex,
+                short_ex=short_ex,
+                days_back=60,
+            )
+            news_ok = bool((not delisting_news) and (not security_news))
+
+            ok = bool(liq_ok and news_ok)
+        except Exception:
+            ok = False
+
+        verdict = "✓ арбитражить" if ok else "✗ не арбитражить"
+        logger.info(f"💰 {coin} Long ({long_ex}), Short ({short_ex}) spread {open_spread_pct:.4f}% {verdict}")
+
+
 async def collect_coins_by_exchange(bot: PerpArbitrageBot, exchanges: List[str]) -> Dict[str, Set[str]]:
     """
     Собирает карту монет для каждой биржи.
@@ -144,6 +274,7 @@ async def process_coin(
     coin: str,
     sem: asyncio.Semaphore,
     coins_by_exchange: Dict[str, Set[str]],
+    analysis_sem: asyncio.Semaphore,
 ) -> None:
     """
     Обрабатывает одну монету: запрашивает данные только с бирж, где монета есть,
@@ -187,8 +318,21 @@ async def process_coin(
 
     if per_coin_found:
         per_coin_found.sort(key=lambda x: x[2], reverse=True)
-        for long_ex, short_ex, spread in per_coin_found:
-            logger.info(f'💰 {coin} Long ({long_ex}), Short ({short_ex}) spread {spread:.4f}%')
+        # Анализируем найденные связки (можно параллельно, но ограничено ANALYSIS_MAX_CONCURRENCY)
+        await asyncio.gather(
+            *(
+                _analyze_and_log_opportunity(
+                    bot=bot,
+                    coin=coin,
+                    long_ex=long_ex,
+                    short_ex=short_ex,
+                    open_spread_pct=spread,
+                    analysis_sem=analysis_sem,
+                )
+                for long_ex, short_ex, spread in per_coin_found
+            ),
+            return_exceptions=True,
+        )
 
 
 async def scan_once(
@@ -197,6 +341,7 @@ async def scan_once(
     coins: List[str],
     sem: asyncio.Semaphore,
     coins_by_exchange: Dict[str, Set[str]],
+    analysis_sem: asyncio.Semaphore,
 ) -> None:
     """
     Один проход по всем монетам батчами.
@@ -209,7 +354,7 @@ async def scan_once(
     for i in range(0, total, COIN_BATCH_SIZE):
         batch = coins[i:i + COIN_BATCH_SIZE]
         await asyncio.gather(
-            *(process_coin(bot, exchanges, coin, sem, coins_by_exchange) for coin in batch),
+            *(process_coin(bot, exchanges, coin, sem, coins_by_exchange, analysis_sem) for coin in batch),
             return_exceptions=True
         )
         logger.info(f"Progress: {min(i + COIN_BATCH_SIZE, total)}/{total} coins processed")
@@ -222,22 +367,32 @@ async def main():
         
         # Создаем семафор для ограничения параллелизма
         sem = asyncio.Semaphore(MAX_CONCURRENCY)
+        analysis_sem = asyncio.Semaphore(ANALYSIS_MAX_CONCURRENCY)
 
         logger.info(
             f"scan_spreads started | MIN_SPREAD={MIN_SPREAD:.2f}% | interval={SCAN_INTERVAL_SEC}s | "
             f"exchanges={exchanges} | "
-            f"max_concurrency={MAX_CONCURRENCY} | timeout={REQ_TIMEOUT_SEC:.1f}s"
+            f"max_concurrency={MAX_CONCURRENCY} | timeout={REQ_TIMEOUT_SEC:.1f}s | "
+            f"invest={SCAN_COIN_INVEST:.2f} | analysis_max_concurrency={ANALYSIS_MAX_CONCURRENCY} | news_cache_ttl={NEWS_CACHE_TTL_SEC:.0f}s"
         )
 
+        printed_stats = False
         while True:
             # Перед каждым глобальным циклом обновляем список монет по биржам
             coins_by_exchange = await collect_coins_by_exchange(bot, exchanges)
             coins = build_union(coins_by_exchange)
 
+            # Статистика по монетам (как раньше, один раз в начале запуска)
+            if not printed_stats:
+                logger.info(f"Всего монет (union по биржам): {len(coins)}")
+                for ex in exchanges:
+                    logger.info(f"{ex}: {len(coins_by_exchange.get(ex, set()))} монет")
+                printed_stats = True
+
             logger.info(f"🔄 Новый цикл поиска | total_coins={len(coins)}")
             t0 = time.perf_counter()
             if coins:
-                await scan_once(bot, exchanges, coins, sem, coins_by_exchange)
+                await scan_once(bot, exchanges, coins, sem, coins_by_exchange, analysis_sem)
             else:
                 logger.warning("Нет монет для сканирования (все списки пустые); пропускаю scan_once")
             dt = time.perf_counter() - t0

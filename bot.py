@@ -5,7 +5,7 @@ import asyncio
 import logging
 import os
 import sys
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Any
 from exchanges.async_bybit import AsyncBybitExchange
 from exchanges.async_gate import AsyncGateExchange
 from exchanges.async_mexc import AsyncMexcExchange
@@ -323,7 +323,7 @@ class PerpArbitrageBot:
             "short_data": short_data
         }
     
-    async def check_liquidity_for_coin(self, coin: str, long_exchange: str, short_exchange: str, notional_usdt: float):
+    async def check_liquidity_for_coin(self, coin: str, long_exchange: str, short_exchange: str, notional_usdt: float) -> Dict[str, Any]:
         """
         Проверяет ликвидность на обеих биржах для указанного размера инвестиций
         
@@ -334,6 +334,9 @@ class PerpArbitrageBot:
             notional_usdt: Размер инвестиций в USDT (для каждой позиции: Long и Short)
         """
         size = notional_usdt
+
+        long_liquidity: Optional[Dict[str, Any]] = None
+        short_liquidity: Optional[Dict[str, Any]] = None
         
         # Проверяем ликвидность на Long бирже (для покупки)
         long_exchange_obj = self.exchanges.get(long_exchange)
@@ -374,6 +377,17 @@ class PerpArbitrageBot:
                           f"spread={short_liquidity['spread_bps']:.1f}bps, sell_impact={sell_impact_str}{reasons_str}")
             else:
                 logger.warning(f"Не удалось проверить ликвидность {short_exchange} Short ({coin}) для {size} USDT")
+
+        long_ok = bool(long_liquidity and long_liquidity.get("ok") is True)
+        short_ok = bool(short_liquidity and short_liquidity.get("ok") is True)
+        return {
+            "ok": bool(long_ok and short_ok),
+            "long_ok": long_ok,
+            "short_ok": short_ok,
+            "long": long_liquidity,
+            "short": short_liquidity,
+            "notional_usdt": size,
+        }
     
     async def check_delisting_for_coin(self, coin: str, exchanges: Optional[List[str]] = None, days_back: int = 60):
         """
