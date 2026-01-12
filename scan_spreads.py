@@ -60,6 +60,10 @@ NEWS_CACHE_TTL_SEC = float(os.getenv("SCAN_NEWS_CACHE_TTL_SEC", "180"))  # TTL �
 ANALYSIS_MAX_CONCURRENCY = int(os.getenv("SCAN_ANALYSIS_MAX_CONCURRENCY", "2"))  # параллелизм "глубокого" анализа спредов
 EXCLUDE_EXCHANGES = {"lbank"}  # не использовать
 
+# Монеты для исключения из поиска спредов (через запятую, например: EXCLUDE_COINS=FLOW,BTC)
+EXCLUDE_COINS_STR = os.getenv("EXCLUDE_COINS", "").strip()
+EXCLUDE_COINS = {coin.strip().upper() for coin in EXCLUDE_COINS_STR.split(",") if coin.strip()} if EXCLUDE_COINS_STR else set()
+
 # Монеты теперь собираются автоматически со всех бирж
 # COINS из .env больше не используется
 
@@ -472,8 +476,8 @@ async def collect_coins_by_exchange(bot: PerpArbitrageBot, exchanges: List[str])
         if isinstance(res, Exception) or not res:
             out[ex] = set()
         else:
-            # фильтруем цифро-префиксные
-            filtered = {c for c in set(res) if not is_ignored_coin(c)}
+            # фильтруем цифро-префиксные и исключенные монеты
+            filtered = {c for c in set(res) if not is_ignored_coin(c) and c.upper() not in EXCLUDE_COINS}
             out[ex] = filtered
     
     return out
@@ -595,12 +599,13 @@ async def main():
         telegram_status = "enabled" if telegram.enabled else "disabled"
         channel_info = f"channel={telegram._get_channel_id() or 'not set'}"
         
+        exclude_coins_info = f"exclude_coins={sorted(EXCLUDE_COINS)}" if EXCLUDE_COINS else "exclude_coins=none"
         logger.info(
             f"scan_spreads started | mode={config.ENV_MODE} | MIN_SPREAD={MIN_SPREAD:.2f}% | interval={SCAN_INTERVAL_SEC}s | "
             f"exchanges={exchanges} | "
             f"max_concurrency={MAX_CONCURRENCY} | timeout={REQ_TIMEOUT_SEC:.1f}s | "
             f"invest={SCAN_COIN_INVEST:.2f} | analysis_max_concurrency={ANALYSIS_MAX_CONCURRENCY} | news_cache_ttl={NEWS_CACHE_TTL_SEC:.0f}s | "
-            f"telegram={telegram_status} | {channel_info}"
+            f"telegram={telegram_status} | {channel_info} | {exclude_coins_info}"
         )
 
         printed_stats = False
