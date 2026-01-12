@@ -21,9 +21,17 @@ LOG_LEVEL=INFO
 ## Использование
 
 ### Способ 1: Аргумент командной строки (пример)
+
+**Windows/Linux:**
 ```bash
 python bot.py "CVC Long (bybit), Short (gate) 30"
 python scan_spreads.py 
+```
+
+**macOS:**
+```bash
+python3 bot.py "CVC Long (bybit), Short (gate) 30"
+python3 scan_spreads.py 
 ```
 
 ### Способ 2: Интерактивный ввод
