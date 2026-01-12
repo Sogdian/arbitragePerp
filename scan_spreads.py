@@ -324,6 +324,53 @@ async def _analyze_and_log_opportunity(
                 logger.warning(f"Ошибка отправки в Telegram для {coin}: {e}", exc_info=True)
 
 
+def _get_exchange_url(exchange: str, coin: str) -> str:
+    """
+    Генерирует ссылку на торговую страницу биржи для конкретной монеты.
+    
+    Args:
+        exchange: Название биржи (lowercase, например "bybit", "gate")
+        coin: Название монеты (например "FLOW")
+    
+    Returns:
+        URL ссылка на торговую страницу биржи
+    """
+    exchange_lower = exchange.lower()
+    coin_upper = coin.upper()
+    
+    # Формируем символ в зависимости от биржи
+    if exchange_lower == "bybit":
+        symbol = f"{coin_upper}USDT"
+        return f"https://www.bybit.com/trade/usdt/{symbol}"
+    elif exchange_lower == "gate":
+        symbol = f"{coin_upper}_USDT"
+        return f"https://www.gate.com/ru/futures/USDT/{symbol}"
+    elif exchange_lower == "okx":
+        symbol = f"{coin_upper}-USDT-SWAP"
+        return f"https://www.okx.com/trade/futures/{symbol}"
+    elif exchange_lower == "binance":
+        symbol = f"{coin_upper}USDT"
+        return f"https://www.binance.com/en/futures/{symbol}"
+    elif exchange_lower == "bitget":
+        symbol = f"{coin_upper}USDT"
+        return f"https://www.bitget.com/futures/{symbol}"
+    elif exchange_lower == "bingx":
+        symbol = f"{coin_upper}-USDT"
+        return f"https://bingx.com/en-us/futures/{symbol}"
+    elif exchange_lower == "mexc":
+        symbol = f"{coin_upper}_USDT"
+        return f"https://www.mexc.com/exchange/{symbol}"
+    elif exchange_lower == "xt":
+        symbol = f"{coin_upper}_USDT"
+        return f"https://www.xt.com/trade/{symbol.lower()}"
+    elif exchange_lower == "lbank":
+        symbol = f"{coin_upper}USDT"
+        return f"https://www.lbank.com/trade/{symbol.lower()}/"
+    else:
+        # Fallback: возвращаем просто название биржи без ссылки
+        return f"https://www.{exchange_lower}.com"
+
+
 def _format_telegram_message(
     coin: str,
     long_ex: str,
@@ -365,9 +412,10 @@ def _format_telegram_message(
                 price_short = (bid_short + ask_short) / 2.0
         funding_short = short_data.get("funding_rate")
     
-    # LONG секция
+    # LONG секция с ссылкой
     long_ex_capitalized = long_ex.capitalize()
-    lines.append(f'🟢 <b>LONG</b> ({long_ex_capitalized})')
+    long_url = _get_exchange_url(long_ex, coin)
+    lines.append(f'🟢 <b>LONG</b> (<a href="{long_url}">{long_ex_capitalized}</a>)')
     if price_long is not None:
         lines.append(f'├ Price: <code>{price_long:.4f}</code>')
     if funding_long is not None:
@@ -377,9 +425,10 @@ def _format_telegram_message(
         if price_long is not None:
             lines.append('└ Funding: <code>N/A</code>')
     
-    # SHORT секция
+    # SHORT секция с ссылкой
     short_ex_capitalized = short_ex.capitalize()
-    lines.append(f'🔴 <b>SHORT</b> ({short_ex_capitalized})')
+    short_url = _get_exchange_url(short_ex, coin)
+    lines.append(f'🔴 <b>SHORT</b> (<a href="{short_url}">{short_ex_capitalized}</a>)')
     if price_short is not None:
         lines.append(f'├ Price: <code>{price_short:.4f}</code>')
     if funding_short is not None:
