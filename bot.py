@@ -545,11 +545,6 @@ class PerpArbitrageBot:
                     ask_short = short_data.get("ask")
                     funding_short = short_data.get("funding_rate")
                     
-                    # DEBUG: выводим bid/ask для диагностики
-                    logger.info(
-                        f"DEBUG prices: {long_exchange} bid={bid_long}, ask={ask_long} | {short_exchange} bid={bid_short}, ask={ask_short}"
-                    )
-                    
                     # Рассчитываем спреды
                     opening_spread = self.calculate_opening_spread(ask_long, bid_short)
                     closing_spread = self.calculate_closing_spread(bid_long, ask_short)
@@ -564,20 +559,19 @@ class PerpArbitrageBot:
                     # Формируем строку вывода
                     exit_threshold = self.get_exit_threshold_pct()
                     if closing_spread is not None:
-                        closing_str = f"Закр (min): {closing_spread:.2f}% ({exit_threshold:.2f}%)"
+                        closing_str = f"🏁 Закр: {closing_spread:.2f}% ({exit_threshold:.2f}%)"
                     else:
-                        closing_str = f"Закр (min): N/A ({exit_threshold:.2f}%)"
-                    opening_str = f"Откр (max): {opening_spread:.2f}%" if opening_spread is not None else "Откр (max): N/A"
+                        closing_str = f"🏁 Закр: N/A ({exit_threshold:.2f}%)"
+                    opening_str = f"🚀 Откр: {opening_spread:.2f}%" if opening_spread is not None else "🚀 Откр: N/A"
                     
-                    long_fr_str = f"{funding_long_pct:.2f}" if funding_long_pct is not None else "N/A"
-                    short_fr_str = f"{funding_short_pct:.2f}" if funding_short_pct is not None else "N/A"
+                    pr_spread_str = f"{opening_spread:.4f}" if opening_spread is not None else "N/A"
                     if fr_spread is not None:
-                        fr_spread_str = f"{fr_spread:.3f} (откр: ≥0.18%, закр: ≤0.05%)"
+                        fr_spread_str = f"{fr_spread:.3f} (≥0.18%, ≤0.05%)"
                     else:
                         fr_spread_str = "N/A"
                     
-                    # Выводим одной строкой (фандинг выводится один раз, так как он одинаковый для обоих спредов)
-                    logger.info(f"{closing_str} | {opening_str} | long_fr: {long_fr_str} | short_fr: {short_fr_str} | fr_spread: {fr_spread_str}")
+                    # Выводим одной строкой
+                    logger.info(f"{closing_str} | {opening_str} | 📊 pr_spread: {pr_spread_str} | 💰 fr_spread: {fr_spread_str}")
                     
                     # Проверяем порог закрытия и отправляем сообщение в Telegram
                     # Для отрицательных порогов: отправляем, когда спред становится хуже (меньше) порога
@@ -587,13 +581,9 @@ class PerpArbitrageBot:
                         if close_threshold_pct < 0:
                             # Для отрицательных порогов: спред хуже (меньше) порога
                             threshold_met = closing_spread <= close_threshold_pct
-                            logger.info(f"Проверка порога: closing_spread={closing_spread:.2f}%, threshold={close_threshold_pct:.2f}%, условие: {closing_spread:.2f} <= {close_threshold_pct:.2f} = {threshold_met}")
                         else:
                             # Для положительных порогов: спред лучше (больше или равен) порога
                             threshold_met = closing_spread >= close_threshold_pct
-                            logger.info(f"Проверка порога: closing_spread={closing_spread:.2f}%, threshold={close_threshold_pct:.2f}%, условие: {closing_spread:.2f} >= {close_threshold_pct:.2f} = {threshold_met}")
-                    elif close_threshold_pct is not None:
-                        logger.info(f"Проверка порога: close_threshold_pct={close_threshold_pct:.2f}%, но closing_spread=None")
                     
                     if threshold_met:
                         # Проверяем интервал между отправками (раз в минуту)
