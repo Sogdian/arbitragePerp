@@ -295,11 +295,21 @@ async def _analyze_and_log_opportunity(
         except Exception:
             ok = False
 
-        verdict = "✓ арбитражить" if ok else "✗ не арбитражить"
-        log_message = f"💰 {coin} Long ({long_ex}), Short ({short_ex}) spread {open_spread_pct:.4f}% {verdict}"
+        # Извлекаем funding rates из переданных данных
+        funding_long = long_data.get("funding_rate") if long_data else None
+        funding_short = short_data.get("funding_rate") if short_data else None
+        
+        # Вычисляем funding spread, если оба доступны
+        funding_spread_str = "N/A"
+        if funding_long is not None and funding_short is not None:
+            funding_spread = (funding_short - funding_long) * 100
+            funding_spread_str = f"{funding_spread:.6f}"
+
+        verdict = "✅ арбитражить" if ok else "❌ не арбитражить"
+        log_message = f"💰 {coin} Long ({long_ex}), Short ({short_ex}) spread {open_spread_pct:.4f}% | funding {funding_spread_str} {verdict}"
         logger.info(log_message)
         
-        # Отправляем в Telegram, если вердикт "✓ арбитражить"
+        # Отправляем в Telegram, если вердикт "✅ арбитражить"
         # Канал выбирается автоматически на основе ENV_MODE (test -> TEST_CHANNEL_ID, prod -> FREE_CHANNEL_ID)
         if ok:
             try:
