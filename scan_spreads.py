@@ -355,31 +355,31 @@ def _get_exchange_url(exchange: str, coin: str) -> str:
     # Формируем символ в зависимости от биржи
     if exchange_lower == "bybit":
         symbol = f"{coin_upper}USDT"
-        return f"https://www.bybit.com/trade/usdt/{symbol}"
+        return f"https://www.bybit.com/ru/trade/usdt/{symbol}"
     elif exchange_lower == "gate":
         symbol = f"{coin_upper}_USDT"
         return f"https://www.gate.com/ru/futures/USDT/{symbol}"
     elif exchange_lower == "okx":
         symbol = f"{coin_upper}-USDT-SWAP"
-        return f"https://www.okx.com/trade/futures/{symbol}"
+        return f"https://www.okx.com/ru/trade/futures/{symbol}"
     elif exchange_lower == "binance":
         symbol = f"{coin_upper}USDT"
-        return f"https://www.binance.com/en/futures/{symbol}"
+        return f"https://www.binance.com/ru/futures/{symbol}"
     elif exchange_lower == "bitget":
         symbol = f"{coin_upper}USDT"
-        return f"https://www.bitget.com/futures/{symbol}"
+        return f"https://www.bitget.com/ru/futures/{symbol}"
     elif exchange_lower == "bingx":
         symbol = f"{coin_upper}USDT"
-        return f"https://bingx.com/en/futures/forward/{symbol}"
+        return f"https://bingx.com/ru-ru/futures/forward/{symbol}"
     elif exchange_lower == "mexc":
         symbol = f"{coin_upper}_USDT"
-        return f"https://www.mexc.com/exchange/{symbol}"
+        return f"https://www.mexc.com/ru/exchange/{symbol}"
     elif exchange_lower == "xt":
         symbol = f"{coin_upper}_USDT"
-        return f"https://www.xt.com/trade/{symbol.lower()}"
+        return f"https://www.xt.com/ru/trade/{symbol.lower()}"
     elif exchange_lower == "lbank":
         symbol = f"{coin_upper}USDT"
-        return f"https://www.lbank.com/trade/{symbol.lower()}/"
+        return f"https://www.lbank.com/ru/trade/{symbol.lower()}/"
     else:
         # Fallback: возвращаем просто название биржи без ссылки
         return f"https://www.{exchange_lower}.com"
