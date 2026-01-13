@@ -303,10 +303,38 @@ async def _analyze_and_log_opportunity(
         funding_spread_str = "N/A"
         if funding_long is not None and funding_short is not None:
             funding_spread = (funding_short - funding_long) * 100
-            funding_spread_str = f"{funding_spread:.6f}"
+            funding_spread_str = f"{funding_spread:.3f}"
 
         verdict = "✅ арбитражить" if ok else "❌ не арбитражить"
-        log_message = f"💰 {coin} Long ({long_ex}), Short ({short_ex}) spread {open_spread_pct:.4f}% | funding {funding_spread_str} {verdict}"
+        
+        # Собираем причины, если вердикт "❌ не арбитражить"
+        reasons_parts = []
+        if not ok:
+            # Причины из ликвидности Long биржи
+            if long_liq and not long_liq.get("ok"):
+                long_reasons = long_liq.get("reasons", [])
+                if long_reasons:
+                    reasons_parts.append(f"ликв. Long: {'; '.join(long_reasons)}")
+            
+            # Причины из ликвидности Short биржи
+            if short_liq and not short_liq.get("ok"):
+                short_reasons = short_liq.get("reasons", [])
+                if short_reasons:
+                    reasons_parts.append(f"ликв. Short: {'; '.join(short_reasons)}")
+            
+            # Причины из новостей
+            if delisting_news:
+                reasons_parts.append("делистинг")
+            if security_news:
+                reasons_parts.append("безопасность")
+        
+        # Формируем финальное сообщение
+        if reasons_parts:
+            reasons_str = f" ({'; '.join(reasons_parts)})"
+        else:
+            reasons_str = ""
+        
+        log_message = f"💰 {coin} Long ({long_ex}), Short ({short_ex}) spread {open_spread_pct:.3f}% | fund {funding_spread_str} {verdict}{reasons_str}"
         logger.info(log_message)
         
         # Отправляем в Telegram, если вердикт "✅ арбитражить"

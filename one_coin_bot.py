@@ -297,10 +297,9 @@ async def _analyze_pair_line(
     funding_spread_str = f"{funding_spread_pct:.3f}%" if funding_spread_pct is not None else "N/A"
 
     base_line = (
-        f"📈 Long {long_ex} Цена: {_fmt_price(price_long)} 📈 Фанд: {_fmt_pct(funding_long_pct)} | "
-        f"📉 Short {short_ex} Цена: {_fmt_price(price_short)} 📉 Фанд: {_fmt_pct(funding_short_pct)} | "
-        f"📊 Спред цены: {price_spread_str} | "
-        f"💸 Спред фанд: {funding_spread_str}"
+        f"📈 Long {long_ex} Ц/Ф: {_fmt_price(price_long)} / {_fmt_pct(funding_long_pct)} | "
+        f"📉 Short {short_ex} Ц/Ф: {_fmt_price(price_short)} / {_fmt_pct(funding_short_pct)} | "
+        f"📊 Спред Ц/Ф: {price_spread_str} / {funding_spread_str}"
     )
 
     # Если в логе есть N/A — вердикт не выводим
@@ -309,14 +308,19 @@ async def _analyze_pair_line(
 
     # Если спред цены меньше MIN_SPREAD — ❌ не арбитражить
     if open_spread_pct < MIN_SPREAD:
-        return f"{base_line} | ❌ не арбитражить"
+        return f"{base_line} | ❌ не арбитр (спред {open_spread_pct:.3f}% < {MIN_SPREAD}%)"
 
     # Вердикт: MIN_SPREAD + (ликвидность OK) + (нет проблемных новостей)
+    long_liq = None
+    short_liq = None
+    delisting_news = []
+    security_news = []
+    long_obj = bot.exchanges.get(long_ex)
+    short_obj = bot.exchanges.get(short_ex)
+    ok = False
     try:
         async with analysis_sem:
             liq_ok = False
-            long_obj = bot.exchanges.get(long_ex)
-            short_obj = bot.exchanges.get(short_ex)
             if long_obj and short_obj:
                 long_liq = await long_obj.check_liquidity(
                     coin,
@@ -351,8 +355,36 @@ async def _analyze_pair_line(
             news_ok = bool((not delisting_news) and (not security_news))
             ok = bool(liq_ok and news_ok)
 
-        verdict = "✅ арбитражить" if ok else "❌ не арбитражить"
-        return f"{base_line} | {verdict}"
+        verdict = "✅ арбитр" if ok else "❌ не арбитр"
+        
+        # Собираем причины, если вердикт "❌ не арбитр"
+        reasons_parts = []
+        if not ok:
+            # Причины из ликвидности Long биржи
+            if long_obj and long_liq and not long_liq.get("ok"):
+                long_reasons = long_liq.get("reasons", [])
+                if long_reasons:
+                    reasons_parts.append(f"ликв. Long: {'; '.join(long_reasons)}")
+            
+            # Причины из ликвидности Short биржи
+            if short_obj and short_liq and not short_liq.get("ok"):
+                short_reasons = short_liq.get("reasons", [])
+                if short_reasons:
+                    reasons_parts.append(f"ликв. Short: {'; '.join(short_reasons)}")
+            
+            # Причины из новостей
+            if delisting_news:
+                reasons_parts.append("делистинг")
+            if security_news:
+                reasons_parts.append("безопасность")
+        
+        # Формируем финальное сообщение
+        if reasons_parts:
+            reasons_str = f" ({'; '.join(reasons_parts)})"
+        else:
+            reasons_str = ""
+        
+        return f"{base_line} | {verdict}{reasons_str}"
     except Exception as e:
         # По требованию: логируем ошибку, но выводим строку БЕЗ вердикта
         logger.warning(f"Analyze error: {coin} long={long_ex} short={short_ex}: {e}", exc_info=True)
@@ -365,7 +397,7 @@ async def main() -> int:
         return 2
 
     coin = sys.argv[1].strip().upper()
-    logger.info(f"Анализ монеты {coin}")
+    logger.info(f"Анализ монеты {coin} (инвестиции (SCAN_COIN_INVEST): {SCAN_COIN_INVEST} USDT на позицию)")
 
     bot = PerpArbitrageBot()
     try:

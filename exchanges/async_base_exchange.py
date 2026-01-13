@@ -235,7 +235,7 @@ class AsyncBaseExchange(ABC):
             
             if spread_bps > max_spread_bps:
                 ok = False
-                reasons.append(f"spread {spread_bps:.1f} bps > {max_spread_bps:.1f}")
+                reasons.append(f"ask1: {ask1} bid1: {bid1} spread {spread_bps:.1f} bps > {max_spread_bps:.1f}")
             
             if not enough_depth:
                 ok = False
