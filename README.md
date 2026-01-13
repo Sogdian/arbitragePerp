@@ -26,12 +26,14 @@ LOG_LEVEL=INFO
 ```bash
 python bot.py "CVC Long (bybit), Short (gate) 30"
 python scan_spreads.py 
+python one_coin_bot.py CLO
 ```
 
 **macOS:**
 ```bash
 python3 bot.py "CVC Long (bybit), Short (gate) 30"
 python3 scan_spreads.py 
+python3 one_coin_bot.py CLO
 ```
 
 ### Способ 2: Интерактивный ввод

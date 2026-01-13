@@ -42,6 +42,7 @@ load_dotenv(".env")
 # ----------------------------
 # Settings (как в scan_spreads.py, но для одного коина)
 # ----------------------------
+MIN_SPREAD = float(os.getenv("MIN_SPREAD", "2"))  # минимальный спред цены для вердикта ✅
 MAX_CONCURRENCY = int(os.getenv("SCAN_MAX_CONCURRENCY", "40"))
 REQ_TIMEOUT_SEC = float(os.getenv("SCAN_REQ_TIMEOUT_SEC", "12"))
 TICKER_TIMEOUT_SEC = float(os.getenv("SCAN_TICKER_TIMEOUT_SEC", str(REQ_TIMEOUT_SEC)))
@@ -298,11 +299,15 @@ async def _analyze_pair_line(
     base_line = (
         f"Long {long_ex} Цена: {_fmt_price(price_long)}, Фандинг: {_fmt_pct(funding_long_pct)} | "
         f"Short {short_ex} Цена: {_fmt_price(price_short)}, Фандинг: {_fmt_pct(funding_short_pct)} | "
-        f"Спред на цену: {price_spread_str} | "
-        f"Спред на фандинги: {funding_spread_str}"
+        f"Спред цены: {price_spread_str} | "
+        f"Спред фандинга: {funding_spread_str}"
     )
 
-    # Вердикт: как в scan_spreads.py (ликвидность OK + нет проблемных новостей)
+    # Если спред цены не посчитался или меньше MIN_SPREAD — ✅ быть не может.
+    if open_spread_pct is None or open_spread_pct < MIN_SPREAD:
+        return f"{base_line} | ❌ не арбитражить"
+
+    # Вердикт: MIN_SPREAD + (ликвидность OK) + (нет проблемных новостей)
     try:
         async with analysis_sem:
             liq_ok = False
@@ -351,7 +356,7 @@ async def _analyze_pair_line(
 
 
 async def main() -> int:
-    if len(sys.argv) < 2 or not sys.argv[1].strip():
+    if len(sys.argv) < 2 or not sys.argv[1].strip() or sys.argv[1].strip() in ("-h", "--help", "/?"):
         logger.info("Usage: python one_coin_bot.py COIN")
         return 2
 
