@@ -90,12 +90,12 @@ def _fmt_price(x: Optional[float]) -> str:
     if x is None:
         return "N/A"
     try:
-        return f"{float(x):.8f}".rstrip("0").rstrip(".")
+        return f"{float(x):.3f}".rstrip("0").rstrip(".")
     except Exception:
         return "N/A"
 
 
-def _fmt_pct(x: Optional[float], decimals: int = 6) -> str:
+def _fmt_pct(x: Optional[float], decimals: int = 3) -> str:
     if x is None:
         return "N/A"
     try:
@@ -293,14 +293,14 @@ async def _analyze_pair_line(
         funding_spread_pct = (funding_short - funding_long) * 100.0
 
     # Базовая строка (всегда)
-    price_spread_str = f"{open_spread_pct:.4f}%" if open_spread_pct is not None else "N/A"
-    funding_spread_str = f"{funding_spread_pct:.6f}%" if funding_spread_pct is not None else "N/A"
+    price_spread_str = f"{open_spread_pct:.3f}%" if open_spread_pct is not None else "N/A"
+    funding_spread_str = f"{funding_spread_pct:.3f}%" if funding_spread_pct is not None else "N/A"
 
     base_line = (
-        f"Long {long_ex} Цена: {_fmt_price(price_long)}, Фандинг: {_fmt_pct(funding_long_pct)} | "
-        f"Short {short_ex} Цена: {_fmt_price(price_short)}, Фандинг: {_fmt_pct(funding_short_pct)} | "
-        f"Спред цены: {price_spread_str} | "
-        f"Спред фандинга: {funding_spread_str}"
+        f"📈 Long {long_ex} Цена: {_fmt_price(price_long)} 📈 Фанд: {_fmt_pct(funding_long_pct)} | "
+        f"📉 Short {short_ex} Цена: {_fmt_price(price_short)} 📉 Фанд: {_fmt_pct(funding_short_pct)} | "
+        f"📊 Спред цены: {price_spread_str} | "
+        f"💸 Спред фанд: {funding_spread_str}"
     )
 
     # Если спред цены не посчитался или меньше MIN_SPREAD — ✅ быть не может.
