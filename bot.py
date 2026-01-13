@@ -559,9 +559,15 @@ class PerpArbitrageBot:
                     # Формируем строку вывода
                     exit_threshold = self.get_exit_threshold_pct()
                     if closing_spread is not None:
-                        closing_str = f"🚩 Закр: {closing_spread:.2f}% (min: {exit_threshold:.2f}%)"
+                        if close_threshold_pct is not None:
+                            closing_str = f"🚩 Закр: {closing_spread:.2f}% (min: {exit_threshold:.2f}% цель: {close_threshold_pct:.2f}%)"
+                        else:
+                            closing_str = f"🚩 Закр: {closing_spread:.2f}% (min: {exit_threshold:.2f}%)"
                     else:
-                        closing_str = f"🚩 Закр: N/A (min: {exit_threshold:.2f}%)"
+                        if close_threshold_pct is not None:
+                            closing_str = f"🚩 Закр: N/A (min: {exit_threshold:.2f}% цель: {close_threshold_pct:.2f}%)"
+                        else:
+                            closing_str = f"🚩 Закр: N/A (min: {exit_threshold:.2f}%)"
                     opening_str = f"⛳ Откр: {opening_spread:.2f}%" if opening_spread is not None else "⛳ Откр: N/A"
                     
                     pr_spread_str = f"{opening_spread:.4f}" if opening_spread is not None else "N/A"
