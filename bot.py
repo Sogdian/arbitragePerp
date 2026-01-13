@@ -616,13 +616,14 @@ class PerpArbitrageBot:
                                             f"⏰ <b>Time to close {coin}:</b> Long ({long_ex_capitalized}) / Short ({short_ex_capitalized})",
                                         ]
                                         
-                                        if opening_spread is not None:
+                                        exit_threshold = self.get_exit_threshold_pct()
+                                        if closing_spread is not None:
                                             if close_threshold_pct is not None:
-                                                message_lines.append(f"📊 <b>Price Spread:</b> {opening_spread:.4f}% (close price: {close_threshold_pct:.2f}%)")
+                                                message_lines.append(f"🚩 <b>Close:</b> {closing_spread:.2f}% (min: {exit_threshold:.2f}% цель: {close_threshold_pct:.2f}%)")
                                             else:
-                                                message_lines.append(f"📊 <b>Price Spread:</b> {opening_spread:.4f}%")
+                                                message_lines.append(f"🚩 <b>Close:</b> {closing_spread:.2f}% (min: {exit_threshold:.2f}%)")
                                         else:
-                                            message_lines.append("📊 <b>Price Spread:</b> N/A")
+                                            message_lines.append(f"🚩 <b>Close:</b> N/A (min: {exit_threshold:.2f}%)")
                                         
                                         if fr_spread is not None:
                                             message_lines.append(f"💰 <b>Funding Spread:</b> {fr_spread:.6f}%")
