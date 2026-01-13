@@ -559,10 +559,10 @@ class PerpArbitrageBot:
                     # Формируем строку вывода
                     exit_threshold = self.get_exit_threshold_pct()
                     if closing_spread is not None:
-                        closing_str = f"🏁 Закр: {closing_spread:.2f}% ({exit_threshold:.2f}%)"
+                        closing_str = f"🚩 Закр: {closing_spread:.2f}% (min: {exit_threshold:.2f}%)"
                     else:
-                        closing_str = f"🏁 Закр: N/A ({exit_threshold:.2f}%)"
-                    opening_str = f"🚀 Откр: {opening_spread:.2f}%" if opening_spread is not None else "🚀 Откр: N/A"
+                        closing_str = f"🚩 Закр: N/A (min: {exit_threshold:.2f}%)"
+                    opening_str = f"⛳ Откр: {opening_spread:.2f}%" if opening_spread is not None else "⛳ Откр: N/A"
                     
                     pr_spread_str = f"{opening_spread:.4f}" if opening_spread is not None else "N/A"
                     if fr_spread is not None:
@@ -576,7 +576,7 @@ class PerpArbitrageBot:
                     coin_str = coin
                     
                     # Выводим одной строкой
-                    logger.info(f"{closing_str} | {opening_str} | 📊 pr_spread: {pr_spread_str} | 💰 fr_spread: {fr_spread_str} | {long_ex_str} | {short_ex_str} | {coin_str}")
+                    logger.info(f"{closing_str} | {opening_str} | 📊 pr_spread: {pr_spread_str} | 💰 fr_spread: {fr_spread_str}⚙️  {long_ex_str} | {short_ex_str} | {coin_str}")
                     
                     # Проверяем порог закрытия и отправляем сообщение в Telegram
                     # Для отрицательных порогов: отправляем, когда спред становится хуже (меньше) порога
@@ -611,7 +611,10 @@ class PerpArbitrageBot:
                                         ]
                                         
                                         if opening_spread is not None:
-                                            message_lines.append(f"📊 <b>Price Spread:</b> {opening_spread:.4f}%")
+                                            if close_threshold_pct is not None:
+                                                message_lines.append(f"📊 <b>Price Spread:</b> {opening_spread:.4f}% (close price: {close_threshold_pct:.2f}%)")
+                                            else:
+                                                message_lines.append(f"📊 <b>Price Spread:</b> {opening_spread:.4f}%")
                                         else:
                                             message_lines.append("📊 <b>Price Spread:</b> N/A")
                                         
