@@ -401,7 +401,7 @@ def _get_exchange_url(exchange: str, coin: str) -> str:
         return f"https://bingx.com/ru-ru/futures/forward/{symbol}"
     elif exchange_lower == "mexc":
         symbol = f"{coin_upper}_USDT"
-        return f"https://www.mexc.com/ru/exchange/{symbol}"
+        return f"https://www.mexc.com/ru-RU/futures/{symbol}"
     elif exchange_lower == "xt":
         symbol = f"{coin_upper}_USDT"
         return f"https://www.xt.com/ru/trade/{symbol.lower()}"
