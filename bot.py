@@ -570,8 +570,13 @@ class PerpArbitrageBot:
                     else:
                         fr_spread_str = "N/A"
                     
+                    # Формируем информацию о биржах и монете
+                    long_ex_str = f"Long {long_exchange}"
+                    short_ex_str = f"Short {short_exchange}"
+                    coin_str = coin
+                    
                     # Выводим одной строкой
-                    logger.info(f"{closing_str} | {opening_str} | 📊 pr_spread: {pr_spread_str} | 💰 fr_spread: {fr_spread_str}")
+                    logger.info(f"{closing_str} | {opening_str} | 📊 pr_spread: {pr_spread_str} | 💰 fr_spread: {fr_spread_str} | {long_ex_str} | {short_ex_str} | {coin_str}")
                     
                     # Проверяем порог закрытия и отправляем сообщение в Telegram
                     # Для отрицательных порогов: отправляем, когда спред становится хуже (меньше) порога
