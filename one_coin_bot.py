@@ -357,6 +357,13 @@ async def _analyze_pair_line(
 
         verdict = "✅ арбитр" if ok else "❌ не арбитр"
         
+        # Вычисляем количество монет для каждой биржи (если вердикт "✅ арбитр")
+        coins_info = ""
+        if ok and price_long is not None and price_short is not None and price_long > 0 and price_short > 0:
+            coins_long = SCAN_COIN_INVEST / price_long
+            coins_short = SCAN_COIN_INVEST / price_short
+            coins_info = f" ({long_ex}: {coins_long:.3f} {coin}, {short_ex}: {coins_short:.3f} {coin})"
+        
         # Собираем причины, если вердикт "❌ не арбитр"
         reasons_parts = []
         if not ok:
@@ -384,7 +391,7 @@ async def _analyze_pair_line(
         else:
             reasons_str = ""
         
-        return f"{base_line} | {verdict}{reasons_str}"
+        return f"{base_line} | {verdict}{coins_info}{reasons_str}"
     except Exception as e:
         # По требованию: логируем ошибку, но выводим строку БЕЗ вердикта
         logger.warning(f"Analyze error: {coin} long={long_ex} short={short_ex}: {e}", exc_info=True)

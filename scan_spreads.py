@@ -305,7 +305,39 @@ async def _analyze_and_log_opportunity(
             funding_spread = (funding_short - funding_long) * 100
             funding_spread_str = f"{funding_spread:.3f}"
 
+        # Извлекаем цены для расчета количества монет
+        price_long = None
+        price_short = None
+        if long_data:
+            # Для Long используем ask (цена покупки), если нет - price, если нет - среднее от bid/ask
+            price_long = long_data.get("ask")
+            if price_long is None:
+                price_long = long_data.get("price")
+            if price_long is None:
+                bid_long = long_data.get("bid")
+                ask_long = long_data.get("ask")
+                if bid_long is not None and ask_long is not None:
+                    price_long = (bid_long + ask_long) / 2.0
+        
+        if short_data:
+            # Для Short используем bid (цена продажи), если нет - price, если нет - среднее от bid/ask
+            price_short = short_data.get("bid")
+            if price_short is None:
+                price_short = short_data.get("price")
+            if price_short is None:
+                bid_short = short_data.get("bid")
+                ask_short = short_data.get("ask")
+                if bid_short is not None and ask_short is not None:
+                    price_short = (bid_short + ask_short) / 2.0
+
         verdict = "✅ арбитражить" if ok else "❌ не арбитражить"
+        
+        # Вычисляем количество монет для каждой биржи (если вердикт "✅ арбитражить")
+        coins_info = ""
+        if ok and price_long is not None and price_short is not None and price_long > 0 and price_short > 0:
+            coins_long = SCAN_COIN_INVEST / price_long
+            coins_short = SCAN_COIN_INVEST / price_short
+            coins_info = f" ({long_ex}: {coins_long:.3f} {coin}, {short_ex}: {coins_short:.3f} {coin})"
         
         # Собираем причины, если вердикт "❌ не арбитражить"
         reasons_parts = []
@@ -334,7 +366,7 @@ async def _analyze_and_log_opportunity(
         else:
             reasons_str = ""
         
-        log_message = f"💰 {coin} Long ({long_ex}), Short ({short_ex}) spread {open_spread_pct:.3f}% | fund {funding_spread_str} {verdict}{reasons_str}"
+        log_message = f"💰 {coin} Long ({long_ex}), Short ({short_ex}) spread {open_spread_pct:.3f}% | fund {funding_spread_str} {verdict}{coins_info}{reasons_str}"
         logger.info(log_message)
         
         # Отправляем в Telegram, если вердикт "✅ арбитражить"
@@ -383,7 +415,8 @@ def _get_exchange_url(exchange: str, coin: str) -> str:
     # Формируем символ в зависимости от биржи
     if exchange_lower == "bybit":
         symbol = f"{coin_upper}USDT"
-        return f"https://www.bybit.com/ru/trade/usdt/{symbol}"
+        # Bybit: у trade-ссылок нет ru-префикса, рабочий вариант без локали
+        return f"https://www.bybit.com/trade/usdt/{symbol}"
     elif exchange_lower == "gate":
         symbol = f"{coin_upper}_USDT"
         return f"https://www.gate.com/ru/futures/USDT/{symbol}"
