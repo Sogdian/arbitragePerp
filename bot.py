@@ -257,11 +257,22 @@ class PerpArbitrageBot:
             price_long = long_data.get("price")
             funding_long = long_data.get("funding_rate")
             
-            logger.info(f"(Long {long_exchange}) ({coin}) Цена: {price_long}")
+            # Вычисляем количество монет, которое можно купить за notional_usdt
+            coins_long = None
+            if price_long is not None and price_long > 0:
+                coins_long = notional_usdt / price_long
+            
+            if price_long is not None:
+                if coins_long is not None:
+                    logger.info(f"(Long {long_exchange}) ({coin}) Цена: {price_long:.3f} ({coins_long:.3f} {coin})")
+                else:
+                    logger.info(f"(Long {long_exchange}) ({coin}) Цена: {price_long:.3f}")
+            else:
+                logger.info(f"(Long {long_exchange}) ({coin}) Цена: недоступно")
             
             if funding_long is not None:
                 funding_long_pct = funding_long * 100
-                logger.info(f"(Long {long_exchange}) ({coin}) Фандинг: {funding_long_pct:.6f}%")
+                logger.info(f"(Long {long_exchange}) ({coin}) Фандинг: {funding_long_pct:.3f}%")
             else:
                 logger.info(f"(Long {long_exchange}) ({coin}) Фандинг: недоступно")
         else:
@@ -274,11 +285,22 @@ class PerpArbitrageBot:
             price_short = short_data.get("price")
             funding_short = short_data.get("funding_rate")
             
-            logger.info(f"(Short {short_exchange}) ({coin}) Цена: {price_short}")
+            # Вычисляем количество монет, которое можно купить за notional_usdt
+            coins_short = None
+            if price_short is not None and price_short > 0:
+                coins_short = notional_usdt / price_short
+            
+            if price_short is not None:
+                if coins_short is not None:
+                    logger.info(f"(Short {short_exchange}) ({coin}) Цена: {price_short:.3f} ({coins_short:.3f} {coin})")
+                else:
+                    logger.info(f"(Short {short_exchange}) ({coin}) Цена: {price_short:.3f}")
+            else:
+                logger.info(f"(Short {short_exchange}) ({coin}) Цена: недоступно")
             
             if funding_short is not None:
                 funding_short_pct = funding_short * 100
-                logger.info(f"(Short {short_exchange}) ({coin}) Фандинг: {funding_short_pct:.6f}%")
+                logger.info(f"(Short {short_exchange}) ({coin}) Фандинг: {funding_short_pct:.3f}%")
             else:
                 logger.info(f"(Short {short_exchange}) ({coin}) Фандинг: недоступно")
         else:
@@ -293,7 +315,7 @@ class PerpArbitrageBot:
             # Положительный спред = хорошо (цена на Short бирже выше)
             price_spread = self.calculate_spread(price_short, price_long)
             if price_spread is not None:
-                logger.info(f"({long_exchange} и {short_exchange}) Спред на цену: {price_spread:.4f}%")
+                logger.info(f"({long_exchange} и {short_exchange}) Спред на цену: {price_spread:.3f}%")
             else:
                 logger.info(f"({long_exchange} и {short_exchange}) Спред на цену: невозможно вычислить")
         else:
@@ -302,12 +324,24 @@ class PerpArbitrageBot:
         if funding_long is not None and funding_short is not None:
             funding_spread = self.calculate_funding_spread(funding_long, funding_short)
             if funding_spread is not None:
-                logger.info(f"({long_exchange} и {short_exchange}) Спред на фандинги: {funding_spread:.6f}% (откр: ≥0.18%, закр: ≤0.05%)")
+                logger.info(f"({long_exchange} и {short_exchange}) Спред на фандинги: {funding_spread:.3f}% (откр: ≥0.18%, закр: ≤0.05%)")
             else:
                 logger.info(f"({long_exchange} и {short_exchange}) Спред на фандинги: невозможно вычислить")
+                funding_spread = None
         else:
             logger.info(f"({long_exchange} и {short_exchange}) Спред на фандинги: недоступно")
             funding_spread = None
+        
+        # Вычисляем общий спред (спред на цену + спред на фандинги)
+        if price_spread is not None and funding_spread is not None:
+            total_spread = price_spread + funding_spread
+            logger.info(f"({long_exchange} и {short_exchange}) Спред общий: {total_spread:.3f}%")
+        elif price_spread is not None:
+            logger.info(f"({long_exchange} и {short_exchange}) Спред общий: недоступно (нет данных по фандингам)")
+        elif funding_spread is not None:
+            logger.info(f"({long_exchange} и {short_exchange}) Спред общий: недоступно (нет данных по цене)")
+        else:
+            logger.info(f"({long_exchange} и {short_exchange}) Спред общий: недоступно")
         
         logger.info("=" * 60)
         
