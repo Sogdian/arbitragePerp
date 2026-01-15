@@ -680,6 +680,25 @@ def _generate_arbitrage_table_image(
             short_data = opp.get("short_data")
             open_spread_pct = opp["open_spread_pct"]
             
+            # Получаем цены
+            price_long = None
+            if long_data:
+                price_long = long_data.get("price")
+                if price_long is None:
+                    bid_long = long_data.get("bid")
+                    ask_long = long_data.get("ask")
+                    if bid_long is not None and ask_long is not None:
+                        price_long = (bid_long + ask_long) / 2.0
+            
+            price_short = None
+            if short_data:
+                price_short = short_data.get("price")
+                if price_short is None:
+                    bid_short = short_data.get("bid")
+                    ask_short = short_data.get("ask")
+                    if bid_short is not None and ask_short is not None:
+                        price_short = (bid_short + ask_short) / 2.0
+            
             # Получаем funding rates
             funding_long = long_data.get("funding_rate") if long_data else None
             funding_short = short_data.get("funding_rate") if short_data else None
@@ -695,12 +714,16 @@ def _generate_arbitrage_table_image(
                 total_spread = open_spread_pct + funding_spread
             
             # Форматируем значения (все с округлением до 3 знаков после запятой)
+            price_long_str = f"{price_long:.3f}" if price_long is not None else "none"
+            price_short_str = f"{price_short:.3f}" if price_short is not None else "none"
             funding_long_str = f"{funding_long * 100:.3f}" if funding_long is not None else "none"
             funding_short_str = f"{funding_short * 100:.3f}" if funding_short is not None else "none"
             funding_spread_str = f"{funding_spread:.3f}" if funding_spread is not None else "none"
             
             rows.append({
                 "coin": coin,
+                "pr_long": price_long_str,
+                "pr_short": price_short_str,
                 "funding_long": funding_long_str,
                 "funding_short": funding_short_str,
                 "pr_spread": f"{open_spread_pct:.3f}",
@@ -712,6 +735,8 @@ def _generate_arbitrage_table_image(
         # Определяем ширину колонок
         col_widths = {
             "coin": 120,
+            "pr_long": 90,
+            "pr_short": 90,
             "funding_long": 80,
             "funding_short": 80,
             "pr_spread": 100,
@@ -741,8 +766,8 @@ def _generate_arbitrage_table_image(
                 font_bold = ImageFont.load_default()
         
         # Рисуем заголовок
-        headers = ["coin", "funding_long", "funding_short", "pr_spread", "fr_spread", "total_spread", "ex_spread"]
-        header_labels = ["coin", "fr_long", "fr_short", "pr_spread", "fr_spread", "total_spread", "ex_spread"]
+        headers = ["coin", "pr_long", "pr_short", "funding_long", "funding_short", "pr_spread", "fr_spread", "total_spread", "ex_spread"]
+        header_labels = ["coin", "pr_long", "pr_short", "fr_long", "fr_short", "pr_spread", "fr_spread", "total_spread", "ex_spread"]
         
         x = border_width
         y = border_width
