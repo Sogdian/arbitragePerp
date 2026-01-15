@@ -651,17 +651,17 @@ class PerpArbitrageBot:
                     exit_threshold = self.get_exit_threshold_pct()
                     if closing_spread is not None:
                         if close_threshold_pct is not None:
-                            closing_str = f"🚩 Закр: {closing_spread:.2f}% (min: {exit_threshold:.2f}% цель: {close_threshold_pct:.2f}%)"
+                            closing_str = f"🚩 Закр: {closing_spread:.3f}% (min: {exit_threshold:.3f}% цель: {close_threshold_pct:.3f}%)"
                         else:
-                            closing_str = f"🚩 Закр: {closing_spread:.2f}% (min: {exit_threshold:.2f}%)"
+                            closing_str = f"🚩 Закр: {closing_spread:.3f}% (min: {exit_threshold:.3f}%)"
                     else:
                         if close_threshold_pct is not None:
-                            closing_str = f"🚩 Закр: N/A (min: {exit_threshold:.2f}% цель: {close_threshold_pct:.2f}%)"
+                            closing_str = f"🚩 Закр: N/A (min: {exit_threshold:.3f}% цель: {close_threshold_pct:.3f}%)"
                         else:
-                            closing_str = f"🚩 Закр: N/A (min: {exit_threshold:.2f}%)"
-                    opening_str = f"⛳ Откр: {opening_spread:.2f}%" if opening_spread is not None else "⛳ Откр: N/A"
+                            closing_str = f"🚩 Закр: N/A (min: {exit_threshold:.3f}%)"
+                    opening_str = f"⛳ Откр: {opening_spread:.3f}%" if opening_spread is not None else "⛳ Откр: N/A"
                     
-                    pr_spread_str = f"{opening_spread:.4f}" if opening_spread is not None else "N/A"
+                    pr_spread_str = f"{opening_spread:.3f}" if opening_spread is not None else "N/A"
                     if fr_spread is not None:
                         fr_spread_str = f"{fr_spread:.3f} (≥0.18%, ≤0.05%)"
                     else:
