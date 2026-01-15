@@ -645,28 +645,24 @@ def _generate_arbitrage_table_image(
             if funding_spread is not None:
                 total_spread = open_spread_pct + funding_spread
             
-            # Форматируем значения
-            funding_long_str = f"{funding_long * 100:.2f}" if funding_long is not None else "none"
-            funding_short_str = f"{funding_short * 100:.2f}" if funding_short is not None else "none"
-            funding_spread_str = f"{funding_spread:.2f}" if funding_spread is not None else "none"
+            # Форматируем значения (все с округлением до 3 знаков после запятой)
+            funding_long_str = f"{funding_long * 100:.3f}" if funding_long is not None else "none"
+            funding_short_str = f"{funding_short * 100:.3f}" if funding_short is not None else "none"
+            funding_spread_str = f"{funding_spread:.3f}" if funding_spread is not None else "none"
             
             rows.append({
                 "coin": coin,
-                "long_ex": long_ex,
-                "short_ex": short_ex,
                 "funding_long": funding_long_str,
                 "funding_short": funding_short_str,
-                "pr_spread": f"{open_spread_pct:.5f}",
+                "pr_spread": f"{open_spread_pct:.3f}",
                 "fr_spread": funding_spread_str,
-                "total_spread": f"{total_spread:.5f}",
+                "total_spread": f"{total_spread:.3f}",
                 "ex_spread": f"Long ({long_ex}), Short ({short_ex})",
             })
         
         # Определяем ширину колонок
         col_widths = {
             "coin": 120,
-            "long_ex": 80,
-            "short_ex": 80,
             "funding_long": 80,
             "funding_short": 80,
             "pr_spread": 100,
@@ -696,8 +692,8 @@ def _generate_arbitrage_table_image(
                 font_bold = ImageFont.load_default()
         
         # Рисуем заголовок
-        headers = ["coin", "long_ex", "short_ex", "funding_long", "funding_short", "pr_spread", "fr_spread", "total_spread", "ex_spread"]
-        header_labels = ["coin", "Long", "Short", "fr_long", "fr_short", "pr_spread", "fr_spread", "total_spread", "ex_spread"]
+        headers = ["coin", "funding_long", "funding_short", "pr_spread", "fr_spread", "total_spread", "ex_spread"]
+        header_labels = ["coin", "fr_long", "fr_short", "pr_spread", "fr_spread", "total_spread", "ex_spread"]
         
         x = border_width
         y = border_width
@@ -855,11 +851,40 @@ async def process_coin(
                 if telegram.enabled:
                     channel_id = telegram._get_channel_id()
                     if channel_id:
+                        # Вычисляем максимальный total_spread и соответствующую пару бирж для caption
+                        max_total_spread = None
+                        max_opp = None
+                        for opp in opportunities:
+                            long_data = opp.get("long_data")
+                            short_data = opp.get("short_data")
+                            open_spread_pct = opp["open_spread_pct"]
+                            
+                            funding_long = long_data.get("funding_rate") if long_data else None
+                            funding_short = short_data.get("funding_rate") if short_data else None
+                            
+                            funding_spread = None
+                            if funding_long is not None and funding_short is not None:
+                                funding_spread = (funding_short - funding_long) * 100
+                            
+                            total_spread = open_spread_pct
+                            if funding_spread is not None:
+                                total_spread = open_spread_pct + funding_spread
+                            
+                            if max_total_spread is None or total_spread > max_total_spread:
+                                max_total_spread = total_spread
+                                max_opp = opp
+                        
                         # Пробуем отправить изображение таблицы (если доступно)
                         if PIL_AVAILABLE:
                             table_image = _generate_arbitrage_table_image(coin=coin, opportunities=opportunities)
                             if table_image:
-                                caption = f'🔔 <b>Signal: {coin}</b> (Liq: {SCAN_COIN_INVEST:.1f} USDT)'
+                                max_spread_str = f"{max_total_spread:.3f}" if max_total_spread is not None else "N/A"
+                                if max_opp:
+                                    long_ex_cap = max_opp["long_ex"].capitalize()
+                                    short_ex_cap = max_opp["short_ex"].capitalize()
+                                    caption = f'🔔 Signal: {coin} (for liq: {SCAN_COIN_INVEST:.1f} USDT)\n{coin} Long ({long_ex_cap}), Short ({short_ex_cap}) max total spread: {max_spread_str}'
+                                else:
+                                    caption = f'🔔 Signal: {coin} (for liq: {SCAN_COIN_INVEST:.1f} USDT)\nmax total spread: {max_spread_str}'
                                 success = await telegram.send_photo(table_image, caption=caption, channel_id=channel_id)
                                 if success:
                                     logger.debug(f"📱 Отправлено изображение таблицы в Telegram для {coin} ({len(opportunities)} opportunities, режим: {config.ENV_MODE})")
