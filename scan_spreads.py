@@ -241,7 +241,7 @@ async def _analyze_and_log_opportunity(
     analysis_sem: asyncio.Semaphore,
     long_data: Optional[Dict[str, Any]] = None,
     short_data: Optional[Dict[str, Any]] = None,
-) -> None:
+) -> Optional[Dict[str, Any]]:
     """
     Считает "как bot.py" (ликвидность + новости), но НЕ печатает подробные логи.
     В логи попадает только 1 строка: "💰 ... spread ... ✓/✗".
@@ -369,33 +369,21 @@ async def _analyze_and_log_opportunity(
         log_message = f"💰 {coin} Long ({long_ex}), Short ({short_ex}) spread {open_spread_pct:.3f}% | fund {funding_spread_str} {verdict}{coins_info}{reasons_str}"
         logger.info(log_message)
         
-        # Отправляем в Telegram, если вердикт "✅ арбитражить"
-        # Канал выбирается автоматически на основе ENV_MODE (test -> TEST_CHANNEL_ID, prod -> FREE_CHANNEL_ID)
+        # Возвращаем данные о найденной возможности, если вердикт "✅ арбитражить"
         if ok:
-            try:
-                telegram = TelegramSender()
-                if telegram.enabled:
-                    channel_id = telegram._get_channel_id()
-                    if channel_id:
-                        # Формируем детальное сообщение
-                        telegram_message = _format_telegram_message(
-                            coin=coin,
-                            long_ex=long_ex,
-                            short_ex=short_ex,
-                            long_data=long_data,
-                            short_data=short_data,
-                            open_spread_pct=open_spread_pct,
-                            long_liq=long_liq,
-                            short_liq=short_liq,
-                            delisting_news=delisting_news,
-                            security_news=security_news,
-                        )
-                        await telegram.send_message(telegram_message, channel_id=channel_id)
-                        logger.debug(f"📱 Отправлено сообщение в Telegram для {coin} (режим: {config.ENV_MODE})")
-                    else:
-                        logger.warning(f"📱 Telegram включен, но канал не настроен для режима {config.ENV_MODE}")
-            except Exception as e:
-                logger.warning(f"Ошибка отправки в Telegram для {coin}: {e}", exc_info=True)
+            return {
+                "coin": coin,
+                "long_ex": long_ex,
+                "short_ex": short_ex,
+                "open_spread_pct": open_spread_pct,
+                "long_data": long_data,
+                "short_data": short_data,
+                "long_liq": long_liq,
+                "short_liq": short_liq,
+                "delisting_news": delisting_news,
+                "security_news": security_news,
+            }
+        return None
 
 
 def _get_exchange_url(exchange: str, coin: str) -> str:
@@ -522,12 +510,79 @@ def _format_telegram_message(
     # Спред на фандинги с порогами
     if funding_long is not None and funding_short is not None:
         funding_spread = (funding_short - funding_long) * 100
-        lines.append(f'• Funding Spread: <b>{funding_spread:.3f}%</b> (open ≥ 0.18% | close ≤ 0.05%)')
+        lines.append(f'• Funding Spread: <b>{funding_spread:.3f}%</b>')
     
     lines.append("")
     
     # Стратегия
     lines.append(f'💎 <b>Strategy:</b> {coin} Long ({long_ex_capitalized}), Short ({short_ex_capitalized})')
+    
+    return "\n".join(lines)
+
+
+def _format_combined_telegram_message(
+    coin: str,
+    opportunities: List[Dict[str, Any]],
+) -> str:
+    """Форматирует объединенное сообщение для Telegram с несколькими возможностями по одной монете"""
+    lines = [f'🔔 <b>Signal: {coin}</b> (Liq: {SCAN_COIN_INVEST:.1f} USDT)']
+    lines.append("")
+    
+    for opp in opportunities:
+        long_ex = opp["long_ex"]
+        short_ex = opp["short_ex"]
+        long_data = opp.get("long_data")
+        short_data = opp.get("short_data")
+        open_spread_pct = opp["open_spread_pct"]
+        
+        # Long данные
+        price_long = None
+        funding_long = None
+        if long_data:
+            price_long = long_data.get("price")
+            if price_long is None:
+                bid_long = long_data.get("bid")
+                ask_long = long_data.get("ask")
+                if bid_long is not None and ask_long is not None:
+                    price_long = (bid_long + ask_long) / 2.0
+            funding_long = long_data.get("funding_rate")
+        
+        # Short данные
+        price_short = None
+        funding_short = None
+        if short_data:
+            price_short = short_data.get("price")
+            if price_short is None:
+                bid_short = short_data.get("bid")
+                ask_short = short_data.get("ask")
+                if bid_short is not None and ask_short is not None:
+                    price_short = (bid_short + ask_short) / 2.0
+            funding_short = short_data.get("funding_rate")
+        
+        # LONG секция
+        long_ex_capitalized = long_ex.capitalize()
+        long_url = _get_exchange_url(long_ex, coin)
+        long_price_str = f"{price_long:.3f}" if price_long is not None else "N/A"
+        long_funding_str = f"{funding_long * 100:.3f}%" if funding_long is not None else "N/A"
+        lines.append(f'🟢 LONG (<a href="{long_url}">{long_ex_capitalized}</a>) | Price: {long_price_str} | Funding: {long_funding_str}')
+        
+        # SHORT секция
+        short_ex_capitalized = short_ex.capitalize()
+        short_url = _get_exchange_url(short_ex, coin)
+        short_price_str = f"{price_short:.3f}" if price_short is not None else "N/A"
+        short_funding_str = f"{funding_short * 100:.3f}%" if funding_short is not None else "N/A"
+        lines.append(f'🔴 SHORT (<a href="{short_url}">{short_ex_capitalized}</a>) | Price: {short_price_str} | Funding: {short_funding_str}')
+        
+        # Спреды
+        funding_spread_str = ""
+        if funding_long is not None and funding_short is not None:
+            funding_spread = (funding_short - funding_long) * 100
+            funding_spread_str = f" | Funding spread: {funding_spread:.3f}%"
+        lines.append(f'• Price spread: {open_spread_pct:.3f}%{funding_spread_str}')
+        
+        # Strategy
+        lines.append(f'💎 Strategy: {coin} Long ({long_ex_capitalized}), Short ({short_ex_capitalized})')
+        lines.append("")
     
     return "\n".join(lines)
 
@@ -613,7 +668,7 @@ async def process_coin(
     if per_coin_found:
         per_coin_found.sort(key=lambda x: x[2], reverse=True)
         # Анализируем найденные связки (можно параллельно, но ограничено ANALYSIS_MAX_CONCURRENCY)
-        await asyncio.gather(
+        results = await asyncio.gather(
             *(
                 _analyze_and_log_opportunity(
                     bot=bot,
@@ -629,6 +684,28 @@ async def process_coin(
             ),
             return_exceptions=True,
         )
+        
+        # Собираем все найденные возможности (где вердикт "✅ арбитражить")
+        opportunities = [r for r in results if r is not None and not isinstance(r, Exception)]
+        
+        # Отправляем одно объединенное сообщение в Telegram, если есть найденные возможности
+        if opportunities:
+            try:
+                telegram = TelegramSender()
+                if telegram.enabled:
+                    channel_id = telegram._get_channel_id()
+                    if channel_id:
+                        # Формируем объединенное сообщение
+                        telegram_message = _format_combined_telegram_message(
+                            coin=coin,
+                            opportunities=opportunities,
+                        )
+                        await telegram.send_message(telegram_message, channel_id=channel_id)
+                        logger.debug(f"📱 Отправлено объединенное сообщение в Telegram для {coin} ({len(opportunities)} opportunities, режим: {config.ENV_MODE})")
+                    else:
+                        logger.warning(f"📱 Telegram включен, но канал не настроен для режима {config.ENV_MODE}")
+            except Exception as e:
+                logger.warning(f"Ошибка отправки объединенного сообщения в Telegram для {coin}: {e}", exc_info=True)
 
 
 async def scan_once(
