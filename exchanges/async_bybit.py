@@ -128,27 +128,42 @@ class AsyncBybitExchange(AsyncBaseExchange):
         """
         try:
             symbol = self._normalize_symbol(coin)
-            url = "/v5/market/funding/history"
-            params = {
-                "category": "linear",
-                "symbol": symbol,
-                "limit": 1,
-            }
-            
-            data = await self._request_json("GET", url, params=params)
+
+            # Bybit:
+            # - /v5/market/tickers -> текущая/индикативная ставка (то, что UI показывает как "Текущая ставка")
+            # - /v5/market/funding/history -> история (то, что UI показывает как "Предыдущая ставка")
+            url_tickers = "/v5/market/tickers"
+            params_tickers = {"category": "linear", "symbol": symbol}
+
+            data = await self._request_json("GET", url_tickers, params=params_tickers)
+            if data and data.get("retCode") == 0:
+                items = (data.get("result") or {}).get("list") or []
+                if items and isinstance(items[0], dict):
+                    r = items[0].get("fundingRate")
+                    if r is not None:
+                        try:
+                            return float(r)
+                        except (TypeError, ValueError):
+                            pass
+
+            # Fallback на историю (предыдущая применённая ставка)
+            url_history = "/v5/market/funding/history"
+            params_history = {"category": "linear", "symbol": symbol, "limit": 1}
+
+            data = await self._request_json("GET", url_history, params=params_history)
             if not data or data.get("retCode") != 0:
                 logger.warning(f"Bybit: фандинг для {coin} не найден")
                 return None
-            
+
             items = (data.get("result") or {}).get("list") or []
             if not items:
                 logger.warning(f"Bybit: фандинг для {coin} не найден")
                 return None
-            
+
             funding_rate_raw = items[0].get("fundingRate")
             if funding_rate_raw is None:
                 return None
-            
+
             return float(funding_rate_raw)
                 
         except Exception as e:
