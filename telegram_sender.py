@@ -5,7 +5,9 @@ import asyncio
 import logging
 import httpx
 import time
-from typing import List, Dict
+import io
+from typing import List, Dict, Optional, Union
+from pathlib import Path
 import config
 
 logger = logging.getLogger(__name__)
@@ -87,6 +89,93 @@ class TelegramSender:
             True если сообщение отправлено успешно
         """
         return await self._send_message(text, channel_id)
+    
+    async def send_photo(
+        self,
+        photo: Union[str, Path, io.BytesIO, bytes],
+        caption: Optional[str] = None,
+        channel_id: Optional[str] = None,
+    ) -> bool:
+        """
+        Отправляет изображение в Telegram канал
+        
+        Args:
+            photo: Путь к файлу изображения (str/Path), BytesIO объект, или bytes
+            caption: Подпись к изображению (опционально, поддерживает HTML)
+            channel_id: ID канала (опционально, если не указан - используется канал из конфига)
+        
+        Returns:
+            True если изображение отправлено успешно
+        """
+        if not self.enabled:
+            return False
+        
+        if not channel_id:
+            channel_id = self._get_channel_id()
+        
+        if not channel_id:
+            logger.error("❌ Channel ID не установлен!")
+            return False
+        
+        url = f"{self.BASE_URL}{self.bot_token}/sendPhoto"
+        
+        try:
+            # Подготовка данных для multipart/form-data
+            data = {"chat_id": channel_id}
+            
+            if caption:
+                data["caption"] = caption
+                data["parse_mode"] = "HTML"
+            
+            # Определяем, как передать фото
+            photo_file = None
+            photo_bytes = None
+            
+            # Если это путь к файлу
+            if isinstance(photo, (str, Path)):
+                photo_path = Path(photo)
+                if not photo_path.exists():
+                    logger.error(f"❌ Файл изображения не найден: {photo_path}")
+                    return False
+                photo_file = open(photo_path, "rb")
+                photo_bytes = photo_file
+            # Если это BytesIO или bytes
+            elif isinstance(photo, (io.BytesIO, bytes)):
+                if isinstance(photo, bytes):
+                    photo_bytes = io.BytesIO(photo)
+                else:
+                    photo_bytes = photo
+                photo_bytes.seek(0)  # Перемещаемся в начало
+            else:
+                logger.error(f"❌ Неподдерживаемый тип фото: {type(photo)}")
+                return False
+            
+            # Отправляем через multipart/form-data
+            files = {"photo": ("table.png", photo_bytes, "image/png")}
+            
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.post(url, data=data, files=files)
+                response.raise_for_status()
+                result = response.json()
+                
+                # Закрываем файл, если открывали
+                if photo_file and hasattr(photo_file, "close"):
+                    photo_file.close()
+                
+                if result.get("ok"):
+                    return True
+                else:
+                    logger.error(f"❌ Ошибка отправки фото: {result.get('description', 'Unknown')}")
+                    return False
+        except Exception as e:
+            logger.error(f"❌ Ошибка при отправке фото в Telegram: {e}", exc_info=True)
+            # Закрываем файл в случае ошибки
+            if photo_file and hasattr(photo_file, "close"):
+                try:
+                    photo_file.close()
+                except:
+                    pass
+            return False
     
     def _get_spread_key(self, coin: str, long_exchange: str, short_exchange: str) -> str:
         """Создает уникальный ключ для спреда (coin + биржи)"""

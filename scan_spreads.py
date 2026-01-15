@@ -4,6 +4,7 @@ import os
 import sys
 import time
 import contextlib
+import io
 from datetime import datetime, timedelta, timezone
 from itertools import combinations
 from typing import Any, Dict, Optional, List, Tuple, Set
@@ -11,6 +12,12 @@ from typing import Any, Dict, Optional, List, Tuple, Set
 from bot import PerpArbitrageBot
 from telegram_sender import TelegramSender
 import config
+
+try:
+    from PIL import Image, ImageDraw, ImageFont
+    PIL_AVAILABLE = True
+except ImportError:
+    PIL_AVAILABLE = False
 
 
 # ----------------------------
@@ -587,6 +594,159 @@ def _format_combined_telegram_message(
     return "\n".join(lines)
 
 
+def _generate_arbitrage_table_image(
+    coin: str,
+    opportunities: List[Dict[str, Any]],
+) -> Optional[io.BytesIO]:
+    """
+    Генерирует изображение таблицы с данными арбитража для отправки в Telegram
+    
+    Args:
+        coin: Название монеты
+        opportunities: Список возможностей арбитража
+        
+    Returns:
+        BytesIO объект с изображением или None если PIL недоступен
+    """
+    if not PIL_AVAILABLE:
+        return None
+    
+    if not opportunities:
+        return None
+    
+    try:
+        # Параметры изображения
+        cell_padding = 8
+        cell_height = 35
+        header_height = 40
+        row_height = cell_height + cell_padding * 2
+        border_width = 2
+        
+        # Подготовка данных для таблицы
+        rows = []
+        for opp in opportunities:
+            long_ex = opp["long_ex"]
+            short_ex = opp["short_ex"]
+            long_data = opp.get("long_data")
+            short_data = opp.get("short_data")
+            open_spread_pct = opp["open_spread_pct"]
+            
+            # Получаем funding rates
+            funding_long = long_data.get("funding_rate") if long_data else None
+            funding_short = short_data.get("funding_rate") if short_data else None
+            
+            # Вычисляем funding spread
+            funding_spread = None
+            if funding_long is not None and funding_short is not None:
+                funding_spread = (funding_short - funding_long) * 100
+            
+            # Total spread
+            total_spread = open_spread_pct
+            if funding_spread is not None:
+                total_spread = open_spread_pct + funding_spread
+            
+            # Форматируем значения
+            funding_long_str = f"{funding_long * 100:.2f}" if funding_long is not None else "none"
+            funding_short_str = f"{funding_short * 100:.2f}" if funding_short is not None else "none"
+            funding_spread_str = f"{funding_spread:.2f}" if funding_spread is not None else "none"
+            
+            rows.append({
+                "coin": coin,
+                "long_ex": long_ex,
+                "short_ex": short_ex,
+                "funding_long": funding_long_str,
+                "funding_short": funding_short_str,
+                "pr_spread": f"{open_spread_pct:.5f}",
+                "fr_spread": funding_spread_str,
+                "total_spread": f"{total_spread:.5f}",
+                "ex_spread": f"Long ({long_ex}), Short ({short_ex})",
+            })
+        
+        # Определяем ширину колонок
+        col_widths = {
+            "coin": 120,
+            "long_ex": 80,
+            "short_ex": 80,
+            "funding_long": 80,
+            "funding_short": 80,
+            "pr_spread": 100,
+            "fr_spread": 100,
+            "total_spread": 100,
+            "ex_spread": 200,
+        }
+        
+        # Вычисляем общую ширину и высоту
+        total_width = sum(col_widths.values()) + border_width * (len(col_widths) + 1)
+        total_height = header_height + len(rows) * row_height + border_width * 2
+        
+        # Создаем изображение
+        img = Image.new("RGB", (total_width, total_height), color="white")
+        draw = ImageDraw.Draw(img)
+        
+        # Пробуем загрузить шрифт, если не получается - используем default
+        try:
+            font = ImageFont.truetype("arial.ttf", 12)
+            font_bold = ImageFont.truetype("arialbd.ttf", 12)
+        except:
+            try:
+                font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 12)
+                font_bold = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 12)
+            except:
+                font = ImageFont.load_default()
+                font_bold = ImageFont.load_default()
+        
+        # Рисуем заголовок
+        headers = ["coin", "long_ex", "short_ex", "funding_long", "funding_short", "pr_spread", "fr_spread", "total_spread", "ex_spread"]
+        header_labels = ["coin", "Long", "Short", "fr_long", "fr_short", "pr_spread", "fr_spread", "total_spread", "ex_spread"]
+        
+        x = border_width
+        y = border_width
+        
+        # Фон заголовка
+        draw.rectangle([x, y, total_width - border_width, y + header_height], fill="#e0e0e0", outline="#000000", width=border_width)
+        
+        # Текст заголовка
+        for i, header in enumerate(headers):
+            label = header_labels[i]
+            width = col_widths[header]
+            text_x = x + cell_padding
+            text_y = y + (header_height - 20) // 2
+            draw.text((text_x, text_y), label, fill="black", font=font_bold)
+            x += width
+        
+        # Рисуем строки данных
+        y = border_width + header_height
+        for row_idx, row in enumerate(rows):
+            x = border_width
+            row_y = y + row_idx * row_height
+            
+            # Фон строки (чередование цветов)
+            if row_idx % 2 == 0:
+                draw.rectangle([x, row_y, total_width - border_width, row_y + row_height], fill="#f5f5f5", outline="#000000", width=1)
+            else:
+                draw.rectangle([x, row_y, total_width - border_width, row_y + row_height], fill="white", outline="#000000", width=1)
+            
+            # Текст данных
+            for header in headers:
+                width = col_widths[header]
+                value = str(row.get(header, ""))
+                text_x = x + cell_padding
+                text_y = row_y + cell_padding
+                draw.text((text_x, text_y), value, fill="black", font=font)
+                x += width
+        
+        # Конвертируем в BytesIO
+        img_bytes = io.BytesIO()
+        img.save(img_bytes, format="PNG")
+        img_bytes.seek(0)
+        
+        return img_bytes
+        
+    except Exception as e:
+        logger.error(f"Ошибка генерации изображения таблицы для {coin}: {e}", exc_info=True)
+        return None
+
+
 async def collect_coins_by_exchange(bot: PerpArbitrageBot, exchanges: List[str]) -> Dict[str, Set[str]]:
     """
     Собирает карту монет для каждой биржи.
@@ -695,13 +855,38 @@ async def process_coin(
                 if telegram.enabled:
                     channel_id = telegram._get_channel_id()
                     if channel_id:
-                        # Формируем объединенное сообщение
-                        telegram_message = _format_combined_telegram_message(
-                            coin=coin,
-                            opportunities=opportunities,
-                        )
-                        await telegram.send_message(telegram_message, channel_id=channel_id)
-                        logger.debug(f"📱 Отправлено объединенное сообщение в Telegram для {coin} ({len(opportunities)} opportunities, режим: {config.ENV_MODE})")
+                        # Пробуем отправить изображение таблицы (если доступно)
+                        if PIL_AVAILABLE:
+                            table_image = _generate_arbitrage_table_image(coin=coin, opportunities=opportunities)
+                            if table_image:
+                                caption = f'🔔 <b>Signal: {coin}</b> (Liq: {SCAN_COIN_INVEST:.1f} USDT)'
+                                success = await telegram.send_photo(table_image, caption=caption, channel_id=channel_id)
+                                if success:
+                                    logger.debug(f"📱 Отправлено изображение таблицы в Telegram для {coin} ({len(opportunities)} opportunities, режим: {config.ENV_MODE})")
+                                else:
+                                    # Fallback на текстовое сообщение, если изображение не отправилось
+                                    telegram_message = _format_combined_telegram_message(
+                                        coin=coin,
+                                        opportunities=opportunities,
+                                    )
+                                    await telegram.send_message(telegram_message, channel_id=channel_id)
+                                    logger.debug(f"📱 Отправлено текстовое сообщение (fallback) в Telegram для {coin} ({len(opportunities)} opportunities, режим: {config.ENV_MODE})")
+                            else:
+                                # Если не удалось сгенерировать изображение - отправляем текст
+                                telegram_message = _format_combined_telegram_message(
+                                    coin=coin,
+                                    opportunities=opportunities,
+                                )
+                                await telegram.send_message(telegram_message, channel_id=channel_id)
+                                logger.debug(f"📱 Отправлено текстовое сообщение в Telegram для {coin} ({len(opportunities)} opportunities, режим: {config.ENV_MODE})")
+                        else:
+                            # Если PIL недоступен - отправляем текстовое сообщение
+                            telegram_message = _format_combined_telegram_message(
+                                coin=coin,
+                                opportunities=opportunities,
+                            )
+                            await telegram.send_message(telegram_message, channel_id=channel_id)
+                            logger.debug(f"📱 Отправлено текстовое сообщение в Telegram для {coin} ({len(opportunities)} opportunities, режим: {config.ENV_MODE})")
                     else:
                         logger.warning(f"📱 Telegram включен, но канал не настроен для режима {config.ENV_MODE}")
             except Exception as e:
