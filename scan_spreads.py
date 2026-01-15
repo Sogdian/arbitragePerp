@@ -96,7 +96,8 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("bot").setLevel(logging.CRITICAL)
 logging.getLogger("news_monitor").setLevel(logging.CRITICAL)
 logging.getLogger("announcements_monitor").setLevel(logging.CRITICAL)
-logging.getLogger("x_news_monitor").setLevel(logging.CRITICAL)
+# x_news_monitor: разрешаем WARNING/ERROR для сообщений о лимитах API
+logging.getLogger("x_news_monitor").setLevel(logging.WARNING)
 logging.getLogger("exchanges").setLevel(logging.CRITICAL)
 
 

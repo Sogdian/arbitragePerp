@@ -126,10 +126,73 @@ class XNewsMonitor:
             async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
                 r = await client.get(self.API_URL, headers=headers, params=params)
             if r.status_code != 200:
-                # Keep this quiet for scanners; the caller can decide logger level.
-                logger.debug(f"X search failed: status={r.status_code} body={(r.text or '')[:250]}")
+                # Обработка превышения лимита API (429 Too Many Requests)
+                if r.status_code == 429:
+                    # Извлекаем информацию о лимитах из заголовков
+                    limit_total = r.headers.get("x-rate-limit-limit", "N/A")
+                    limit_remaining = r.headers.get("x-rate-limit-remaining", "0")
+                    limit_reset = r.headers.get("x-rate-limit-reset", "N/A")
+                    
+                    # Пытаемся вычислить время сброса лимита
+                    reset_info = "N/A"
+                    if limit_reset != "N/A":
+                        try:
+                            reset_timestamp = int(limit_reset)
+                            reset_dt = datetime.fromtimestamp(reset_timestamp, tz=timezone.utc)
+                            now_utc = datetime.now(timezone.utc)
+                            wait_seconds = int((reset_dt - now_utc).total_seconds())
+                            if wait_seconds > 0:
+                                wait_minutes = wait_seconds // 60
+                                reset_info = f"{reset_dt.strftime('%Y-%m-%d %H:%M:%S')} UTC (через {wait_minutes} мин)"
+                            else:
+                                reset_info = f"{reset_dt.strftime('%Y-%m-%d %H:%M:%S')} UTC (скоро)"
+                        except (ValueError, OSError):
+                            reset_info = limit_reset
+                    
+                    logger.warning(
+                        f"⚠️ X API: превышен лимит запросов (429). "
+                        f"Лимит: {limit_total}, осталось: {limit_remaining}, сброс: {reset_info}. "
+                        f"Запросы к X API будут пропущены до сброса лимита."
+                    )
+                elif r.status_code == 403:
+                    # 403 Forbidden - может быть связано с лимитами или доступом
+                    error_body = (r.text or "")[:250]
+                    logger.warning(
+                        f"⚠️ X API: доступ запрещен (403). "
+                        f"Возможно, превышен лимит или проблемы с токеном. "
+                        f"Ответ: {error_body}"
+                    )
+                elif r.status_code == 503:
+                    # 503 Service Unavailable - временная перегрузка
+                    logger.warning(
+                        f"⚠️ X API: сервис временно недоступен (503). "
+                        f"Возможно, временная перегрузка. Повторите запрос позже."
+                    )
+                else:
+                    # Другие ошибки API логируем на уровне debug
+                    logger.debug(f"X search failed: status={r.status_code} body={(r.text or '')[:250]}")
                 items: List[Dict[str, Any]] = []
             else:
+                # Успешный ответ - проверяем лимиты и предупреждаем, если они близки к исчерпанию
+                limit_total_str = r.headers.get("x-rate-limit-limit", "")
+                limit_remaining_str = r.headers.get("x-rate-limit-remaining", "")
+                
+                if limit_total_str and limit_remaining_str:
+                    try:
+                        limit_total = int(limit_total_str)
+                        limit_remaining = int(limit_remaining_str)
+                        
+                        # Предупреждаем, если осталось меньше 10% или меньше 5 запросов
+                        if limit_total > 0:
+                            remaining_percent = (limit_remaining / limit_total) * 100
+                            if remaining_percent < 10.0 or limit_remaining < 5:
+                                logger.warning(
+                                    f"⚠️ X API: лимит запросов близок к исчерпанию. "
+                                    f"Осталось: {limit_remaining}/{limit_total} ({remaining_percent:.1f}%)"
+                                )
+                    except (ValueError, ZeroDivisionError):
+                        pass  # Игнорируем ошибки парсинга
+                
                 payload = r.json() or {}
                 data = payload.get("data") or []
                 includes = payload.get("includes") or {}
