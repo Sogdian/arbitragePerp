@@ -492,10 +492,10 @@ def _format_telegram_message(
     long_url = _get_exchange_url(long_ex, coin)
     lines.append(f'🟢 <b>LONG</b> (<a href="{long_url}">{long_ex_capitalized}</a>)')
     if price_long is not None:
-        lines.append(f'├ Price: <code>{price_long:.4f}</code>')
+        lines.append(f'├ Price: <code>{price_long:.3f}</code>')
     if funding_long is not None:
         funding_long_pct = funding_long * 100
-        lines.append(f'└ Funding: <code>{funding_long_pct:.6f}%</code>')
+        lines.append(f'└ Funding: <code>{funding_long_pct:.3f}%</code>')
     else:
         if price_long is not None:
             lines.append('└ Funding: <code>N/A</code>')
@@ -505,10 +505,10 @@ def _format_telegram_message(
     short_url = _get_exchange_url(short_ex, coin)
     lines.append(f'🔴 <b>SHORT</b> (<a href="{short_url}">{short_ex_capitalized}</a>)')
     if price_short is not None:
-        lines.append(f'├ Price: <code>{price_short:.4f}</code>')
+        lines.append(f'├ Price: <code>{price_short:.3f}</code>')
     if funding_short is not None:
         funding_short_pct = funding_short * 100
-        lines.append(f'└ Funding: <code>{funding_short_pct:.6f}%</code>')
+        lines.append(f'└ Funding: <code>{funding_short_pct:.3f}%</code>')
     else:
         if price_short is not None:
             lines.append('└ Funding: <code>N/A</code>')
@@ -517,12 +517,12 @@ def _format_telegram_message(
     
     # Спреды
     lines.append('<b>📊 Spreads:</b>')
-    lines.append(f'• Price Spread: <b>{open_spread_pct:.4f}%</b>')
+    lines.append(f'• Price Spread: <b>{open_spread_pct:.3f}%</b>')
     
     # Спред на фандинги с порогами
     if funding_long is not None and funding_short is not None:
         funding_spread = (funding_short - funding_long) * 100
-        lines.append(f'• Funding Spread: <b>{funding_spread:.6f}%</b> (open ≥ 0.18% | close ≤ 0.05%)')
+        lines.append(f'• Funding Spread: <b>{funding_spread:.3f}%</b> (open ≥ 0.18% | close ≤ 0.05%)')
     
     lines.append("")
     
