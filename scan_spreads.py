@@ -104,8 +104,12 @@ logging.getLogger("exchanges").setLevel(logging.CRITICAL)
 # ----------------------------
 # News cache (only for scan_spreads)
 # ----------------------------
-# key=(coin,long_ex,short_ex) -> (expires_at_monotonic, delisting_news, security_news)
-_news_cache: Dict[Tuple[str, str, str], Tuple[float, List[Dict[str, Any]], List[Dict[str, Any]]]] = {}
+# ВАЖНО: кешируем по (coin, exchange), а не по паре бирж.
+# Это позволяет переиспользовать результаты при появлении новых комбинаций:
+# - сначала посчитали (BTC, bybit) и (BTC, binance)
+# - затем для пары (BTC, bybit, gate) докачиваем только (BTC, gate)
+# key=(coin, ex) -> (expires_at_monotonic, delisting_news, security_news)
+_news_cache: Dict[Tuple[str, str], Tuple[float, List[Dict[str, Any]], List[Dict[str, Any]]]] = {}
 
 
 @contextlib.contextmanager
@@ -212,80 +216,81 @@ async def _get_news_cached(
     days_back: int = 60,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], bool]:
     """
-    Возвращает (delisting_news, security_news, cached) для ключа (coin,long,short).
+    Возвращает (delisting_news, security_news, cached) для пары бирж,
+    используя кеш на уровне (coin, exchange).
     TTL по умолчанию 3 минуты.
     """
-    key = (coin, long_ex, short_ex)
     now_m = time.monotonic()
-    cached = _news_cache.get(key)
-    if cached and cached[0] > now_m:
-        return cached[1], cached[2], True
-
-    # Один сетевой проход: достаём announcements один раз и прогоняем 2 фильтра.
-    # ВАЖНО: внутренние методы могут логировать; логгеры заглушены (см. выше).
-    anns = await bot.news_monitor._fetch_exchange_announcements(
-        limit=200,
-        days_back=days_back,
-        exchanges=[long_ex, short_ex],
-    )
     now_utc = datetime.now(timezone.utc)
     lookback = now_utc - timedelta(days=days_back, hours=6) if days_back > 0 else None
 
-    delisting_news = await bot.news_monitor.find_delisting_news(anns, coin_symbol=coin, lookback=lookback)
-    # X (Twitter) delisting (optional)
-    x_delisting_news: List[Dict[str, Any]] = []
-    if getattr(bot, "x_news_monitor", None) is not None and bot.x_news_monitor.enabled:
-        try:
-            x_delisting_news = await bot.x_news_monitor.find_delisting_news(
-                coin_symbol=coin,
-                exchanges=[long_ex, short_ex],
-                lookback=lookback,
-            )
-        except Exception:
-            x_delisting_news = []
-
-    if x_delisting_news:
-        # merge + dedupe (by url/title)
+    def _merge_dedupe(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         seen = set()
-        merged: List[Dict[str, Any]] = []
-        for it in (delisting_news or []) + x_delisting_news:
+        out: List[Dict[str, Any]] = []
+        for it in items or []:
             url = str(it.get("url") or "").strip()
             key = url or (str(it.get("title") or "").strip()[:200])
             if not key or key in seen:
                 continue
             seen.add(key)
-            merged.append(it)
-        delisting_news = merged
+            out.append(it)
+        return out
 
-    security_news: List[Dict[str, Any]] = []
-    # Как в bot.py: security проверяем только если делистинг не найден (экономим запросы/шум).
-    if not delisting_news:
-        security_news = await bot.announcements_monitor.find_security_news(anns, coin_symbol=coin, lookback=lookback)
-        # X (Twitter) security (optional)
-        x_security_news: List[Dict[str, Any]] = []
-        if getattr(bot, "x_news_monitor", None) is not None and bot.x_news_monitor.enabled:
+    async def _get_exchange_news(ex: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], bool]:
+        k = (coin, ex)
+        cached = _news_cache.get(k)
+        if cached and cached[0] > now_m:
+            return cached[1], cached[2], True
+
+        # Один сетевой проход на биржу: announcements для конкретной биржи
+        anns = await bot.news_monitor._fetch_exchange_announcements(
+            limit=200,
+            days_back=days_back,
+            exchanges=[ex],
+        )
+
+        delisting_news = await bot.news_monitor.find_delisting_news(anns, coin_symbol=coin, lookback=lookback)
+
+        # X (optional): дергаем только если по официальным announcements ничего не нашли
+        if (not delisting_news) and getattr(bot, "x_news_monitor", None) is not None and bot.x_news_monitor.enabled:
             try:
-                x_security_news = await bot.x_news_monitor.find_security_news(
+                x_del = await bot.x_news_monitor.find_delisting_news(
                     coin_symbol=coin,
-                    exchanges=[long_ex, short_ex],
+                    exchanges=[ex],
                     lookback=lookback,
                 )
+                if x_del:
+                    delisting_news = _merge_dedupe((delisting_news or []) + x_del)
             except Exception:
-                x_security_news = []
-        if x_security_news:
-            seen2 = set()
-            merged2: List[Dict[str, Any]] = []
-            for it in (security_news or []) + x_security_news:
-                url = str(it.get("url") or "").strip()
-                key = url or (str(it.get("title") or "").strip()[:200])
-                if not key or key in seen2:
-                    continue
-                seen2.add(key)
-                merged2.append(it)
-            security_news = merged2
+                pass
 
-    _news_cache[key] = (now_m + NEWS_CACHE_TTL_SEC, delisting_news, security_news)
-    return delisting_news, security_news, False
+        security_news: List[Dict[str, Any]] = []
+        # Security проверяем только если делистинг не найден (экономим запросы/шум).
+        if not delisting_news:
+            security_news = await bot.announcements_monitor.find_security_news(anns, coin_symbol=coin, lookback=lookback)
+            # X (optional): дергаем только если security по announcements не нашли
+            if (not security_news) and getattr(bot, "x_news_monitor", None) is not None and bot.x_news_monitor.enabled:
+                try:
+                    x_sec = await bot.x_news_monitor.find_security_news(
+                        coin_symbol=coin,
+                        exchanges=[ex],
+                        lookback=lookback,
+                    )
+                    if x_sec:
+                        security_news = _merge_dedupe((security_news or []) + x_sec)
+                except Exception:
+                    pass
+
+        _news_cache[k] = (now_m + NEWS_CACHE_TTL_SEC, delisting_news, security_news)
+        return delisting_news, security_news, False
+
+    del_long, sec_long, c1 = await _get_exchange_news(long_ex)
+    del_short, sec_short, c2 = await _get_exchange_news(short_ex)
+
+    delisting_news = _merge_dedupe((del_long or []) + (del_short or []))
+    security_news = _merge_dedupe((sec_long or []) + (sec_short or []))
+    cached_any = bool(c1 and c2)
+    return delisting_news, security_news, cached_any
 
 
 async def _analyze_and_log_opportunity(

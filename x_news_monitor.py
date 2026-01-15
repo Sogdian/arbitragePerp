@@ -64,7 +64,7 @@ class XNewsMonitor:
 
     Env:
     - X_BEARER_TOKEN: required to enable
-    - X_NEWS_CACHE_TTL_SEC: cache TTL per query (default 180)
+    - X_NEWS_CACHE_TTL_SEC: cache TTL per query (default 600)
     - X_NEWS_MAX_RESULTS: max tweets per query (default 25, capped to [10..100])
     """
 
@@ -72,11 +72,14 @@ class XNewsMonitor:
 
     def __init__(self) -> None:
         self.bearer_token = (os.getenv("X_BEARER_TOKEN") or "").strip()
-        self.cache_ttl_sec = float(os.getenv("X_NEWS_CACHE_TTL_SEC", "180"))
+        # Увеличиваем TTL по умолчанию до 10 минут (600 сек) для более эффективного использования лимитов
+        self.cache_ttl_sec = float(os.getenv("X_NEWS_CACHE_TTL_SEC", "600"))
         self.max_results = int(os.getenv("X_NEWS_MAX_RESULTS", "25"))
         self.max_results = max(10, min(100, self.max_results))
         # key -> (expires_monotonic, items)
         self._cache: Dict[Tuple[str, str], Tuple[float, List[Dict[str, Any]]]] = {}
+        # Флаг для отслеживания исчерпания лимита (429)
+        self._rate_limit_reset_at: Optional[float] = None  # monotonic time
 
     @property
     def enabled(self) -> bool:
@@ -104,8 +107,22 @@ class XNewsMonitor:
         if not self.enabled:
             return []
 
-        cache_key = (query, _iso(start_time) if start_time else "")
+        # Проверяем, не исчерпан ли лимит (429)
         now_m = time.monotonic()
+        if self._rate_limit_reset_at is not None and self._rate_limit_reset_at > now_m:
+            # Лимит исчерпан, пропускаем запрос
+            logger.debug(f"X API: пропуск запроса из-за исчерпания лимита (сброс через {int(self._rate_limit_reset_at - now_m)} сек)")
+            return []
+
+        # ВАЖНО: start_time (особенно "now-7d") меняется каждую секунду → кеш по точному ISO почти не попадает.
+        # Поэтому кешируем по "ведру" времени (5 минут), чтобы эффективно экономить лимиты API.
+        start_bucket = ""
+        if start_time is not None:
+            try:
+                start_bucket = str(int(start_time.timestamp()) // 300)  # 5-min buckets
+            except Exception:
+                start_bucket = ""
+        cache_key = (query, start_bucket)
         cached = self._cache.get(cache_key)
         if cached and cached[0] > now_m:
             return cached[1]
@@ -135,6 +152,7 @@ class XNewsMonitor:
                     
                     # Пытаемся вычислить время сброса лимита
                     reset_info = "N/A"
+                    wait_seconds = 0
                     if limit_reset != "N/A":
                         try:
                             reset_timestamp = int(limit_reset)
@@ -148,12 +166,22 @@ class XNewsMonitor:
                                 reset_info = f"{reset_dt.strftime('%Y-%m-%d %H:%M:%S')} UTC (скоро)"
                         except (ValueError, OSError):
                             reset_info = limit_reset
+                            # Если не удалось распарсить, используем консервативное значение (15 минут)
+                            wait_seconds = 900
+                    
+                    # Устанавливаем время сброса лимита (добавляем небольшой запас в 30 секунд)
+                    if wait_seconds > 0:
+                        self._rate_limit_reset_at = now_m + wait_seconds + 30
+                    else:
+                        # Если не удалось определить, используем консервативное значение (15 минут)
+                        self._rate_limit_reset_at = now_m + 900
                     
                     logger.warning(
                         f"⚠️ X API: превышен лимит запросов (429). "
                         f"Лимит: {limit_total}, осталось: {limit_remaining}, сброс: {reset_info}. "
                         f"Запросы к X API будут пропущены до сброса лимита."
                     )
+                    return []  # Возвращаем пустой список, не сохраняем в кеш
                 elif r.status_code == 403:
                     # 403 Forbidden - может быть связано с лимитами или доступом
                     error_body = (r.text or "")[:250]
@@ -168,10 +196,11 @@ class XNewsMonitor:
                         f"⚠️ X API: сервис временно недоступен (503). "
                         f"Возможно, временная перегрузка. Повторите запрос позже."
                     )
+                    return []  # Возвращаем пустой список, не сохраняем в кеш
                 else:
                     # Другие ошибки API логируем на уровне debug
                     logger.debug(f"X search failed: status={r.status_code} body={(r.text or '')[:250]}")
-                items: List[Dict[str, Any]] = []
+                    return []  # Возвращаем пустой список, не сохраняем в кеш
             else:
                 # Успешный ответ - проверяем лимиты и предупреждаем, если они близки к исчерпанию
                 limit_total_str = r.headers.get("x-rate-limit-limit", "")
@@ -244,13 +273,18 @@ class XNewsMonitor:
     ) -> List[Dict[str, Any]]:
         """
         Returns X posts that look like delisting / suspension / removal announcements for the coin.
+        
+        ВАЖНО: для оптимизации лимитов запросы кешируются по монете (без учета exchanges),
+        так как новости о делистинге монеты не зависят от конкретной пары бирж.
         """
         if not self.enabled:
             return []
 
         start_time = _clamp_recent_search_lookback(lookback)
         coin_terms = self._coin_query_terms(coin_symbol)
-        ex_terms = self._exchange_query_terms(exchanges)
+        # ОПТИМИЗАЦИЯ: не включаем exchanges в query для лучшего кеширования
+        # Новости о делистинге монеты обычно не зависят от конкретной биржи
+        # ex_terms = self._exchange_query_terms(exchanges)
 
         delist_terms = (
             "(delist OR delisting OR \"will delist\" OR \"to delist\" OR \"remove\" OR "
@@ -259,8 +293,8 @@ class XNewsMonitor:
         )
 
         parts = [coin_terms, delist_terms]
-        if ex_terms:
-            parts.append(ex_terms)
+        # if ex_terms:
+        #     parts.append(ex_terms)
         query = " ".join(parts) + " -is:retweet"
 
         items = await self._search_recent(query=query, start_time=start_time)
@@ -285,13 +319,18 @@ class XNewsMonitor:
     ) -> List[Dict[str, Any]]:
         """
         Returns X posts that look like security/hack/exploit news for the coin.
+        
+        ВАЖНО: для оптимизации лимитов запросы кешируются по монете (без учета exchanges),
+        так как новости о безопасности монеты не зависят от конкретной пары бирж.
         """
         if not self.enabled:
             return []
 
         start_time = _clamp_recent_search_lookback(lookback)
         coin_terms = self._coin_query_terms(coin_symbol)
-        ex_terms = self._exchange_query_terms(exchanges)
+        # ОПТИМИЗАЦИЯ: не включаем exchanges в query для лучшего кеширования
+        # Новости о безопасности монеты обычно не зависят от конкретной биржи
+        # ex_terms = self._exchange_query_terms(exchanges)
 
         sec_terms = (
             "(security OR hack OR hacked OR exploit OR exploited OR breach OR compromised OR "
@@ -300,8 +339,8 @@ class XNewsMonitor:
         )
 
         parts = [coin_terms, sec_terms]
-        if ex_terms:
-            parts.append(ex_terms)
+        # if ex_terms:
+        #     parts.append(ex_terms)
         query = " ".join(parts) + " -is:retweet"
 
         items = await self._search_recent(query=query, start_time=start_time)
