@@ -7,6 +7,7 @@ import os
 import re
 import sys
 import time
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, List, Any
 from exchanges.async_bybit import AsyncBybitExchange
 from exchanges.async_gate import AsyncGateExchange
@@ -20,6 +21,7 @@ from exchanges.async_bingx import AsyncBingxExchange
 from input_parser import parse_input
 from news_monitor import NewsMonitor
 from announcements_monitor import AnnouncementsMonitor
+from x_news_monitor import XNewsMonitor
 from telegram_sender import TelegramSender
 import config
 
@@ -65,6 +67,7 @@ class PerpArbitrageBot:
         }
         self.news_monitor = NewsMonitor()
         self.announcements_monitor = AnnouncementsMonitor(news_monitor=self.news_monitor)
+        self.x_news_monitor = XNewsMonitor()
     
     async def close(self):
         """Закрывает соединения с биржами"""
@@ -440,7 +443,37 @@ class PerpArbitrageBot:
                 logger.warning(f"Укажите биржи для проверки делистинга {coin}")
                 return
             
+            # 1) Exchange announcements (existing)
             delisting_news = await self.news_monitor.check_delisting(coin, exchanges=exchanges, days_back=days_back)
+
+            # 2) X(Twitter) (optional)
+            now_utc = datetime.now(timezone.utc)
+            lookback = now_utc - timedelta(days=days_back, hours=6) if days_back > 0 else None
+            x_delisting_news: List[Dict[str, Any]] = []
+            if getattr(self, "x_news_monitor", None) is not None and self.x_news_monitor.enabled:
+                x_delisting_news = await self.x_news_monitor.find_delisting_news(
+                    coin_symbol=coin,
+                    exchanges=exchanges,
+                    lookback=lookback,
+                )
+                # Логируем найденные X-делистинги (в отличие от exchange announcements, они иначе не логируются)
+                for n in x_delisting_news[:5]:
+                    title = (n.get("title") or "")[:120]
+                    url = n.get("url") or "N/A"
+                    logger.warning(f"⚠️ X delisting {coin}: {title} | URL: {url}")
+
+            # Dedupe by URL/title
+            if x_delisting_news:
+                seen = set()
+                merged: List[Dict[str, Any]] = []
+                for it in (delisting_news or []) + x_delisting_news:
+                    url = str(it.get("url") or "").strip()
+                    key = url or (str(it.get("title") or "").strip()[:200])
+                    if not key or key in seen:
+                        continue
+                    seen.add(key)
+                    merged.append(it)
+                delisting_news = merged
             
             # Формируем строку с биржами для вывода
             exchanges_str = ", ".join(exchanges)
@@ -454,6 +487,30 @@ class PerpArbitrageBot:
                     exchanges=exchanges,
                     days_back=days_back,
                 )
+                # X security (optional) — добавляем к exchange-security
+                x_security_news: List[Dict[str, Any]] = []
+                if getattr(self, "x_news_monitor", None) is not None and self.x_news_monitor.enabled:
+                    x_security_news = await self.x_news_monitor.find_security_news(
+                        coin_symbol=coin,
+                        exchanges=exchanges,
+                        lookback=lookback,
+                    )
+                    for n in x_security_news[:5]:
+                        title = (n.get("title") or "")[:120]
+                        url = n.get("url") or "N/A"
+                        logger.warning(f"⚠️ X security {coin}: {title} | URL: {url}")
+
+                if x_security_news:
+                    seen2 = set()
+                    merged2: List[Dict[str, Any]] = []
+                    for it in (security_news or []) + x_security_news:
+                        url = str(it.get("url") or "").strip()
+                        key = url or (str(it.get("title") or "").strip()[:200])
+                        if not key or key in seen2:
+                            continue
+                        seen2.add(key)
+                        merged2.append(it)
+                    security_news = merged2
                 if not security_news:
                     logger.info(
                         f"✓ Новостей о взломах/безопасности {coin} ({exchanges_str}) за последние {days_back} дней не найдено"

@@ -96,6 +96,7 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("bot").setLevel(logging.CRITICAL)
 logging.getLogger("news_monitor").setLevel(logging.CRITICAL)
 logging.getLogger("announcements_monitor").setLevel(logging.CRITICAL)
+logging.getLogger("x_news_monitor").setLevel(logging.CRITICAL)
 logging.getLogger("exchanges").setLevel(logging.CRITICAL)
 
 
@@ -230,10 +231,57 @@ async def _get_news_cached(
     lookback = now_utc - timedelta(days=days_back, hours=6) if days_back > 0 else None
 
     delisting_news = await bot.news_monitor.find_delisting_news(anns, coin_symbol=coin, lookback=lookback)
+    # X (Twitter) delisting (optional)
+    x_delisting_news: List[Dict[str, Any]] = []
+    if getattr(bot, "x_news_monitor", None) is not None and bot.x_news_monitor.enabled:
+        try:
+            x_delisting_news = await bot.x_news_monitor.find_delisting_news(
+                coin_symbol=coin,
+                exchanges=[long_ex, short_ex],
+                lookback=lookback,
+            )
+        except Exception:
+            x_delisting_news = []
+
+    if x_delisting_news:
+        # merge + dedupe (by url/title)
+        seen = set()
+        merged: List[Dict[str, Any]] = []
+        for it in (delisting_news or []) + x_delisting_news:
+            url = str(it.get("url") or "").strip()
+            key = url or (str(it.get("title") or "").strip()[:200])
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            merged.append(it)
+        delisting_news = merged
+
     security_news: List[Dict[str, Any]] = []
     # Как в bot.py: security проверяем только если делистинг не найден (экономим запросы/шум).
     if not delisting_news:
         security_news = await bot.announcements_monitor.find_security_news(anns, coin_symbol=coin, lookback=lookback)
+        # X (Twitter) security (optional)
+        x_security_news: List[Dict[str, Any]] = []
+        if getattr(bot, "x_news_monitor", None) is not None and bot.x_news_monitor.enabled:
+            try:
+                x_security_news = await bot.x_news_monitor.find_security_news(
+                    coin_symbol=coin,
+                    exchanges=[long_ex, short_ex],
+                    lookback=lookback,
+                )
+            except Exception:
+                x_security_news = []
+        if x_security_news:
+            seen2 = set()
+            merged2: List[Dict[str, Any]] = []
+            for it in (security_news or []) + x_security_news:
+                url = str(it.get("url") or "").strip()
+                key = url or (str(it.get("title") or "").strip()[:200])
+                if not key or key in seen2:
+                    continue
+                seen2.add(key)
+                merged2.append(it)
+            security_news = merged2
 
     _news_cache[key] = (now_m + NEWS_CACHE_TTL_SEC, delisting_news, security_news)
     return delisting_news, security_news, False
