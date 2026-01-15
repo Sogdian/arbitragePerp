@@ -125,8 +125,21 @@ async def fetch_mexc_coins(exchange) -> Set[str]:
             state = str(it.get("state", ""))
             if state in ("3", "4", "5"):  # если знаешь точно неактивные
                 continue
-            
-            coins.add(sym.replace("_USDT", "").upper())
+
+            # ВАЖНО (MEXC): у некоторых контрактов "отображаемое" имя (UI) не совпадает с API symbol.
+            # Пример: UI FUNUSDT соответствует API symbol SPORTFUN_USDT, а API symbol FUN_USDT — это FUNTOKEN.
+            # Поэтому, если есть displayName вида "{COIN}_USDT..." — используем его для имени монеты.
+            disp = it.get("displayName") or it.get("display_name") or it.get("displayNameEn") or it.get("display_name_en")
+            coin_from_disp = None
+            if isinstance(disp, str):
+                up = disp.upper()
+                idx = up.find("_USDT")
+                if idx > 0:
+                    coin_from_disp = up[:idx].strip()
+                    # небольшая нормализация (убираем пробелы/мусорные символы)
+                    coin_from_disp = "".join(ch for ch in coin_from_disp if ch.isalnum())
+
+            coins.add((coin_from_disp or sym.replace("_USDT", "")).upper())
         
         return coins
     except Exception as e:

@@ -32,8 +32,22 @@ class AsyncMexcExchange(AsyncBaseExchange):
         super().__init__("MEXC", pool_limit)
 
     def _normalize_symbol(self, coin: str) -> str:
-        """MEXC perpetual обычно использует формат COIN_USDT"""
-        return f"{coin.upper()}_USDT"
+        """
+        MEXC perpetual обычно использует формат COIN_USDT, но иногда у MEXC есть алиасы,
+        когда "отображаемый" тикер (как в UI) не совпадает с API symbol.
+
+        Пример:
+        - UI: FUNUSDT (монета FUN, цена ~0.07)
+        - API symbol: SPORTFUN_USDT
+        - При этом API symbol FUN_USDT — это другой контракт (FUNTOKEN_USDT) с другой ценой (~0.002)
+        """
+        c = coin.upper()
+        # Хардкод алиасов для известных коллизий/переименований на MEXC
+        aliases = {
+            "FUN": "SPORTFUN_USDT",      # UI FUNUSDT -> API SPORTFUN_USDT
+            "FUNTOKEN": "FUN_USDT",      # UI FUNTOKENUSDT -> API FUN_USDT
+        }
+        return aliases.get(c, f"{c}_USDT")
 
     def _canon(self, sym: str) -> str:
         """GPS_USDT, GPS-USDT, GPSUSDT -> GPSUSDT"""
@@ -160,11 +174,10 @@ class AsyncMexcExchange(AsyncBaseExchange):
         Тикер: GET /api/v1/contract/ticker?symbol=...
         """
         try:
-            c = coin.upper()
             url = "/api/v1/contract/ticker"
 
-            # 1) основной формат COIN_USDT
-            symbol = f"{c}_USDT"
+            # 1) основной формат COIN_USDT (с учетом алиасов)
+            symbol = self._normalize_symbol(coin)
             data = await self._request_json_with_domain_fallback("GET", url, params={"symbol": symbol})
 
             # 2) если ответ странный/ошибочный — пробуем COINUSDT
@@ -172,7 +185,7 @@ class AsyncMexcExchange(AsyncBaseExchange):
             looks_empty = self._looks_empty_top(data)
 
             if (not data) or looks_empty or (code_int is not None and code_int != 0):
-                symbol_fallback = f"{c}USDT"
+                symbol_fallback = symbol.replace("_", "")
                 logger.debug(f"MEXC: ticker fallback symbol {symbol_fallback} for {coin}")
                 data2 = await self._request_json_with_domain_fallback("GET", url, params={"symbol": symbol_fallback})
 
@@ -248,17 +261,15 @@ class AsyncMexcExchange(AsyncBaseExchange):
         GET /api/v1/contract/funding_rate/{symbol}
         """
         try:
-            c = coin.upper()
-
-            # 1) пробуем COIN_USDT
-            symbol1 = f"{c}_USDT"
+            # 1) пробуем COIN_USDT (с учетом алиасов)
+            symbol1 = self._normalize_symbol(coin)
             url1 = f"/api/v1/contract/funding_rate/{symbol1}"
             data = await self._request_json_with_domain_fallback("GET", url1, params=None)
 
             # 2) fallback COINUSDT
             code_int = _to_int(data.get("code")) if isinstance(data, dict) else None
             if not data or (code_int is not None and code_int != 0) or self._looks_empty_top(data):
-                symbol2 = f"{c}USDT"
+                symbol2 = symbol1.replace("_", "")
                 url2 = f"/api/v1/contract/funding_rate/{symbol2}"
                 data = await self._request_json_with_domain_fallback("GET", url2, params=None)
 
@@ -308,11 +319,10 @@ class AsyncMexcExchange(AsyncBaseExchange):
         GET /api/v1/contract/depth/{symbol}?limit=...
         """
         try:
-            c = coin.upper()
             limit_i = max(1, min(int(limit), 200))
 
-            # 1) COIN_USDT
-            symbol1 = f"{c}_USDT"
+            # 1) COIN_USDT (с учетом алиасов)
+            symbol1 = self._normalize_symbol(coin)
             url1 = f"/api/v1/contract/depth/{symbol1}"
             data = await self._request_json_with_domain_fallback(
                 "GET",
@@ -325,7 +335,7 @@ class AsyncMexcExchange(AsyncBaseExchange):
             # 2) fallback COINUSDT
             code_int = _to_int(data.get("code")) if isinstance(data, dict) else None
             if not data or (code_int is not None and code_int != 0) or self._looks_empty_top(data):
-                symbol2 = f"{c}USDT"
+                symbol2 = symbol1.replace("_", "")
                 url2 = f"/api/v1/contract/depth/{symbol2}"
                 data = await self._request_json_with_domain_fallback(
                     "GET",

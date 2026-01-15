@@ -362,33 +362,16 @@ async def _analyze_and_log_opportunity(
             funding_spread_str = f"{funding_spread:.3f}"
 
         # Извлекаем цены для расчета количества монет
-        price_long = None
-        price_short = None
-        if long_data:
-            # Для Long используем ask (цена покупки), если нет - price, если нет - среднее от bid/ask
-            price_long = long_data.get("ask")
-            if price_long is None:
-                price_long = long_data.get("price")
-            if price_long is None:
-                bid_long = long_data.get("bid")
-                ask_long = long_data.get("ask")
-                if bid_long is not None and ask_long is not None:
-                    price_long = (bid_long + ask_long) / 2.0
-        
-        if short_data:
-            # Для Short используем bid (цена продажи), если нет - price, если нет - среднее от bid/ask
-            price_short = short_data.get("bid")
-            if price_short is None:
-                price_short = short_data.get("price")
-            if price_short is None:
-                bid_short = short_data.get("bid")
-                ask_short = short_data.get("ask")
-                if bid_short is not None and ask_short is not None:
-                    price_short = (bid_short + ask_short) / 2.0
+        # ВАЖНО: используем ТОЧНО те же цены, что и для расчета спреда (ask_long и bid_short)
+        # чтобы количество монет соответствовало реальному спреду
+        # НЕ используем fallback на price, так как это может привести к несоответствию со спредом
+        price_long = long_data.get("ask") if long_data else None
+        price_short = short_data.get("bid") if short_data else None
 
         verdict = "✅ арбитражить" if ok else "❌ не арбитражить"
         
         # Вычисляем количество монет для каждой биржи (если вердикт "✅ арбитражить")
+        # ВАЖНО: используем те же цены, что и для расчета спреда (ask_long и bid_short)
         coins_info = ""
         if ok and price_long is not None and price_short is not None and price_long > 0 and price_short > 0:
             coins_long = SCAN_COIN_INVEST / price_long
@@ -683,7 +666,10 @@ def _generate_arbitrage_table_image(
             # Получаем цены
             price_long = None
             if long_data:
-                price_long = long_data.get("price")
+                # Для pr_long показываем цену входа в Long: покупка по ask
+                price_long = long_data.get("ask")
+                if price_long is None:
+                    price_long = long_data.get("price")
                 if price_long is None:
                     bid_long = long_data.get("bid")
                     ask_long = long_data.get("ask")
@@ -692,7 +678,10 @@ def _generate_arbitrage_table_image(
             
             price_short = None
             if short_data:
-                price_short = short_data.get("price")
+                # Для pr_short показываем цену входа в Short: продажа по bid
+                price_short = short_data.get("bid")
+                if price_short is None:
+                    price_short = short_data.get("price")
                 if price_short is None:
                     bid_short = short_data.get("bid")
                     ask_short = short_data.get("ask")
