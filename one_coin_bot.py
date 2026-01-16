@@ -344,11 +344,17 @@ async def _analyze_pair_line(
     # Базовая строка (всегда)
     price_spread_str = f"{open_spread_pct:.3f}%" if open_spread_pct is not None else "N/A"
     funding_spread_str = f"{funding_spread_pct:.3f}%" if funding_spread_pct is not None else "N/A"
+    
+    # Вычисляем общий спред (спред на цену + спред на фандинги)
+    total_spread_pct = None
+    if open_spread_pct is not None and funding_spread_pct is not None:
+        total_spread_pct = open_spread_pct + funding_spread_pct
+    total_spread_str = f"{total_spread_pct:.3f}%" if total_spread_pct is not None else "N/A"
 
     base_line = (
         f"📈 Long {long_ex} Ц/Ф: {_fmt_price(price_long)} / {_fmt_pct(funding_long_pct)} | "
         f"📉 Short {short_ex} Ц/Ф: {_fmt_price(price_short)} / {_fmt_pct(funding_short_pct)} | "
-        f"📊 Спред Ц/Ф: {price_spread_str} / {funding_spread_str}"
+        f"📊 Спред Ц/Ф/О: {price_spread_str} / {funding_spread_str} / {total_spread_str}"
     )
 
     # Если в логе есть N/A — вердикт не выводим

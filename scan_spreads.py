@@ -305,7 +305,7 @@ async def _analyze_and_log_opportunity(
 ) -> Optional[Dict[str, Any]]:
     """
     Считает "как bot.py" (ликвидность + новости), но НЕ печатает подробные логи.
-    В логи попадает только 1 строка: "💰 ... spread ... ✓/✗".
+    В логи попадает только 1 строка: "💰 ... spread ... ✅/❌".
     Использует только переданные данные (без дополнительных запросов).
     """
     async with analysis_sem:
@@ -361,10 +361,16 @@ async def _analyze_and_log_opportunity(
         funding_short = short_data.get("funding_rate") if short_data else None
         
         # Вычисляем funding spread, если оба доступны
+        funding_spread = None
         funding_spread_str = "N/A"
         if funding_long is not None and funding_short is not None:
             funding_spread = (funding_short - funding_long) * 100
-            funding_spread_str = f"{funding_spread:.3f}"
+            funding_spread_str = f"{funding_spread:.3f}%"
+        
+        # Вычисляем общий спред (спред на цену + спред на фандинги)
+        total_spread = open_spread_pct
+        if funding_spread is not None:
+            total_spread = open_spread_pct + funding_spread
 
         # Извлекаем цены для расчета количества монет
         # ВАЖНО: используем ТОЧНО те же цены, что и для расчета спреда (ask_long и bid_short)
@@ -410,7 +416,8 @@ async def _analyze_and_log_opportunity(
         else:
             reasons_str = ""
         
-        log_message = f"💰 {coin} Long ({long_ex}), Short ({short_ex}) spread {open_spread_pct:.3f}% | fund {funding_spread_str} {verdict}{coins_info}{reasons_str}"
+        log_message = f"💰 {coin} Long ({long_ex}), Short ({short_ex}) Спред на цену: {open_spread_pct:.3f}% | Фандинг: {funding_spread_str} | Спред общий: {total_spread:.3f}% {verdict}{coins_info}{reasons_str}"
+        
         logger.info(log_message)
         
         # Возвращаем данные о найденной возможности, если вердикт "✅ арбитражить"

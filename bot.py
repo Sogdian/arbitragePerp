@@ -215,9 +215,11 @@ class PerpArbitrageBot:
         short_exchange = parsed["short_exchange"]
         notional_usdt = parsed.get("notional_usdt")
         
+        # Если размер не указан, используем SCAN_COIN_INVEST из переменных окружения
         if notional_usdt is None:
-            logger.error("Размер инвестиций не указан. Формат: 'монета Long (биржа), Short (биржа) размер'")
-            return None
+            SCAN_COIN_INVEST = float(os.getenv("SCAN_COIN_INVEST", "50"))
+            notional_usdt = SCAN_COIN_INVEST
+            logger.info(f"Размер инвестиций не указан, используется SCAN_COIN_INVEST={notional_usdt} USDT")
         
         # Получаем данные с обеих бирж параллельно
         long_data_task = self.get_futures_data(long_exchange, coin)
@@ -776,8 +778,9 @@ async def main():
             input_text = " ".join(filtered_args)
         else:
             # Читаем из stdin
-            print("Введите данные в формате: 'монета Long (биржа), Short (биржа) размер'")
+            print("Введите данные в формате: 'монета Long (биржа), Short (биржа) [размер]'")
             print("Пример: CVC Long (bybit), Short (gate) 100")
+            print("Пример без размера (будет использован SCAN_COIN_INVEST): CVC Long (bybit), Short (gate)")
             input_text = input().strip()
         
         if not input_text:

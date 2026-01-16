@@ -10,8 +10,9 @@ logger = logging.getLogger(__name__)
 
 def parse_input(input_text: str) -> Optional[Dict]:
     """
-    Парсит вводные данные в формате: "монета Long (биржа), Short (биржа) размер"
+    Парсит вводные данные в формате: "монета Long (биржа), Short (биржа) [размер]"
     Пример: "CVC Long (bybit), Short (gate) 100"
+    Пример без размера: "CVC Long (bybit), Short (gate)"
     
     Args:
         input_text: Строка с вводными данными
@@ -22,7 +23,7 @@ def parse_input(input_text: str) -> Optional[Dict]:
             "coin": str,           # Название монеты (например, "CVC")
             "long_exchange": str,  # Биржа для Long позиции (например, "bybit")
             "short_exchange": str, # Биржа для Short позиции (например, "gate")
-            "notional_usdt": float # Размер инвестиций в USDT (например, 100.0)
+            "notional_usdt": float | None # Размер инвестиций в USDT (например, 100.0) или None если не указан
         }
         или None если ошибка парсинга
     """
@@ -33,32 +34,35 @@ def parse_input(input_text: str) -> Optional[Dict]:
     # Нормализуем строку: убираем лишние пробелы
     normalized = input_text.strip()
     
-    # Паттерн для поиска: монета, затем Long (биржа), затем Short (биржа), затем размер инвестиций
+    # Паттерн для поиска: монета, затем Long (биржа), затем Short (биржа), затем опционально размер инвестиций
     # Примеры:
     # "CVC Long (bybit), Short (gate) 100"
     # "BTC Long (bybit), Short (gate) 50"
     # "ETH Long (gate), Short (bybit) 150"
+    # "CVC Long (bybit), Short (gate)" - без размера
     
-    pattern = r'^(\w+)\s+Long\s*\((\w+)\)\s*,\s*Short\s*\((\w+)\)\s+(\d+(?:\.\d+)?)$'
+    pattern = r'^(\w+)\s+Long\s*\((\w+)\)\s*,\s*Short\s*\((\w+)\)(?:\s+(\d+(?:\.\d+)?))?$'
     match = re.match(pattern, normalized, re.IGNORECASE)
     
     if not match:
-        logger.error(f"Неверный формат ввода: {input_text}. Ожидается: 'монета Long (биржа), Short (биржа) размер' (размер обязателен)")
+        logger.error(f"Неверный формат ввода: {input_text}. Ожидается: 'монета Long (биржа), Short (биржа) [размер]'")
         return None
     
     coin = match.group(1).upper()
     long_exchange = match.group(2).lower()
     short_exchange = match.group(3).lower()
     
-    # Извлекаем размер инвестиций
-    try:
-        notional_usdt = float(match.group(4))
-        if notional_usdt <= 0:
-            logger.error(f"Размер инвестиций должен быть положительным числом, получено: {notional_usdt}")
+    # Извлекаем размер инвестиций (опционально)
+    notional_usdt = None
+    if match.group(4):
+        try:
+            notional_usdt = float(match.group(4))
+            if notional_usdt <= 0:
+                logger.error(f"Размер инвестиций должен быть положительным числом, получено: {notional_usdt}")
+                return None
+        except (ValueError, IndexError):
+            logger.error(f"Не удалось распарсить размер инвестиций из: {input_text}")
             return None
-    except (ValueError, IndexError):
-        logger.error(f"Не удалось распарсить размер инвестиций из: {input_text}")
-        return None
     
     # Проверяем, что биржи поддерживаются
     # LBank временно отключен для арбитража (код не удален)
