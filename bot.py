@@ -681,7 +681,7 @@ class PerpArbitrageBot:
                     coin_str = coin
                     
                     # Выводим одной строкой
-                    logger.info(f"{closing_str} | {opening_str} | 💰 fr_spread: {fr_spread_str} | 🎯 total_spread: {total_spread_str}⚙️  {long_ex_str} | {short_ex_str} | {coin_str}")
+                    logger.info(f"{closing_str} | {opening_str} | 💰 fr_spread: {fr_spread_str} | 🎯 total_spread: {total_spread_str} ⚙️  {long_ex_str} | {short_ex_str} | {coin_str}")
                     
                     # Проверяем порог закрытия и отправляем сообщение в Telegram
                     # Для отрицательных порогов: отправляем, когда спред становится хуже (меньше) порога
