@@ -24,6 +24,7 @@ from announcements_monitor import AnnouncementsMonitor
 from x_news_monitor import XNewsMonitor
 from telegram_sender import TelegramSender
 import config
+from position_opener import open_long_short_positions
 
 # Настройка логирования
 logging.basicConfig(
@@ -356,11 +357,12 @@ class PerpArbitrageBot:
         # Проверяем делистинг на обеих биржах
         await self.check_delisting_for_coin(coin, exchanges=[long_exchange, short_exchange])
         
-        # Сохраняем данные для мониторинга
+        # Сохраняем данные для мониторинга/трейдинга
         return {
             "coin": coin,
             "long_exchange": long_exchange,
             "short_exchange": short_exchange,
+            "notional_usdt": notional_usdt,
             "long_data": long_data,
             "short_data": short_data
         }
@@ -808,10 +810,18 @@ async def main():
                     answer_lower = answer.lower()
                     should_monitor = answer_lower.startswith("да") or answer_lower.startswith("yes") or answer_lower.startswith("y")
                     
-                    # Заглушка для открытия позиций (пока что)
+                    # Автоматическое открытие позиций (лонг+шорт) по API, затем мониторинг как обычно
                     close_threshold_pct = None
                     if should_monitor:
-                        logger.info("Заглушка: открытие позиций (будет реализовано позже)")
+                        opened_ok = await open_long_short_positions(
+                            bot=bot,
+                            coin=monitoring_data["coin"],
+                            long_exchange=monitoring_data["long_exchange"],
+                            short_exchange=monitoring_data["short_exchange"],
+                            notional_usdt=monitoring_data["notional_usdt"],
+                        )
+                        if not opened_ok:
+                            should_monitor = False
             
             if should_monitor:
                 # Запускаем мониторинг

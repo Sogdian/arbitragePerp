@@ -41,7 +41,8 @@ def parse_input(input_text: str) -> Optional[Dict]:
     # "ETH Long (gate), Short (bybit) 150"
     # "CVC Long (bybit), Short (gate)" - без размера
     
-    pattern = r'^(\w+)\s+Long\s*\((\w+)\)\s*,\s*Short\s*\((\w+)\)(?:\s+(\d+(?:\.\d+)?))?$'
+    # Размер может быть числом ("30", "30.5") или токеном SCAN_COIN_INVEST
+    pattern = r'^(\w+)\s+Long\s*\((\w+)\)\s*,\s*Short\s*\((\w+)\)(?:\s+(\d+(?:\.\d+)?|SCAN_COIN_INVEST))?$'
     match = re.match(pattern, normalized, re.IGNORECASE)
     
     if not match:
@@ -55,14 +56,18 @@ def parse_input(input_text: str) -> Optional[Dict]:
     # Извлекаем размер инвестиций (опционально)
     notional_usdt = None
     if match.group(4):
-        try:
-            notional_usdt = float(match.group(4))
-            if notional_usdt <= 0:
-                logger.error(f"Размер инвестиций должен быть положительным числом, получено: {notional_usdt}")
+        raw_size = str(match.group(4)).strip()
+        if raw_size.upper() == "SCAN_COIN_INVEST":
+            notional_usdt = None  # будет взято из env в bot.py
+        else:
+            try:
+                notional_usdt = float(raw_size)
+                if notional_usdt <= 0:
+                    logger.error(f"Размер инвестиций должен быть положительным числом, получено: {notional_usdt}")
+                    return None
+            except (ValueError, IndexError):
+                logger.error(f"Не удалось распарсить размер инвестиций из: {input_text}")
                 return None
-        except (ValueError, IndexError):
-            logger.error(f"Не удалось распарсить размер инвестиций из: {input_text}")
-            return None
     
     # Проверяем, что биржи поддерживаются
     # LBank временно отключен для арбитража (код не удален)
