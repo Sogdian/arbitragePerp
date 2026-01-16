@@ -214,13 +214,10 @@ class PerpArbitrageBot:
         coin = parsed["coin"]
         long_exchange = parsed["long_exchange"]
         short_exchange = parsed["short_exchange"]
-        notional_usdt = parsed.get("notional_usdt")
-        
-        # Если размер не указан, используем SCAN_COIN_INVEST из переменных окружения
-        if notional_usdt is None:
-            SCAN_COIN_INVEST = float(os.getenv("SCAN_COIN_INVEST", "50"))
-            notional_usdt = SCAN_COIN_INVEST
-            logger.info(f"Размер инвестиций не указан, используется SCAN_COIN_INVEST={notional_usdt} USDT")
+        coin_amount = parsed.get("coin_amount")
+        if coin_amount is None:
+            logger.error("Не указано количество монет (пример: 'DASH Long (bybit), Short (gate) 1')")
+            return
         
         # Получаем данные с обеих бирж параллельно
         long_data_task = self.get_futures_data(long_exchange, coin)
@@ -263,16 +260,9 @@ class PerpArbitrageBot:
             price_long = long_data.get("price")
             funding_long = long_data.get("funding_rate")
             
-            # Вычисляем количество монет, которое можно купить за notional_usdt
-            coins_long = None
-            if price_long is not None and price_long > 0:
-                coins_long = notional_usdt / price_long
-            
             if price_long is not None:
-                if coins_long is not None:
-                    logger.info(f"(Long {long_exchange}) ({coin}) Цена: {price_long:.3f} ({coins_long:.3f} {coin})")
-                else:
-                    logger.info(f"(Long {long_exchange}) ({coin}) Цена: {price_long:.3f}")
+                notional_long = coin_amount * price_long
+                logger.info(f"(Long {long_exchange}) ({coin}) Цена: {price_long:.3f} (qty: {coin_amount:.6f} {coin} | ~{notional_long:.3f} USDT)")
             else:
                 logger.info(f"(Long {long_exchange}) ({coin}) Цена: недоступно")
             
@@ -291,16 +281,9 @@ class PerpArbitrageBot:
             price_short = short_data.get("price")
             funding_short = short_data.get("funding_rate")
             
-            # Вычисляем количество монет, которое можно купить за notional_usdt
-            coins_short = None
-            if price_short is not None and price_short > 0:
-                coins_short = notional_usdt / price_short
-            
             if price_short is not None:
-                if coins_short is not None:
-                    logger.info(f"(Short {short_exchange}) ({coin}) Цена: {price_short:.3f} ({coins_short:.3f} {coin})")
-                else:
-                    logger.info(f"(Short {short_exchange}) ({coin}) Цена: {price_short:.3f}")
+                notional_short = coin_amount * price_short
+                logger.info(f"(Short {short_exchange}) ({coin}) Цена: {price_short:.3f} (qty: {coin_amount:.6f} {coin} | ~{notional_short:.3f} USDT)")
             else:
                 logger.info(f"(Short {short_exchange}) ({coin}) Цена: недоступно")
             
@@ -352,7 +335,17 @@ class PerpArbitrageBot:
         logger.info("=" * 60)
         
         # Проверяем ликвидность на обеих биржах для указанного размера инвестиций
-        await self.check_liquidity_for_coin(coin, long_exchange, short_exchange, notional_usdt)
+        # Оценка в USDT для ликвидности: используем last price как приближение
+        approx_price = None
+        if price_long is not None and price_long > 0:
+            approx_price = price_long
+        elif price_short is not None and price_short > 0:
+            approx_price = price_short
+        approx_notional_usdt = float(coin_amount) * float(approx_price) if approx_price else 0.0
+        if approx_notional_usdt > 0:
+            await self.check_liquidity_for_coin(coin, long_exchange, short_exchange, approx_notional_usdt)
+        else:
+            logger.warning("Не удалось оценить notional в USDT для проверки ликвидности")
         
         # Проверяем делистинг на обеих биржах
         await self.check_delisting_for_coin(coin, exchanges=[long_exchange, short_exchange])
@@ -362,7 +355,7 @@ class PerpArbitrageBot:
             "coin": coin,
             "long_exchange": long_exchange,
             "short_exchange": short_exchange,
-            "notional_usdt": notional_usdt,
+            "coin_amount": coin_amount,
             "long_data": long_data,
             "short_data": short_data
         }
@@ -778,9 +771,8 @@ async def main():
             input_text = " ".join(filtered_args)
         else:
             # Читаем из stdin
-            print("Введите данные в формате: 'монета Long (биржа), Short (биржа) [размер]'")
-            print("Пример: CVC Long (bybit), Short (gate) 100")
-            print("Пример без размера (будет использован SCAN_COIN_INVEST): CVC Long (bybit), Short (gate)")
+            print("Введите данные в формате: 'монета Long (биржа), Short (биржа) количество_монет'")
+            print("Пример: DASH Long (bybit), Short (gate) 1")
             input_text = input().strip()
         
         if not input_text:
@@ -818,7 +810,7 @@ async def main():
                             coin=monitoring_data["coin"],
                             long_exchange=monitoring_data["long_exchange"],
                             short_exchange=monitoring_data["short_exchange"],
-                            notional_usdt=monitoring_data["notional_usdt"],
+                            coin_amount=monitoring_data["coin_amount"],
                         )
                         if not opened_ok:
                             should_monitor = False

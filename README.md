@@ -25,8 +25,7 @@ LOG_LEVEL=INFO
 **Windows/Linux:**
 ```bash
 python scan_spreads.py (тут SCAN_COIN_INVEST)
-python bot.py "CVC Long (bybit), Short (gate) 30" --no-monitor
-python bot.py "CVC Long (bybit), Short (gate)" --no-monitor (тут SCAN_COIN_INVEST)
+python bot.py "CVC Long (bybit), Short (gate) 30" --no-monitor (30 = количество монет CVC)
 python one_coin_bot.py CLO (тут SCAN_COIN_INVEST)
 ```
 
@@ -42,12 +41,12 @@ python3 one_coin_bot.py CLO
 ```bash
 python bot.py
 ```
-Затем введите данные в формате: `монета Long (биржа), Short (биржа)`
+Затем введите данные в формате: `монета Long (биржа), Short (биржа) количество_монет`
 
 ## Формат ввода
 
 ```
-монета Long (биржа), Short (биржа)
+монета Long (биржа), Short (биржа) количество_монет
 ```
 ## Поддерживаемые биржи
 
