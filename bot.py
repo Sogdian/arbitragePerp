@@ -796,9 +796,9 @@ async def main():
             elif monitor_disabled:
                 should_monitor = False
             else:
-                # Спрашиваем про ручное открытие позиций
-                print("\nБыло ли ручное открытие позиций (long и short)?")
-                print("Введите 'Да' или 'Нет': если 'Да', то введите min цену закр, для отправки сообщения в тг")
+                # Спрашиваем про открытие позиций
+                print("\nОткрыть позиции в лонг и шорт?")
+                print("Ведите 'Да' или 'Нет': если 'Да', то позиции будут открыты")
                 # Если запуск не интерактивный — не блокируемся.
                 if not sys.stdin or not sys.stdin.isatty() or os.getenv("BOT_NO_PROMPT") == "1":
                     should_monitor = False
@@ -808,21 +808,10 @@ async def main():
                     answer_lower = answer.lower()
                     should_monitor = answer_lower.startswith("да") or answer_lower.startswith("yes") or answer_lower.startswith("y")
                     
-                    # Парсим порог закрытия из ввода (формат: "Да, 2%" или "Да, 2.5%" или "Да, -1%")
+                    # Заглушка для открытия позиций (пока что)
                     close_threshold_pct = None
                     if should_monitor:
-                        # Ищем паттерн: число (может быть отрицательным) с опциональным знаком процента
-                        # Ищем после запятой или в любом месте строки
-                        match = re.search(r'([-]?\d+\.?\d*)\s*%?', answer)
-                        if match:
-                            try:
-                                close_threshold_pct = float(match.group(1))
-                                logger.info(f"Распарсен порог закрытия: {close_threshold_pct:.2f}% из ввода '{answer}'")
-                            except ValueError:
-                                close_threshold_pct = None
-                                logger.warning(f"Не удалось распарсить порог закрытия из '{answer}', мониторинг без уведомлений")
-                        else:
-                            logger.warning(f"Не найден порог закрытия в '{answer}', мониторинг без уведомлений")
+                        logger.info("Заглушка: открытие позиций (будет реализовано позже)")
             
             if should_monitor:
                 # Запускаем мониторинг
