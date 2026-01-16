@@ -153,13 +153,7 @@ async def open_long_short_positions(
         logger.error("❌ Preflight не пройден, ордера не отправлены")
         return False
 
-    # 2) Настраиваем isolated + leverage=1 до ордеров (если на одной бирже не удалось — не открываем на обеих)
-    if not await _prepare_exchange_for_trading(exchange_name=long_exchange, exchange_obj=long_obj, coin=coin):
-        return False
-    if not await _prepare_exchange_for_trading(exchange_name=short_exchange, exchange_obj=short_obj, coin=coin):
-        return False
-
-    # 3) Выставляем лимитные ордера параллельно
+    # 2) Выставляем лимитные ордера параллельно
     long_task = _place_one_leg(planned=long_plan)
     short_task = _place_one_leg(planned=short_plan)
     long_res, short_res = await _gather2(long_task, short_task)
@@ -167,7 +161,22 @@ async def open_long_short_positions(
     _log_leg_result(long_res)
     _log_leg_result(short_res)
 
-    ok_all = bool(long_res.ok and short_res.ok)
+    # 3) Проверка fill: строго 100% (иначе считаем ошибкой)
+    long_filled_ok = False
+    short_filled_ok = False
+    long_filled_qty = 0.0
+    short_filled_qty = 0.0
+    if long_res.ok and long_res.order_id:
+        long_filled_ok, long_filled_qty = await _check_filled_full(planned=long_plan, order_id=long_res.order_id)
+    if short_res.ok and short_res.order_id:
+        short_filled_ok, short_filled_qty = await _check_filled_full(planned=short_plan, order_id=short_res.order_id)
+
+    if long_res.ok and not long_filled_ok:
+        logger.error(f"❌ Ордер не заполнен полностью: {long_exchange} long | filled={long_filled_qty:.8f} (need {coin_amount:.8f})")
+    if short_res.ok and not short_filled_ok:
+        logger.error(f"❌ Ордер не заполнен полностью: {short_exchange} short | filled={short_filled_qty:.8f} (need {coin_amount:.8f})")
+
+    ok_all = bool(long_res.ok and short_res.ok and long_filled_ok and short_filled_ok)
     if ok_all:
         long_px = float(long_plan.get("limit_price") or 0)
         short_px = float(short_plan.get("limit_price") or 0)
@@ -182,12 +191,12 @@ async def open_long_short_positions(
         )
         logger.info(f"✅ Позиции открыты: {coin} | Long {long_exchange} (order={long_res.order_id}) | Short {short_exchange} (order={short_res.order_id})")
     else:
-        if long_res.ok and not short_res.ok:
+        if (long_res.ok and long_filled_ok) and not (short_res.ok and short_filled_ok):
             logger.error(f"⚠️ Открыта только Long позиция: {coin} | Long ok=True | Short ok=False")
-        elif short_res.ok and not long_res.ok:
+        elif (short_res.ok and short_filled_ok) and not (long_res.ok and long_filled_ok):
             logger.error(f"⚠️ Открыта только Short позиция: {coin} | Long ok=False | Short ok=True")
         else:
-            logger.error(f"❌ Не удалось открыть позиции: {coin} | Long ok={long_res.ok} | Short ok={short_res.ok}")
+            logger.error(f"❌ Не удалось открыть позиции: {coin} | Long ok={long_res.ok and long_filled_ok} | Short ok={short_res.ok and short_filled_ok}")
     return ok_all
 
 
@@ -258,6 +267,228 @@ async def _prepare_exchange_for_trading(*, exchange_name: str, exchange_obj: Any
         return True
     logger.error(f"❌ Trading preparation not implemented for {exchange_name}")
     return False
+
+
+async def _check_filled_full(*, planned: Dict[str, Any], order_id: str) -> Tuple[bool, float]:
+    """
+    Проверяет, что ордер исполнен полностью. Возвращает (ok_full_fill, filled_qty_base).
+    """
+    ex = str(planned.get("exchange") or "").lower()
+    if ex == "bybit":
+        return await _bybit_wait_full_fill(planned=planned, order_id=order_id)
+    if ex == "gate":
+        return await _gate_wait_full_fill(planned=planned, order_id=order_id)
+    return False, 0.0
+
+
+async def _bybit_private_request(
+    *,
+    exchange_obj: Any,
+    api_key: str,
+    api_secret: str,
+    method: str,
+    path: str,
+    params: Optional[Dict[str, Any]] = None,
+    body: Optional[Dict[str, Any]] = None,
+) -> Any:
+    """
+    Bybit v5 signing:
+    sign = HMAC_SHA256(secret, timestamp + api_key + recv_window + (queryString|bodyJson))
+    For GET: queryString is sorted by key and URL-encoded.
+    """
+    recv_window = str(int(float(os.getenv("BYBIT_RECV_WINDOW", "5000"))))
+    ts = str(int(time.time() * 1000))
+    method_u = method.upper()
+    payload = ""
+    req_kwargs: Dict[str, Any] = {}
+    if method_u == "GET":
+        p = params or {}
+        # Sort by key for stable signing
+        from urllib.parse import urlencode
+        payload = urlencode(sorted([(k, str(v)) for k, v in p.items() if v is not None]), doseq=True)
+        req_kwargs["params"] = p
+    else:
+        body_json = json.dumps(body or {}, separators=(",", ":"), ensure_ascii=False)
+        payload = body_json
+        req_kwargs["content"] = body_json
+
+    sign_payload = f"{ts}{api_key}{recv_window}{payload}"
+    sign = hmac.new(api_secret.encode("utf-8"), sign_payload.encode("utf-8"), hashlib.sha256).hexdigest()
+    headers = {
+        "X-BAPI-API-KEY": api_key,
+        "X-BAPI-TIMESTAMP": ts,
+        "X-BAPI-RECV-WINDOW": recv_window,
+        "X-BAPI-SIGN": sign,
+        "Content-Type": "application/json",
+    }
+    try:
+        resp = await exchange_obj.client.request(method_u, path, headers=headers, **req_kwargs)
+    except Exception as e:
+        return {"_error": f"http error: {type(e).__name__}: {e}"}
+    if resp.status_code < 200 or resp.status_code >= 300:
+        return {"_error": f"http {resp.status_code}", "_body": resp.text[:400]}
+    try:
+        return resp.json()
+    except Exception:
+        return {"_error": "bad json", "_body": resp.text[:400]}
+
+
+async def _bybit_wait_full_fill(*, planned: Dict[str, Any], order_id: str) -> Tuple[bool, float]:
+    """
+    Bybit: realtime endpoint может не возвращать уже filled/cancelled ордера,
+    поэтому используем fallback на /v5/order/history.
+    """
+    api_key = planned["api_key"]
+    api_secret = planned["api_secret"]
+    exchange_obj = planned["exchange_obj"]
+    symbol = planned["symbol"]
+    qty_req = float(planned["qty"])
+    eps = max(1e-10, qty_req * 1e-8)
+
+    import asyncio
+    last_seen: Optional[Dict[str, Any]] = None
+    for _ in range(30):  # ~6s total
+        # 1) realtime (open orders)
+        data_rt = await _bybit_private_request(
+            exchange_obj=exchange_obj,
+            api_key=api_key,
+            api_secret=api_secret,
+            method="GET",
+            path="/v5/order/realtime",
+            params={"category": "linear", "symbol": symbol, "orderId": order_id},
+        )
+        if isinstance(data_rt, dict) and data_rt.get("_error"):
+            logger.debug(f"Bybit fill check realtime error: {data_rt}")
+        if isinstance(data_rt, dict) and data_rt.get("retCode") == 0:
+            items = ((data_rt.get("result") or {}).get("list") or [])
+            item = items[0] if items and isinstance(items[0], dict) else None
+            if item:
+                last_seen = item
+
+        # 2) history (filled/cancelled)
+        data_h = await _bybit_private_request(
+            exchange_obj=exchange_obj,
+            api_key=api_key,
+            api_secret=api_secret,
+            method="GET",
+            path="/v5/order/history",
+            params={"category": "linear", "symbol": symbol, "orderId": order_id},
+        )
+        if isinstance(data_h, dict) and data_h.get("_error"):
+            logger.debug(f"Bybit fill check history error: {data_h}")
+        if isinstance(data_h, dict) and data_h.get("retCode") == 0:
+            items = ((data_h.get("result") or {}).get("list") or [])
+            item = items[0] if items and isinstance(items[0], dict) else None
+            if item:
+                last_seen = item
+
+        if last_seen:
+            status = str(last_seen.get("orderStatus") or "")
+            cum_exec = last_seen.get("cumExecQty")
+            try:
+                filled = float(cum_exec) if cum_exec is not None else 0.0
+            except Exception:
+                filled = 0.0
+            if status.lower() in ("filled", "cancelled", "canceled", "rejected", "partiallyfilled", "partially_filled"):
+                return (filled + eps >= qty_req), filled
+
+        await asyncio.sleep(0.2)
+
+    # если ничего не нашли — это скорее проблема доступа/подписи/ответа API
+    logger.error(f"Bybit fill check: не удалось получить статус ордера {order_id} (symbol={symbol})")
+    return False, 0.0
+
+
+async def _gate_private_request(
+    *,
+    exchange_obj: Any,
+    api_key: str,
+    api_secret: str,
+    method: str,
+    path: str,
+    params: Optional[Dict[str, Any]] = None,
+    body: Optional[Dict[str, Any]] = None,
+) -> Any:
+    """
+    Gate v4 signing:
+    SIGN = HMAC_SHA512(secret, method + '\n' + path + '\n' + query + '\n' + sha512(body) + '\n' + timestamp)
+    For GET: body hash is sha512('').
+    """
+    method_u = method.upper()
+    from urllib.parse import urlencode
+    query = urlencode(sorted([(k, str(v)) for k, v in (params or {}).items() if v is not None]), doseq=True)
+    body_json = json.dumps(body or {}, separators=(",", ":"), ensure_ascii=False) if method_u != "GET" else ""
+    payload_hash = hashlib.sha512(body_json.encode("utf-8")).hexdigest()
+    ts = str(int(time.time()))
+    sign_str = "\n".join([method_u, path, query, payload_hash, ts])
+    sign = hmac.new(api_secret.encode("utf-8"), sign_str.encode("utf-8"), hashlib.sha512).hexdigest()
+    headers = {"KEY": api_key, "Timestamp": ts, "SIGN": sign, "Accept": "application/json"}
+    if method_u != "GET":
+        headers["Content-Type"] = "application/json"
+    try:
+        resp = await exchange_obj.client.request(method_u, path, headers=headers, params=(params or None), content=(body_json if body_json else None))
+    except Exception as e:
+        return {"_error": f"http error: {type(e).__name__}: {e}"}
+    if resp.status_code < 200 or resp.status_code >= 300:
+        return {"_error": f"http {resp.status_code}", "_body": resp.text[:400]}
+    try:
+        return resp.json()
+    except Exception:
+        return {"_error": "bad json", "_body": resp.text[:400]}
+
+
+async def _gate_wait_full_fill(*, planned: Dict[str, Any], order_id: str) -> Tuple[bool, float]:
+    api_key = planned["api_key"]
+    api_secret = planned["api_secret"]
+    exchange_obj = planned["exchange_obj"]
+    contract = planned["contract"]
+    # For futures: size is contracts, but we need base filled amount. We'll approximate via contracts * quanto_multiplier.
+    cinfo = await _gate_fetch_contract_info(exchange_obj=exchange_obj, contract=contract)
+    qmul = None
+    try:
+        qmul = float((cinfo or {}).get("quanto_multiplier"))
+    except Exception:
+        qmul = None
+    if not qmul or qmul <= 0:
+        qmul = 1.0
+
+    qty_req_contracts = abs(float(planned.get("size", 0)))
+    qty_req_base = qty_req_contracts * qmul
+    eps = max(1e-10, qty_req_base * 1e-8)
+
+    import asyncio
+    for _ in range(20):
+        data = await _gate_private_request(
+            exchange_obj=exchange_obj,
+            api_key=api_key,
+            api_secret=api_secret,
+            method="GET",
+            path=f"/api/v4/futures/usdt/orders/{order_id}",
+            params={"contract": contract},
+        )
+        if isinstance(data, dict) and data.get("_error"):
+            return False, 0.0
+        if not isinstance(data, dict):
+            await asyncio.sleep(0.2)
+            continue
+        status = str(data.get("status") or "")
+        # Gate futures: left is remaining contracts; size is original signed contracts
+        try:
+            left = float(data.get("left") or 0)
+        except Exception:
+            left = 0.0
+        try:
+            size_abs = abs(float(data.get("size") or 0))
+        except Exception:
+            size_abs = 0.0
+        filled_contracts = max(0.0, size_abs - left)
+        filled_base = filled_contracts * qmul
+
+        if status.lower() in ("finished", "cancelled", "canceled"):
+            ok_full = (filled_contracts + 1e-9 >= qty_req_contracts)
+            return ok_full, filled_base
+        await asyncio.sleep(0.2)
+    return False, 0.0
 
 
 async def _open_one_leg(
@@ -519,28 +750,15 @@ async def _bybit_fetch_instrument_filters(*, exchange_obj: Any, symbol: str) -> 
 
 
 async def _bybit_private_post(*, exchange_obj: Any, api_key: str, api_secret: str, path: str, body: Dict[str, Any]) -> Any:
-    body_json = json.dumps(body, separators=(",", ":"), ensure_ascii=False)
-    recv_window = str(int(float(os.getenv("BYBIT_RECV_WINDOW", "5000"))))
-    ts = str(int(time.time() * 1000))
-    sign_payload = f"{ts}{api_key}{recv_window}{body_json}"
-    sign = hmac.new(api_secret.encode("utf-8"), sign_payload.encode("utf-8"), hashlib.sha256).hexdigest()
-    headers = {
-        "X-BAPI-API-KEY": api_key,
-        "X-BAPI-TIMESTAMP": ts,
-        "X-BAPI-RECV-WINDOW": recv_window,
-        "X-BAPI-SIGN": sign,
-        "Content-Type": "application/json",
-    }
-    try:
-        resp = await exchange_obj.client.request("POST", path, headers=headers, content=body_json)
-    except Exception as e:
-        return {"_error": f"http error: {type(e).__name__}: {e}"}
-    if resp.status_code < 200 or resp.status_code >= 300:
-        return {"_error": f"http {resp.status_code}", "_body": resp.text[:400]}
-    try:
-        return resp.json()
-    except Exception:
-        return {"_error": "bad json", "_body": resp.text[:400]}
+    # Use unified request helper (also supports GET signing)
+    return await _bybit_private_request(
+        exchange_obj=exchange_obj,
+        api_key=api_key,
+        api_secret=api_secret,
+        method="POST",
+        path=path,
+        body=body,
+    )
 
 
 async def _bybit_switch_isolated_and_leverage_1(*, exchange_obj: Any, symbol: str) -> Tuple[bool, str]:
@@ -804,7 +1022,8 @@ async def _gate_place_leg(*, planned: Dict[str, Any]) -> OpenLegResult:
         "tif": "ioc",
     }
     data = await _gate_private_post(exchange_obj=exchange_obj, api_key=api_key, api_secret=api_secret, path="/api/v4/futures/usdt/orders", body=body)
-    if isinstance(data, dict) and data.get("id") is not None:
+    # Gate может вернуть dict с label/message при ошибке — не считаем это успехом
+    if isinstance(data, dict) and data.get("id") is not None and ("label" not in data) and ("message" not in data):
         return OpenLegResult(exchange="gate", direction=direction, ok=True, order_id=str(data.get("id")), raw=data)
     return OpenLegResult(exchange="gate", direction=direction, ok=False, error=f"api error: {data}", raw=data)
 

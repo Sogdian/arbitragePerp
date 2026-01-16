@@ -262,7 +262,7 @@ class PerpArbitrageBot:
             
             if price_long is not None:
                 notional_long = coin_amount * price_long
-                logger.info(f"(Long {long_exchange}) ({coin}) Цена: {price_long:.3f} (qty: {coin_amount:.6f} {coin} | ~{notional_long:.3f} USDT)")
+                logger.info(f"(Long {long_exchange}) ({coin}) Цена: {price_long:.3f} (qty: {coin_amount:.3f} {coin} | ~{notional_long:.3f} USDT)")
             else:
                 logger.info(f"(Long {long_exchange}) ({coin}) Цена: недоступно")
             
@@ -283,7 +283,7 @@ class PerpArbitrageBot:
             
             if price_short is not None:
                 notional_short = coin_amount * price_short
-                logger.info(f"(Short {short_exchange}) ({coin}) Цена: {price_short:.3f} (qty: {coin_amount:.6f} {coin} | ~{notional_short:.3f} USDT)")
+                logger.info(f"(Short {short_exchange}) ({coin}) Цена: {price_short:.3f} (qty: {coin_amount:.3f} {coin} | ~{notional_short:.3f} USDT)")
             else:
                 logger.info(f"(Short {short_exchange}) ({coin}) Цена: недоступно")
             
@@ -370,7 +370,7 @@ class PerpArbitrageBot:
             short_exchange: Биржа для Short позиции
             notional_usdt: Размер инвестиций в USDT (для каждой позиции: Long и Short)
         """
-        size = notional_usdt
+        size = float(notional_usdt)
 
         long_liquidity: Optional[Dict[str, Any]] = None
         short_liquidity: Optional[Dict[str, Any]] = None
@@ -390,7 +390,7 @@ class PerpArbitrageBot:
                 status = "✅" if long_liquidity["ok"] else "❌"
                 buy_impact_str = f"{long_liquidity['buy_impact_bps']:.1f}bps" if long_liquidity['buy_impact_bps'] is not None else "N/A"
                 reasons_str = f" (Причины: {', '.join(long_liquidity['reasons'])})" if not long_liquidity["ok"] else ""
-                logger.info(f"{status} Ликвидность {long_exchange} Long ({coin}): {size} USDT | "
+                logger.info(f"{status} Ликвидность {long_exchange} Long ({coin}): {size:.3f} USDT | "
                           f"spread={long_liquidity['spread_bps']:.1f}bps, buy_impact={buy_impact_str}{reasons_str}")
             else:
                 logger.warning(f"Не удалось проверить ликвидность {long_exchange} Long ({coin}) для {size} USDT")
@@ -410,7 +410,7 @@ class PerpArbitrageBot:
                 status = "✅" if short_liquidity["ok"] else "❌"
                 sell_impact_str = f"{short_liquidity['sell_impact_bps']:.1f}bps" if short_liquidity['sell_impact_bps'] is not None else "N/A"
                 reasons_str = f" (Причины: {', '.join(short_liquidity['reasons'])})" if not short_liquidity["ok"] else ""
-                logger.info(f"{status} Ликвидность {short_exchange} Short ({coin}): {size} USDT | "
+                logger.info(f"{status} Ликвидность {short_exchange} Short ({coin}): {size:.3f} USDT | "
                           f"spread={short_liquidity['spread_bps']:.1f}bps, sell_impact={sell_impact_str}{reasons_str}")
             else:
                 logger.warning(f"Не удалось проверить ликвидность {short_exchange} Short ({coin}) для {size} USDT")
