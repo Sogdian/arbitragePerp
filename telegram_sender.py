@@ -65,16 +65,27 @@ class TelegramSender:
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
                 response = await client.post(url, json=data)
-                response.raise_for_status()
                 result = response.json()
                 
                 if result.get("ok"):
                     return True
                 else:
-                    logger.error(f"❌ Ошибка отправки: {result.get('description', 'Unknown')}")
+                    error_desc = result.get('description', 'Unknown')
+                    error_code = result.get('error_code', 'N/A')
+                    logger.error(f"❌ Ошибка отправки в Telegram (код {error_code}): {error_desc}")
                     return False
+        except httpx.HTTPStatusError as e:
+            # Обрабатываем HTTP ошибки (400, 401, 403, etc.)
+            try:
+                error_body = e.response.json()
+                error_desc = error_body.get('description', str(e))
+                error_code = error_body.get('error_code', e.response.status_code)
+                logger.error(f"❌ HTTP ошибка при отправке в Telegram (код {error_code}): {error_desc}")
+            except:
+                logger.error(f"❌ HTTP ошибка при отправке в Telegram: {e}")
+            return False
         except Exception as e:
-            logger.error(f"❌ Ошибка при отправке в Telegram: {e}")
+            logger.error(f"❌ Ошибка при отправке в Telegram: {e}", exc_info=True)
             return False
     
     async def send_message(self, text: str, channel_id: str = None) -> bool:

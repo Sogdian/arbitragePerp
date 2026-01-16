@@ -687,15 +687,15 @@ class PerpArbitrageBot:
                     
                     # Проверяем порог закрытия и отправляем сообщение в Telegram
                     # Для отрицательных порогов: отправляем, когда спред становится хуже (меньше) порога
-                    # Для положительных порогов: отправляем, когда спред становится лучше (больше) порога
+                    # Для положительных порогов: отправляем, когда спред становится хуже (меньше) порога
                     threshold_met = False
                     if close_threshold_pct is not None and closing_spread is not None:
                         if close_threshold_pct < 0:
                             # Для отрицательных порогов: спред хуже (меньше) порога
                             threshold_met = closing_spread <= close_threshold_pct
                         else:
-                            # Для положительных порогов: спред лучше (больше или равен) порога
-                            threshold_met = closing_spread >= close_threshold_pct
+                            # Для положительных порогов: спред хуже (меньше) порога - отправляем уведомление
+                            threshold_met = closing_spread <= close_threshold_pct
                     
                     if threshold_met:
                         # Проверяем интервал между отправками (раз в минуту)
@@ -707,7 +707,8 @@ class PerpArbitrageBot:
                             try:
                                 telegram = TelegramSender()
                                 if telegram.enabled:
-                                    channel_id = telegram._get_channel_id()
+                                    # bot.py всегда использует FREE_CHANNEL_ID
+                                    channel_id = config.FREE_CHANNEL_ID
                                     if channel_id:
                                         # Формируем сообщение в новом формате
                                         long_ex_capitalized = long_exchange.capitalize()
@@ -737,10 +738,7 @@ class PerpArbitrageBot:
                                         # Обновляем время последней отправки
                                         last_sent_time[key] = current_time
                                         
-                                        if close_threshold_pct < 0:
-                                            logger.info(f"📱 Отправлено сообщение в Telegram: закрытие при спреде {closing_spread:.2f}% <= {close_threshold_pct:.2f}%")
-                                        else:
-                                            logger.info(f"📱 Отправлено сообщение в Telegram: закрытие при спреде {closing_spread:.2f}% >= {close_threshold_pct:.2f}%")
+                                        logger.info(f"📱 Отправлено сообщение в Telegram: закрытие при спреде {closing_spread:.2f}% <= {close_threshold_pct:.2f}%")
                                     else:
                                         logger.warning(f"📱 Telegram включен, но канал не настроен для режима {config.ENV_MODE}")
                             except Exception as e:

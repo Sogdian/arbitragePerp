@@ -924,7 +924,8 @@ async def process_coin(
             try:
                 telegram = TelegramSender()
                 if telegram.enabled:
-                    channel_id = telegram._get_channel_id()
+                    # scan_spreads.py всегда использует TEST_CHANNEL_ID
+                    channel_id = config.TEST_CHANNEL_ID
                     if channel_id:
                         # Вычисляем максимальный total_spread и соответствующую пару бирж для caption
                         max_total_spread = None
@@ -1030,7 +1031,7 @@ async def main():
         # Логируем режим работы и настройки Telegram
         telegram = TelegramSender()
         telegram_status = "enabled" if telegram.enabled else "disabled"
-        channel_info = f"channel={telegram._get_channel_id() or 'not set'}"
+        channel_info = f"channel={config.TEST_CHANNEL_ID or 'not set'}"
         
         exclude_coins_info = f"exclude_coins={sorted(EXCLUDE_COINS)}" if EXCLUDE_COINS else "exclude_coins=none"
         logger.info(
