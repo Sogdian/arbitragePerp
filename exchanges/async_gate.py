@@ -15,8 +15,20 @@ class AsyncGateExchange(AsyncBaseExchange):
         super().__init__("Gate")
 
     def _normalize_symbol(self, coin: str) -> str:
-        """Преобразует монету в формат Gate.io для фьючерсов (например, CVC -> CVC_USDT)"""
-        return f"{coin.upper()}_USDT"
+        """
+        Преобразует монету в формат Gate.io для фьючерсов (например, CVC -> CVC_USDT)
+        
+        ВАЖНО: На Gate.io FUN_USDT соответствует SPORTFUN (Sport.Fun), а не FUNTOKEN.
+        FUNTOKEN на Gate.io отсутствует.
+        """
+        c = coin.upper()
+        # Алиасы для известных коллизий
+        aliases = {
+            "SPORTFUN": "FUN_USDT",  # SPORTFUN -> FUN_USDT (на Gate FUN_USDT это SPORTFUN)
+            # FUN (FUNTOKEN) на Gate отсутствует — возвращаем несуществующий символ, чтобы получить N/A
+            "FUN": "FUNTOKEN_USDT",
+        }
+        return aliases.get(c, f"{c}_USDT")
 
     def _safe_px(self, raw: object, fallback: float, sanity_mult: float = 20.0) -> float:
         """

@@ -88,7 +88,12 @@ async def fetch_gate_coins(exchange) -> Set[str]:
             if ts in ("delisting", "suspend", "suspended", "closed"):
                 continue
             
-            coins.add(base.upper())
+            base_u = base.upper()
+            # ВАЖНО: на Gate контракт FUN_USDT — это SPORTFUN (Sport.Fun), а FUN (FUNTOKEN) там нет.
+            if base_u == "FUN":
+                coins.add("SPORTFUN")
+            else:
+                coins.add(base_u)
         
         return coins
     except Exception as e:
@@ -126,9 +131,19 @@ async def fetch_mexc_coins(exchange) -> Set[str]:
             if state in ("3", "4", "5"):  # если знаешь точно неактивные
                 continue
 
-            # ВАЖНО (MEXC): у некоторых контрактов "отображаемое" имя (UI) не совпадает с API symbol.
-            # Пример: UI FUNUSDT соответствует API symbol SPORTFUN_USDT, а API symbol FUN_USDT — это FUNTOKEN.
-            # Поэтому, если есть displayName вида "{COIN}_USDT..." — используем его для имени монеты.
+            sym_u = sym.upper()
+            # ВАЖНО (MEXC): у монеты FUN есть два разных контракта:
+            # - FUN_USDT -> FUN (FUNTOKEN)
+            # - SPORTFUN_USDT -> SPORTFUN (Sport.Fun)
+            # Не смешиваем их. Для этих двух контрактов используем именно symbol, а не displayName.
+            if sym_u == "FUN_USDT":
+                coins.add("FUN")
+                continue
+            if sym_u == "SPORTFUN_USDT":
+                coins.add("SPORTFUN")
+                continue
+
+            # Для остальных контрактов: если есть displayName вида "{COIN}_USDT..." — используем его для имени монеты.
             disp = it.get("displayName") or it.get("display_name") or it.get("displayNameEn") or it.get("display_name_en")
             coin_from_disp = None
             if isinstance(disp, str):
@@ -257,7 +272,14 @@ async def fetch_bitget_coins(exchange) -> Set[str]:
             
             # основной формат: BTCUSDT
             if s.endswith("USDT") and len(s) > 4:
-                coins.add(s[:-4])
+                base = s[:-4]
+                # ВАЖНО (Bitget): FUNUSDT -> SPORTFUN, FUNTOKENUSDT -> FUN (FUNTOKEN)
+                if base == "FUN":
+                    coins.add("SPORTFUN")
+                elif base == "FUNTOKEN":
+                    coins.add("FUN")
+                else:
+                    coins.add(base)
         
         return coins
     except Exception:
@@ -315,7 +337,12 @@ async def fetch_bingx_coins(exchange) -> Set[str]:
         for it in items:
             sym = it.get("symbol")  # BTC-USDT
             if isinstance(sym, str) and sym.endswith("-USDT"):
-                coins.add(sym.replace("-USDT", "").upper())
+                base = sym.replace("-USDT", "").upper()
+                # ВАЖНО (BingX): FUNTOKEN-USDT -> FUN (FUNTOKEN)
+                if base == "FUNTOKEN":
+                    coins.add("FUN")
+                else:
+                    coins.add(base)
         
         return coins
     except Exception as e:

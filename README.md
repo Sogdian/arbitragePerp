@@ -24,17 +24,17 @@ LOG_LEVEL=INFO
 
 **Windows/Linux:**
 ```bash
-python scan_spreads.py 
+python scan_spreads.py (тут SCAN_COIN_INVEST)
 python bot.py "CVC Long (bybit), Short (gate) 30" --no-monitor
 python bot.py "CVC Long (bybit), Short (gate)" --no-monitor (тут SCAN_COIN_INVEST)
-python one_coin_bot.py CLO
+python one_coin_bot.py CLO (тут SCAN_COIN_INVEST)
 ```
 
 **macOS:**
 ```bash
 python3 scan_spreads.py 
 python3 bot.py "CVC Long (bybit), Short (gate) 30" --no-monitor
-python bot.py "CVC Long (bybit), Short (gate)" --no-monitor (тут SCAN_COIN_INVEST)
+python bot.py "CVC Long (bybit), Short (gate)" --no-monitor
 python3 one_coin_bot.py CLO
 ```
 
