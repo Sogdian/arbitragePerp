@@ -390,7 +390,7 @@ class PerpArbitrageBot:
                 mode="entry_long" # Проверяем только глубину на покупку
             )
             if long_liquidity:
-                status = "✓" if long_liquidity["ok"] else "✗"
+                status = "✅" if long_liquidity["ok"] else "❌"
                 buy_impact_str = f"{long_liquidity['buy_impact_bps']:.1f}bps" if long_liquidity['buy_impact_bps'] is not None else "N/A"
                 reasons_str = f" (Причины: {', '.join(long_liquidity['reasons'])})" if not long_liquidity["ok"] else ""
                 logger.info(f"{status} Ликвидность {long_exchange} Long ({coin}): {size} USDT | "
@@ -410,7 +410,7 @@ class PerpArbitrageBot:
                 mode="entry_short" # Проверяем только глубину на продажу
             )
             if short_liquidity:
-                status = "✓" if short_liquidity["ok"] else "✗"
+                status = "✅" if short_liquidity["ok"] else "❌"
                 sell_impact_str = f"{short_liquidity['sell_impact_bps']:.1f}bps" if short_liquidity['sell_impact_bps'] is not None else "N/A"
                 reasons_str = f" (Причины: {', '.join(short_liquidity['reasons'])})" if not short_liquidity["ok"] else ""
                 logger.info(f"{status} Ликвидность {short_exchange} Short ({coin}): {size} USDT | "
@@ -479,7 +479,7 @@ class PerpArbitrageBot:
             exchanges_str = ", ".join(exchanges)
             
             if not delisting_news:
-                logger.info(f"✓ Новостей о делистинге {coin} ({exchanges_str}) за последние {days_back} дней не найдено")
+                logger.info(f"✅ Новостей о делистинге {coin} ({exchanges_str}) за последние {days_back} дней не найдено")
 
                 # Доп. проверка: security/hack новости по монете на тех же биржах
                 security_news = await self.announcements_monitor.check_security_for_coin(
@@ -513,7 +513,7 @@ class PerpArbitrageBot:
                     security_news = merged2
                 if not security_news:
                     logger.info(
-                        f"✓ Новостей о взломах/безопасности {coin} ({exchanges_str}) за последние {days_back} дней не найдено"
+                        f"✅ Новостей о взломах/безопасности {coin} ({exchanges_str}) за последние {days_back} дней не найдено"
                     )
                 else:
                     for n in security_news[:5]:

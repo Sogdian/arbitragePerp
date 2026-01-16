@@ -92,7 +92,7 @@ logging.basicConfig(
 
 logger = logging.getLogger("scan_spreads")
 logging.getLogger("httpx").setLevel(logging.WARNING)
-# В scan_spreads не печатаем "подробные" логи из bot/news/бирж — только итоговую строку с ✓/✗
+# В scan_spreads не печатаем "подробные" логи из bot/news/бирж — только итоговую строку с ✅/❌
 logging.getLogger("bot").setLevel(logging.CRITICAL)
 logging.getLogger("news_monitor").setLevel(logging.CRITICAL)
 logging.getLogger("announcements_monitor").setLevel(logging.CRITICAL)
