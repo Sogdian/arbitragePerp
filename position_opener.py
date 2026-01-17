@@ -586,9 +586,21 @@ async def _binance_get_symbol_filters(*, exchange_obj: Any, symbol: str) -> Dict
         if not isinstance(data, dict):
             return {}
         syms = data.get("symbols") or []
-        item = syms[0] if syms and isinstance(syms[0], dict) else None
+        # Найдем нужный символ (Binance может вернуть все символы даже с параметром symbol)
+        item = None
+        for s in syms:
+            if isinstance(s, dict) and s.get("symbol") == symbol:
+                item = s
+                break
         if not item:
+            # Fallback: если не нашли, возьмем первый (для обратной совместимости)
+            item = syms[0] if syms and isinstance(syms[0], dict) else None
+        if not item:
+            logger.warning(f"Binance: symbol {symbol} not found in exchangeInfo")
             return {}
+        # Проверка: убедимся, что нашли правильный символ
+        if item.get("symbol") != symbol:
+            logger.warning(f"Binance: expected symbol {symbol}, got {item.get('symbol')} in exchangeInfo")
         filters = item.get("filters") or []
         out: Dict[str, Optional[str]] = {}
         for f in filters:
@@ -601,7 +613,10 @@ async def _binance_get_symbol_filters(*, exchange_obj: Any, symbol: str) -> Dict
                 out["stepSize"] = str(f.get("stepSize")) if f.get("stepSize") is not None else None
                 out["minQty"] = str(f.get("minQty")) if f.get("minQty") is not None else None
             elif ft == "MIN_NOTIONAL":
-                out["minNotional"] = str(f.get("notional") or f.get("minNotional")) if (f.get("notional") or f.get("minNotional")) is not None else None
+                notional_val = f.get("notional") or f.get("minNotional")
+                out["minNotional"] = str(notional_val) if notional_val is not None else None
+                if notional_val is not None:
+                    logger.debug(f"Binance {symbol}: MIN_NOTIONAL = {notional_val}")
         _BINANCE_EXCHANGE_INFO_CACHE[symbol] = out
         return out
     except Exception:
