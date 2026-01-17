@@ -25,8 +25,8 @@ LOG_LEVEL=INFO
 **Windows/Linux:**
 ```bash
 python scan_spreads.py (тут SCAN_COIN_INVEST)
-python bot.py "CVC Long (bybit), Short (gate) 30" --no-monitor (30 = количество монет CVC)
 python one_coin_bot.py CLO (тут SCAN_COIN_INVEST)
+python bot.py "CVC Long (bybit), Short (gate) 30" --no-monitor (30 = количество монет CVC)
 ```
 
 **macOS:**

@@ -798,13 +798,15 @@ async def main():
                     should_monitor = False
                     close_threshold_pct = None
                 else:
-                    answer = input().strip()
-                    answer_lower = answer.lower()
-                    should_monitor = answer_lower.startswith("да") or answer_lower.startswith("yes") or answer_lower.startswith("y")
+                    answer1 = input().strip()
+                    answer1_lower = answer1.lower()
+                    open_positions = answer1_lower.startswith("да") or answer1_lower.startswith("yes") or answer1_lower.startswith("y")
                     
-                    # Автоматическое открытие позиций (лонг+шорт) по API, затем мониторинг как обычно
                     close_threshold_pct = None
-                    if should_monitor:
+                    should_monitor = False
+                    
+                    if open_positions:
+                        # Автоматическое открытие позиций (лонг+шорт) по API, затем мониторинг как обычно
                         opened_ok = await open_long_short_positions(
                             bot=bot,
                             coin=monitoring_data["coin"],
@@ -812,8 +814,34 @@ async def main():
                             short_exchange=monitoring_data["short_exchange"],
                             coin_amount=monitoring_data["coin_amount"],
                         )
-                        if not opened_ok:
+                        if opened_ok:
+                            should_monitor = True
+                            # После успешного открытия позиций мониторинг запускается без порога закрытия
+                            close_threshold_pct = None
+                    else:
+                        # Если ответ "Нет" на открытие позиций, спрашиваем про мониторинг
+                        print("\nВключить мониторинг?")
+                        print("Введите 'Да' или 'Нет': если 'Да', то введите min цену закр, для отправки сообщения в тг")
+                        answer2 = input().strip()
+                        answer2_lower = answer2.lower()
+                        monitor_yes = answer2_lower.startswith("да") or answer2_lower.startswith("yes") or answer2_lower.startswith("y")
+                        
+                        if monitor_yes:
+                            should_monitor = True
+                            # Парсим порог закрытия из ввода (формат: "Да, 2%" или "Да, 2.5%" или "Да, -1%" или "Да 3")
+                            match = re.search(r'([-]?\d+\.?\d*)', answer2)
+                            if match:
+                                try:
+                                    close_threshold_pct = float(match.group(1))
+                                    logger.info(f"Распарсен порог закрытия: {close_threshold_pct:.2f}% из ввода '{answer2}'")
+                                except ValueError:
+                                    close_threshold_pct = None
+                                    logger.warning(f"Не удалось распарсить порог закрытия из '{answer2}', мониторинг без уведомлений")
+                            else:
+                                logger.warning(f"Не найден порог закрытия в '{answer2}', мониторинг без уведомлений")
+                        else:
                             should_monitor = False
+                            close_threshold_pct = None
             
             if should_monitor:
                 # Запускаем мониторинг
