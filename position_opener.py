@@ -729,7 +729,20 @@ async def _binance_private_request(
     except Exception as e:
         return {"_error": f"http error: {type(e).__name__}: {e}"}
     if resp.status_code < 200 or resp.status_code >= 300:
-        return {"_error": f"http {resp.status_code}", "_body": resp.text[:400]}
+        body_text = (resp.text or "")[:400]
+        # Binance almost always returns JSON even on HTTP 4xx.
+        try:
+            j = resp.json()
+            if isinstance(j, dict):
+                return {
+                    "_error": f"http {resp.status_code}",
+                    "code": j.get("code"),
+                    "msg": j.get("msg"),
+                    "_body": body_text,
+                }
+        except Exception:
+            pass
+        return {"_error": f"http {resp.status_code}", "_body": body_text}
     try:
         return resp.json()
     except Exception:
@@ -799,8 +812,19 @@ async def _binance_place_leg(*, planned: Dict[str, Any]) -> OpenLegResult:
                 "price": px_str,
             },
         )
-        if not isinstance(data, dict) or data.get("_error") or data.get("code") is not None:
+        if not isinstance(data, dict):
             return OpenLegResult(exchange="binance", direction=direction, ok=False, error=f"api error: {data}", raw=data)
+
+        # FOK rejection is a normal outcome when the snapshot is stale or liquidity moved:
+        # try the next price level (up to 3), per our strategy.
+        code = data.get("code")
+        msg = str(data.get("msg") or "")
+        if data.get("_error") or code is not None:
+            if code == -5021 or "FOK" in msg.upper():
+                logger.warning(f"Binance: FOK отклонён на уровне {idx} | причина={msg or data.get('_body')}")
+                continue
+            return OpenLegResult(exchange="binance", direction=direction, ok=False, error=f"api error: {data}", raw=data)
+
         order_id = str(data.get("orderId") or "")
         if not order_id:
             return OpenLegResult(exchange="binance", direction=direction, ok=False, error=f"no orderId in response: {data}", raw=data)
@@ -854,6 +878,35 @@ async def _mexc_plan_leg(*, exchange_obj: Any, coin: str, direction: str, coin_a
     api_secret = _get_env("MEXC_API_SECRET")
     if not api_key or not api_secret:
         return OpenLegResult(exchange="mexc", direction=direction, ok=False, error="missing MEXC_API_KEY/MEXC_API_SECRET in env")
+
+    # Проверка разрешений API ключа: пробуем простой приватный запрос
+    test_resp = await _mexc_private_request(
+        exchange_obj=exchange_obj,
+        api_key=api_key,
+        api_secret=api_secret,
+        method="GET",
+        path="/api/v1/private/account/assets",
+        params={},
+    )
+    if isinstance(test_resp, dict) and test_resp.get("_error"):
+        error_code = test_resp.get("_error", "")
+        error_body = test_resp.get("_body", "")
+        if "401" in error_code or "Not logged in" in error_body:
+            return OpenLegResult(
+                exchange="mexc",
+                direction=direction,
+                ok=False,
+                error="MEXC API: не удалось авторизоваться (401 Not logged in or login has expired). Проверь API key/secret и права (contract/futures trading).",
+            )
+        if "403" in error_code or "Access Denied" in error_body:
+            return OpenLegResult(
+                exchange="mexc",
+                direction=direction,
+                ok=False,
+                error=f"API ключ не имеет разрешений на торговлю (403 Access Denied). Проверь настройки API ключа на MEXC: разрешения на торговлю должны быть включены, IP-адрес должен быть разрешен (если включен whitelist)"
+            )
+        # Другие ошибки тоже логируем, но не блокируем (может быть временная проблема)
+        logger.warning(f"MEXC: предварительная проверка API ключа вернула ошибку: {test_resp}")
 
     symbol = exchange_obj._normalize_symbol(coin)
     ob = await exchange_obj.get_orderbook(coin, limit=3)
@@ -1002,6 +1055,16 @@ async def _mexc_place_leg(*, planned: Dict[str, Any]) -> OpenLegResult:
             },
         )
         if not isinstance(data, dict) or data.get("_error"):
+            error_code = data.get("_error", "")
+            error_body = data.get("_body", "")
+            if "403" in error_code or "Access Denied" in error_body:
+                return OpenLegResult(
+                    exchange="mexc",
+                    direction=direction,
+                    ok=False,
+                    error=f"API ключ не имеет разрешений на размещение ордеров (403 Access Denied). Проверь настройки API ключа на MEXC: разрешения на торговлю должны быть включены, IP-адрес должен быть разрешен (если включен whitelist)",
+                    raw=data
+                )
             return OpenLegResult(exchange="mexc", direction=direction, ok=False, error=f"api error: {data}", raw=data)
         # orderId in data/result
         item = data.get("data") or data.get("result") or data
