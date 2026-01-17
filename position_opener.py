@@ -31,6 +31,28 @@ import httpx
 logger = logging.getLogger("__main__")
 
 
+def _format_number(value: Optional[float], precision: int = 3) -> str:
+    """
+    Форматирует число до указанной точности и убирает нули на конце.
+    
+    Args:
+        value: Число для форматирования (может быть None)
+        precision: Количество знаков после запятой (по умолчанию 3)
+    
+    Returns:
+        Отформатированная строка или "N/A" если value is None
+    """
+    if value is None:
+        return "N/A"
+    
+    formatted = f"{value:.{precision}f}"
+    # Убираем нули на конце
+    if '.' in formatted:
+        formatted = formatted.rstrip('0').rstrip('.')
+    
+    return formatted
+
+
 @dataclass
 class OpenLegResult:
     exchange: str
@@ -156,7 +178,7 @@ async def open_long_short_positions(
         logger.error(f"❌ Количество монет должно быть > 0, получено: {coin_amount}")
         return False
 
-    logger.info(f"🧩 Авто-открытие позиций: {coin} | Long {long_exchange} + Short {short_exchange} | qty={coin_amount} {coin}")
+    logger.info(f"🧩 Авто-открытие позиций: {coin} | Long {long_exchange} + Short {short_exchange} | qty={_format_number(coin_amount)} {coin}")
 
     long_obj = (getattr(bot, "exchanges", {}) or {}).get(long_exchange)
     short_obj = (getattr(bot, "exchanges", {}) or {}).get(short_exchange)
@@ -196,9 +218,9 @@ async def open_long_short_positions(
         short_filled_ok, short_filled_qty = await _check_filled_full(planned=short_plan, order_id=short_res.order_id)
 
     if long_res.ok and not long_filled_ok:
-        logger.error(f"❌ Ордер не исполнен полностью: {long_exchange} long | исполнено={long_filled_qty:.8f} {coin} | требовалось={coin_amount:.8f} {coin}")
+        logger.error(f"❌ Ордер не исполнен полностью: {long_exchange} long | исполнено={_format_number(long_filled_qty)} {coin} | требовалось={_format_number(coin_amount)} {coin}")
     if short_res.ok and not short_filled_ok:
-        logger.error(f"❌ Ордер не исполнен полностью: {short_exchange} short | исполнено={short_filled_qty:.8f} {coin} | требовалось={coin_amount:.8f} {coin}")
+        logger.error(f"❌ Ордер не исполнен полностью: {short_exchange} short | исполнено={_format_number(short_filled_qty)} {coin} | требовалось={_format_number(coin_amount)} {coin}")
 
     ok_all = bool(long_res.ok and short_res.ok and long_filled_ok and short_filled_ok)
     if ok_all:
@@ -209,9 +231,9 @@ async def open_long_short_positions(
             spread_open = (short_px - long_px) / long_px * 100.0
         spread_str = f"{spread_open:.3f}%" if spread_open is not None else "N/A"
         logger.info(
-            f"Биржа лонг: {long_exchange}, Цена входа Long: {long_px:.6f}, "
-            f"Биржа шорт: {short_exchange}, Цена входа Short: {short_px:.6f}, "
-            f"Количество монет: {coin_amount:.6f}, Спред открытия: {spread_str}"
+            f"Биржа лонг: {long_exchange}, Цена входа Long: {_format_number(long_px)}, "
+            f"Биржа шорт: {short_exchange}, Цена входа Short: {_format_number(short_px)}, "
+            f"Количество монет: {_format_number(coin_amount)}, Спред открытия: {spread_str}"
         )
         logger.info(f"✅ Позиции открыты: {coin} | Long {long_exchange} (order={long_res.order_id}) | Short {short_exchange} (order={short_res.order_id})")
     else:
@@ -424,7 +446,7 @@ async def _bybit_wait_full_fill(*, planned: Dict[str, Any], order_id: str) -> Tu
             except Exception:
                 filled = 0.0
             if status.lower() in ("filled", "cancelled", "canceled", "rejected", "partiallyfilled", "partially_filled"):
-                logger.info(f"Bybit: статус ордера {order_id}: {status} | исполнено={filled:.8f} | требовалось={qty_req:.8f}")
+                logger.info(f"Bybit: статус ордера {order_id}: {status} | исполнено={_format_number(filled)} | требовалось={_format_number(qty_req)}")
                 return (filled + eps >= qty_req), filled
 
         await asyncio.sleep(0.2)
@@ -526,7 +548,7 @@ async def _gate_wait_full_fill(*, planned: Dict[str, Any], order_id: str) -> Tup
             logger.info(
                 f"Gate: статус ордера {order_id}: {status}"
                 + (f"/{finish_as}" if finish_as else "")
-                + f" | исполнено_контрактов={filled_contracts:.8f} | требовалось_контрактов={qty_req_contracts:.8f}"
+                + f" | исполнено_контрактов={_format_number(filled_contracts)} | требовалось_контрактов={_format_number(qty_req_contracts)}"
             )
             return ok_full, filled_base
         await asyncio.sleep(0.2)
@@ -894,7 +916,8 @@ async def _bybit_plan_leg(*, exchange_obj: Any, coin: str, direction: str, coin_
     qty_str = _format_by_step(coin_amount, qty_step_raw)
     price_str = _format_by_step(limit_price, tick_raw)
 
-    logger.info(f"План Bybit: {direction} qty={qty_str} | best={best_price} | кандидаты уровней(<=3)={candidates}")
+    candidates_str = "[" + ", ".join([_format_number(c) for c in candidates]) + "]"
+    logger.info(f"План Bybit: {direction} qty={qty_str} | best={_format_number(best_price)} | кандидаты уровней(<=3)={candidates_str}")
 
     return {
         "exchange": "bybit",
@@ -948,7 +971,7 @@ async def _bybit_place_leg(*, planned: Dict[str, Any]) -> OpenLegResult:
         if ok_full:
             return OpenLegResult(exchange="bybit", direction=direction, ok=True, order_id=str(order_id), raw=data)
         # если не исполнилось, пробуем следующий уровень
-        logger.warning(f"Bybit: не исполнилось полностью на уровне {idx} | исполнено={filled_qty:.8f} | требовалось={float(planned['qty']):.8f}")
+        logger.warning(f"Bybit: не исполнилось полностью на уровне {idx} | исполнено={_format_number(filled_qty)} | требовалось={_format_number(float(planned['qty']))}")
 
     return OpenLegResult(exchange="bybit", direction=direction, ok=False, error="не удалось исполнить ордер полностью за 3 попытки (уровни 1-3)")
 
@@ -1084,7 +1107,8 @@ async def _gate_plan_leg(*, exchange_obj: Any, coin: str, direction: str, coin_a
     price_step = _gate_price_step_from_contract_info(cinfo) or 0.0
     limit_price = _round_price_for_side(limit_price_raw, price_step, side)
 
-    logger.info(f"План Gate: {direction} contracts={contracts_i} | best_bid={best_bid} best_ask={best_ask} | кандидаты уровней(<=3)={candidates}")
+    candidates_str = "[" + ", ".join([_format_number(c) for c in candidates]) + "]"
+    logger.info(f"План Gate: {direction} contracts={contracts_i} | best_bid={_format_number(best_bid)} best_ask={_format_number(best_ask)} | кандидаты уровней(<=3)={candidates_str}")
 
     size_signed = contracts_i if direction == "long" else -contracts_i
     price_str = _format_by_step(limit_price, str(price_step) if price_step > 0 else None)
@@ -1131,7 +1155,7 @@ async def _gate_place_leg(*, planned: Dict[str, Any]) -> OpenLegResult:
             return OpenLegResult(exchange="gate", direction=direction, ok=True, order_id=order_id, raw=data)
         if filled_base > 0:
             # partial fill — не продолжаем, чтобы не добирать остаток по худшей цене без явного разрешения
-            logger.warning(f"Gate: частичное исполнение, дальнейшие попытки остановлены | исполнено~{filled_base:.8f} base")
+            logger.warning(f"Gate: частичное исполнение, дальнейшие попытки остановлены | исполнено~{_format_number(filled_base)} base")
             return OpenLegResult(exchange="gate", direction=direction, ok=False, order_id=order_id, error="частичное исполнение (не 100%)", raw=data)
         logger.warning("Gate: не исполнилось полностью на уровне %s (0 исполнено) — пробуем следующий", idx)
 
