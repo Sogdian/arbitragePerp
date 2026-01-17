@@ -18,7 +18,7 @@ pip install -r requirements.txt
 LOG_FILE=arbitrage_perp_bot.log
 LOG_LEVEL=INFO
 ```
-## Использование
+## Использование (контекст в CONTEXT.md)
 
 ### Способ 1: Аргумент командной строки (пример)
 

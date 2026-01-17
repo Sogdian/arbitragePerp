@@ -508,6 +508,7 @@ async def _gate_wait_full_fill(*, planned: Dict[str, Any], order_id: str) -> Tup
             await asyncio.sleep(0.2)
             continue
         status = str(data.get("status") or "")
+        finish_as = str(data.get("finish_as") or "")
         # Gate futures: left is remaining contracts; size is original signed contracts
         try:
             left = float(data.get("left") or 0)
@@ -522,6 +523,11 @@ async def _gate_wait_full_fill(*, planned: Dict[str, Any], order_id: str) -> Tup
 
         if status.lower() in ("finished", "cancelled", "canceled"):
             ok_full = (filled_contracts + 1e-9 >= qty_req_contracts)
+            logger.info(
+                f"Gate: статус ордера {order_id}: {status}"
+                + (f"/{finish_as}" if finish_as else "")
+                + f" | исполнено_контрактов={filled_contracts:.8f} | требовалось_контрактов={qty_req_contracts:.8f}"
+            )
             return ok_full, filled_base
         await asyncio.sleep(0.2)
     return False, 0.0
@@ -1112,7 +1118,8 @@ async def _gate_place_leg(*, planned: Dict[str, Any]) -> OpenLegResult:
             "contract": planned["contract"],
             "size": planned["size"],
             "price": px_str,
-            "tif": "ioc",
+            # Требование: строго 100% исполнение или отмена
+            "tif": "fok",
         }
         data = await _gate_private_post(exchange_obj=exchange_obj, api_key=api_key, api_secret=api_secret, path="/api/v4/futures/usdt/orders", body=body)
         # Gate может вернуть dict с label/message при ошибке — не считаем это успехом
