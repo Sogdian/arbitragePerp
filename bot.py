@@ -42,6 +42,28 @@ logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
+def format_number(value: Optional[float], precision: int = 3) -> str:
+    """
+    Форматирует число до указанной точности и убирает нули на конце.
+    
+    Args:
+        value: Число для форматирования (может быть None)
+        precision: Количество знаков после запятой (по умолчанию 3)
+    
+    Returns:
+        Отформатированная строка или "N/A" если value is None
+    """
+    if value is None:
+        return "N/A"
+    
+    formatted = f"{value:.{precision}f}"
+    # Убираем нули на конце
+    if '.' in formatted:
+        formatted = formatted.rstrip('0').rstrip('.')
+    
+    return formatted
+
+
 class PerpArbitrageBot:
     """Бот для анализа арбитража фьючерсов"""
     
@@ -714,18 +736,19 @@ class PerpArbitrageBot:
                                         ]
                                         
                                         exit_threshold = self.get_exit_threshold_pct()
-                                        if closing_spread is not None:
+                                        # Используем closing_spread_display из лога (уже инвертированное значение)
+                                        if closing_spread_display is not None:
                                             if close_threshold_pct is not None:
-                                                message_lines.append(f"🚩 <b>Close:</b> {closing_spread:.2f}% (min: {exit_threshold:.2f}% цель: {close_threshold_pct:.2f}%)")
+                                                message_lines.append(f"🚩 <b>Close price:</b> {format_number(closing_spread_display)}% (min: {format_number(exit_threshold)}% цель: {format_number(close_threshold_pct)}%)")
                                             else:
-                                                message_lines.append(f"🚩 <b>Close:</b> {closing_spread:.2f}% (min: {exit_threshold:.2f}%)")
+                                                message_lines.append(f"🚩 <b>Close price:</b> {format_number(closing_spread_display)}% (min: {format_number(exit_threshold)}%)")
                                         else:
-                                            message_lines.append(f"🚩 <b>Close:</b> N/A (min: {exit_threshold:.2f}%)")
+                                            message_lines.append(f"🚩 <b>Close price:</b> N/A (min: {format_number(exit_threshold)}%)")
                                         
-                                        if fr_spread is not None:
-                                            message_lines.append(f"💰 <b>Funding Spread:</b> {fr_spread:.6f}%")
-                                        else:
-                                            message_lines.append("💰 <b>Funding Spread:</b> N/A")
+                                        # Используем fr_spread и total_spread из лога, форматируем через format_number
+                                        fr_spread_formatted = format_number(fr_spread)
+                                        total_spread_formatted = format_number(total_spread)
+                                        message_lines.append(f"💰 fr_spread: {fr_spread_formatted} | 🎯 total_spread: {total_spread_formatted}")
                                         
                                         telegram_message = "\n".join(message_lines)
                                         await telegram.send_message(telegram_message, channel_id=channel_id)
@@ -833,7 +856,6 @@ async def main():
                             if match:
                                 try:
                                     close_threshold_pct = float(match.group(1))
-                                    logger.info(f"Распарсен порог закрытия: {close_threshold_pct:.2f}% из ввода '{answer2}'")
                                 except ValueError:
                                     close_threshold_pct = None
                                     logger.warning(f"Не удалось распарсить порог закрытия из '{answer2}', мониторинг без уведомлений")
