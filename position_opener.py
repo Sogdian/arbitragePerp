@@ -111,6 +111,30 @@ def _format_by_step(x: float, step_raw: Optional[str]) -> str:
     return s.rstrip("0").rstrip(".") if "." in s else s
 
 
+def _price_level_for_target_size(levels: Any, target_size: float) -> Tuple[Optional[float], float]:
+    """
+    Возвращает цену уровня, на котором суммарный объем (size) достигает target_size.
+    levels: [[price, size], ...]
+    """
+    if not isinstance(levels, list) or target_size <= 0:
+        return None, 0.0
+    cum = 0.0
+    for lvl in levels:
+        if not isinstance(lvl, (list, tuple)) or len(lvl) < 2:
+            continue
+        try:
+            p = float(lvl[0])
+            s = float(lvl[1])
+        except Exception:
+            continue
+        if p <= 0 or s <= 0:
+            continue
+        cum += s
+        if cum + 1e-12 >= target_size:
+            return p, cum
+    return None, cum
+
+
 async def open_long_short_positions(
     *,
     bot: Any,
@@ -172,9 +196,9 @@ async def open_long_short_positions(
         short_filled_ok, short_filled_qty = await _check_filled_full(planned=short_plan, order_id=short_res.order_id)
 
     if long_res.ok and not long_filled_ok:
-        logger.error(f"❌ Ордер не заполнен полностью: {long_exchange} long | filled={long_filled_qty:.8f} (need {coin_amount:.8f})")
+        logger.error(f"❌ Ордер не исполнен полностью: {long_exchange} long | исполнено={long_filled_qty:.8f} {coin} | требовалось={coin_amount:.8f} {coin}")
     if short_res.ok and not short_filled_ok:
-        logger.error(f"❌ Ордер не заполнен полностью: {short_exchange} short | filled={short_filled_qty:.8f} (need {coin_amount:.8f})")
+        logger.error(f"❌ Ордер не исполнен полностью: {short_exchange} short | исполнено={short_filled_qty:.8f} {coin} | требовалось={coin_amount:.8f} {coin}")
 
     ok_all = bool(long_res.ok and short_res.ok and long_filled_ok and short_filled_ok)
     if ok_all:
@@ -303,10 +327,12 @@ async def _bybit_private_request(
     req_kwargs: Dict[str, Any] = {}
     if method_u == "GET":
         p = params or {}
-        # Sort by key for stable signing
+        # Важно: строка подписи должна совпадать с реальным querystring 1:1,
+        # поэтому используем отсортированный список tuple и передаем его в httpx как params=list[tuple].
         from urllib.parse import urlencode
-        payload = urlencode(sorted([(k, str(v)) for k, v in p.items() if v is not None]), doseq=True)
-        req_kwargs["params"] = p
+        pairs = sorted([(k, str(v)) for k, v in p.items() if v is not None], key=lambda kv: kv[0])
+        payload = urlencode(pairs, doseq=True)
+        req_kwargs["params"] = pairs
     else:
         body_json = json.dumps(body or {}, separators=(",", ":"), ensure_ascii=False)
         payload = body_json
@@ -319,6 +345,7 @@ async def _bybit_private_request(
         "X-BAPI-TIMESTAMP": ts,
         "X-BAPI-RECV-WINDOW": recv_window,
         "X-BAPI-SIGN": sign,
+        "X-BAPI-SIGN-TYPE": "2",
         "Content-Type": "application/json",
     }
     try:
@@ -347,6 +374,7 @@ async def _bybit_wait_full_fill(*, planned: Dict[str, Any], order_id: str) -> Tu
 
     import asyncio
     last_seen: Optional[Dict[str, Any]] = None
+    last_err: Optional[str] = None
     for _ in range(30):  # ~6s total
         # 1) realtime (open orders)
         data_rt = await _bybit_private_request(
@@ -358,7 +386,10 @@ async def _bybit_wait_full_fill(*, planned: Dict[str, Any], order_id: str) -> Tu
             params={"category": "linear", "symbol": symbol, "orderId": order_id},
         )
         if isinstance(data_rt, dict) and data_rt.get("_error"):
+            last_err = str(data_rt)
             logger.debug(f"Bybit fill check realtime error: {data_rt}")
+        elif isinstance(data_rt, dict) and data_rt.get("retCode") not in (None, 0):
+            last_err = f"realtime retCode={data_rt.get('retCode')} retMsg={data_rt.get('retMsg')}"
         if isinstance(data_rt, dict) and data_rt.get("retCode") == 0:
             items = ((data_rt.get("result") or {}).get("list") or [])
             item = items[0] if items and isinstance(items[0], dict) else None
@@ -375,7 +406,10 @@ async def _bybit_wait_full_fill(*, planned: Dict[str, Any], order_id: str) -> Tu
             params={"category": "linear", "symbol": symbol, "orderId": order_id},
         )
         if isinstance(data_h, dict) and data_h.get("_error"):
+            last_err = str(data_h)
             logger.debug(f"Bybit fill check history error: {data_h}")
+        elif isinstance(data_h, dict) and data_h.get("retCode") not in (None, 0):
+            last_err = f"history retCode={data_h.get('retCode')} retMsg={data_h.get('retMsg')}"
         if isinstance(data_h, dict) and data_h.get("retCode") == 0:
             items = ((data_h.get("result") or {}).get("list") or [])
             item = items[0] if items and isinstance(items[0], dict) else None
@@ -390,12 +424,14 @@ async def _bybit_wait_full_fill(*, planned: Dict[str, Any], order_id: str) -> Tu
             except Exception:
                 filled = 0.0
             if status.lower() in ("filled", "cancelled", "canceled", "rejected", "partiallyfilled", "partially_filled"):
+                logger.info(f"Bybit: статус ордера {order_id}: {status} | исполнено={filled:.8f} | требовалось={qty_req:.8f}")
                 return (filled + eps >= qty_req), filled
 
         await asyncio.sleep(0.2)
 
     # если ничего не нашли — это скорее проблема доступа/подписи/ответа API
-    logger.error(f"Bybit fill check: не удалось получить статус ордера {order_id} (symbol={symbol})")
+    tail = f" | last_error={last_err}" if last_err else ""
+    logger.error(f"Bybit fill check: не удалось получить статус ордера {order_id} (symbol={symbol}){tail}")
     return False, 0.0
 
 
@@ -787,20 +823,34 @@ async def _bybit_plan_leg(*, exchange_obj: Any, coin: str, direction: str, coin_
 
     symbol = exchange_obj._normalize_symbol(coin)
 
-    ob = await exchange_obj.get_orderbook(coin, limit=1)
+    ob_levels = min(3, int(os.getenv("ENTRY_OB_LEVELS", "3")))
+    ob = await exchange_obj.get_orderbook(coin, limit=ob_levels)
     if not ob or not ob.get("bids") or not ob.get("asks"):
         return OpenLegResult(exchange="bybit", direction=direction, ok=False, error=f"orderbook not available for {coin}")
 
-    best_bid = float(ob["bids"][0][0])
-    best_bid_sz = float(ob["bids"][0][1])
-    best_ask = float(ob["asks"][0][0])
-    best_ask_sz = float(ob["asks"][0][1])
-    if best_bid <= 0 or best_ask <= 0:
-        return OpenLegResult(exchange="bybit", direction=direction, ok=False, error=f"bad orderbook prices: bid={best_bid} ask={best_ask}")
-
     side = "Buy" if direction == "long" else "Sell"
-    limit_price_raw = best_ask if side == "Buy" else best_bid
-    top_sz = best_ask_sz if side == "Buy" else best_bid_sz
+    book_side = ob["asks"] if side == "Buy" else ob["bids"]
+    best_price = float(book_side[0][0])
+    if best_price <= 0:
+        return OpenLegResult(exchange="bybit", direction=direction, ok=False, error="bad orderbook best price")
+
+    # Кандидаты цен: максимум 3 уровня. Пытаемся 1й, потом 2й, потом 3й.
+    candidates: list[float] = []
+    cum = 0.0
+    for lvl in book_side[:ob_levels]:
+        try:
+            p = float(lvl[0])
+            s = float(lvl[1])
+        except Exception:
+            continue
+        if p <= 0 or s <= 0:
+            continue
+        cum += s
+        if cum + 1e-12 >= coin_amount:
+            candidates.append(p)
+    if not candidates:
+        return OpenLegResult(exchange="bybit", direction=direction, ok=False, error=f"not enough depth in first {ob_levels} levels: need {coin_amount}, available {cum}")
+    limit_price_raw = float(candidates[0])
 
     f = await _bybit_fetch_instrument_filters(exchange_obj=exchange_obj, symbol=symbol)
     qty_step_raw = f.get("qtyStep")
@@ -832,12 +882,13 @@ async def _bybit_plan_leg(*, exchange_obj: Any, coin: str, direction: str, coin_
             error=f"Order does not meet minimum order value {min_amt:.3f}USDT (requested ~{notional:.3f}USDT)",
         )
 
-    # Ликвидность на лучшем уровне: чтобы не открыть частично
-    if top_sz > 0 and coin_amount > top_sz:
-        return OpenLegResult(exchange="bybit", direction=direction, ok=False, error=f"not enough size at best price: need {coin_amount}, top={top_sz}")
+    # Примечание: мы уже выбрали price level, на котором хватает cum_sz >= coin_amount,
+    # поэтому отдельная проверка top-of-book не нужна.
 
     qty_str = _format_by_step(coin_amount, qty_step_raw)
     price_str = _format_by_step(limit_price, tick_raw)
+
+    logger.info(f"План Bybit: {direction} qty={qty_str} | best={best_price} | кандидаты уровней(<=3)={candidates}")
 
     return {
         "exchange": "bybit",
@@ -848,6 +899,7 @@ async def _bybit_plan_leg(*, exchange_obj: Any, coin: str, direction: str, coin_
         "qty": qty_str,
         "limit_price": float(price_str),
         "price_str": price_str,
+        "candidate_prices_raw": candidates,
         "api_key": api_key,
         "api_secret": api_secret,
     }
@@ -858,20 +910,41 @@ async def _bybit_place_leg(*, planned: Dict[str, Any]) -> OpenLegResult:
     api_key = planned["api_key"]
     api_secret = planned["api_secret"]
     direction = planned["direction"]
-    body = {
-        "category": "linear",
-        "symbol": planned["symbol"],
-        "side": planned["side"],
-        "orderType": "Limit",
-        "qty": planned["qty"],
-        "price": planned["price_str"],
-        "timeInForce": "IOC",
-    }
-    data = await _bybit_private_post(exchange_obj=exchange_obj, api_key=api_key, api_secret=api_secret, path="/v5/order/create", body=body)
-    if not isinstance(data, dict) or data.get("retCode") != 0:
-        return OpenLegResult(exchange="bybit", direction=direction, ok=False, error=f"api error: {data}", raw=data)
-    order_id = (data.get("result") or {}).get("orderId") if isinstance(data.get("result"), dict) else None
-    return OpenLegResult(exchange="bybit", direction=direction, ok=True, order_id=str(order_id) if order_id else None, raw=data)
+    side = planned["side"]
+    tick_raw = (await _bybit_fetch_instrument_filters(exchange_obj=exchange_obj, symbol=planned["symbol"])).get("tickSize")
+    tick = float(tick_raw) if tick_raw else 0.0
+
+    candidates = planned.get("candidate_prices_raw") or [float(planned["price_str"])]
+    # максимум 3 попытки: уровень 1 -> 2 -> 3
+    attempts = candidates[:3]
+    for idx, px_raw in enumerate(attempts, start=1):
+        px = _round_price_for_side(float(px_raw), tick, "buy" if side == "Buy" else "sell")
+        px_str = _format_by_step(px, tick_raw)
+        logger.info(f"Bybit: попытка {idx}/{len(attempts)} | {direction} qty={planned['qty']} | лимит={px_str}")
+        body = {
+            "category": "linear",
+            "symbol": planned["symbol"],
+            "side": side,
+            "orderType": "Limit",
+            "qty": planned["qty"],
+            "price": px_str,
+            # строго 100% или отмена
+            "timeInForce": "FOK",
+        }
+        data = await _bybit_private_post(exchange_obj=exchange_obj, api_key=api_key, api_secret=api_secret, path="/v5/order/create", body=body)
+        if not isinstance(data, dict) or data.get("retCode") != 0:
+            return OpenLegResult(exchange="bybit", direction=direction, ok=False, error=f"api error: {data}", raw=data)
+        order_id = (data.get("result") or {}).get("orderId") if isinstance(data.get("result"), dict) else None
+        if not order_id:
+            return OpenLegResult(exchange="bybit", direction=direction, ok=False, error=f"no orderId in response: {data}", raw=data)
+
+        ok_full, filled_qty = await _bybit_wait_full_fill(planned={**planned, "price_str": px_str, "limit_price": float(px_str)}, order_id=str(order_id))
+        if ok_full:
+            return OpenLegResult(exchange="bybit", direction=direction, ok=True, order_id=str(order_id), raw=data)
+        # если не исполнилось, пробуем следующий уровень
+        logger.warning(f"Bybit: не исполнилось полностью на уровне {idx} | исполнено={filled_qty:.8f} | требовалось={float(planned['qty']):.8f}")
+
+    return OpenLegResult(exchange="bybit", direction=direction, ok=False, error="не удалось исполнить ордер полностью за 3 попытки (уровни 1-3)")
 
 
 async def _gate_private_post(*, exchange_obj: Any, api_key: str, api_secret: str, path: str, body: Dict[str, Any]) -> Any:
@@ -947,14 +1020,13 @@ async def _gate_plan_leg(*, exchange_obj: Any, coin: str, direction: str, coin_a
         return OpenLegResult(exchange="gate", direction=direction, ok=False, error="missing GATEIO_API_KEY/GATEIO_API_SECRET in env")
 
     contract = exchange_obj._normalize_symbol(coin)
-    ob = await exchange_obj.get_orderbook(coin, limit=1)
+    ob_levels = min(3, int(os.getenv("ENTRY_OB_LEVELS", "3")))
+    ob = await exchange_obj.get_orderbook(coin, limit=ob_levels)
     if not ob or not ob.get("bids") or not ob.get("asks"):
         return OpenLegResult(exchange="gate", direction=direction, ok=False, error=f"orderbook not available for {coin}")
 
     best_bid = float(ob["bids"][0][0])
-    best_bid_sz = float(ob["bids"][0][1])
     best_ask = float(ob["asks"][0][0])
-    best_ask_sz = float(ob["asks"][0][1])
     if best_bid <= 0 or best_ask <= 0:
         return OpenLegResult(exchange="gate", direction=direction, ok=False, error=f"bad orderbook prices: bid={best_bid} ask={best_ask}")
 
@@ -984,15 +1056,29 @@ async def _gate_plan_leg(*, exchange_obj: Any, coin: str, direction: str, coin_a
         return OpenLegResult(exchange="gate", direction=direction, ok=False, error=f"contracts {contracts_i} < min {min_size}")
 
     side = "buy" if direction == "long" else "sell"
-    limit_price_raw = best_ask if side == "buy" else best_bid
-    top_sz = best_ask_sz if side == "buy" else best_bid_sz
+    book_side = ob["asks"] if side == "buy" else ob["bids"]
+    # Кандидаты цен: максимум 3 уровня. Пытаемся 1й, потом 2й, потом 3й.
+    candidates: list[float] = []
+    cum = 0.0
+    for lvl in book_side[:ob_levels]:
+        try:
+            p = float(lvl[0])
+            s = float(lvl[1])
+        except Exception:
+            continue
+        if p <= 0 or s <= 0:
+            continue
+        cum += s
+        if cum + 1e-12 >= float(contracts_i):
+            candidates.append(p)
+    if not candidates:
+        return OpenLegResult(exchange="gate", direction=direction, ok=False, error=f"not enough depth in first {ob_levels} levels: need {contracts_i} contracts, available {cum}")
+    limit_price_raw = float(candidates[0])
 
     price_step = _gate_price_step_from_contract_info(cinfo) or 0.0
     limit_price = _round_price_for_side(limit_price_raw, price_step, side)
 
-    # На Gate futures orderbook size обычно в контрактах — проверяем на best-level
-    if top_sz > 0 and float(contracts_i) > float(top_sz):
-        return OpenLegResult(exchange="gate", direction=direction, ok=False, error=f"not enough size at best price: need {contracts_i} contracts, top={top_sz}")
+    logger.info(f"План Gate: {direction} contracts={contracts_i} | best_bid={best_bid} best_ask={best_ask} | кандидаты уровней(<=3)={candidates}")
 
     size_signed = contracts_i if direction == "long" else -contracts_i
     price_str = _format_by_step(limit_price, str(price_step) if price_step > 0 else None)
@@ -1005,6 +1091,7 @@ async def _gate_plan_leg(*, exchange_obj: Any, coin: str, direction: str, coin_a
         "size": size_signed,
         "limit_price": float(price_str),
         "price_str": price_str,
+        "candidate_prices_raw": candidates,
         "api_key": api_key,
         "api_secret": api_secret,
     }
@@ -1015,16 +1102,32 @@ async def _gate_place_leg(*, planned: Dict[str, Any]) -> OpenLegResult:
     api_key = planned["api_key"]
     api_secret = planned["api_secret"]
     direction = planned["direction"]
-    body = {
-        "contract": planned["contract"],
-        "size": planned["size"],
-        "price": planned["price_str"],
-        "tif": "ioc",
-    }
-    data = await _gate_private_post(exchange_obj=exchange_obj, api_key=api_key, api_secret=api_secret, path="/api/v4/futures/usdt/orders", body=body)
-    # Gate может вернуть dict с label/message при ошибке — не считаем это успехом
-    if isinstance(data, dict) and data.get("id") is not None and ("label" not in data) and ("message" not in data):
-        return OpenLegResult(exchange="gate", direction=direction, ok=True, order_id=str(data.get("id")), raw=data)
-    return OpenLegResult(exchange="gate", direction=direction, ok=False, error=f"api error: {data}", raw=data)
+    candidates = planned.get("candidate_prices_raw") or [float(planned["price_str"])]
+    attempts = candidates[:3]
+    for idx, px_raw in enumerate(attempts, start=1):
+        px = float(px_raw)
+        px_str = _format_by_step(px, None)
+        logger.info(f"Gate: попытка {idx}/{len(attempts)} | {direction} size={planned['size']} | лимит={px_str}")
+        body = {
+            "contract": planned["contract"],
+            "size": planned["size"],
+            "price": px_str,
+            "tif": "ioc",
+        }
+        data = await _gate_private_post(exchange_obj=exchange_obj, api_key=api_key, api_secret=api_secret, path="/api/v4/futures/usdt/orders", body=body)
+        # Gate может вернуть dict с label/message при ошибке — не считаем это успехом
+        if not (isinstance(data, dict) and data.get("id") is not None and ("label" not in data) and ("message" not in data)):
+            return OpenLegResult(exchange="gate", direction=direction, ok=False, error=f"api error: {data}", raw=data)
+        order_id = str(data.get("id"))
+        ok_full, filled_base = await _gate_wait_full_fill(planned={**planned, "price_str": px_str, "limit_price": float(px_str)}, order_id=order_id)
+        if ok_full:
+            return OpenLegResult(exchange="gate", direction=direction, ok=True, order_id=order_id, raw=data)
+        if filled_base > 0:
+            # partial fill — не продолжаем, чтобы не добирать остаток по худшей цене без явного разрешения
+            logger.warning(f"Gate: частичное исполнение, дальнейшие попытки остановлены | исполнено~{filled_base:.8f} base")
+            return OpenLegResult(exchange="gate", direction=direction, ok=False, order_id=order_id, error="частичное исполнение (не 100%)", raw=data)
+        logger.warning("Gate: не исполнилось полностью на уровне %s (0 исполнено) — пробуем следующий", idx)
+
+    return OpenLegResult(exchange="gate", direction=direction, ok=False, error="не удалось исполнить ордер полностью за 3 попытки (уровни 1-3)")
 
 
