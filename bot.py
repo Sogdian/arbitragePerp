@@ -703,16 +703,18 @@ class PerpArbitrageBot:
                     logger.info(f"{closing_str} | {opening_str} | 💰 fr_spread: {fr_spread_str} | 🎯 total_spread: {total_spread_str} ⚙️  {long_ex_str} | {short_ex_str} | {coin_str}")
                     
                     # Проверяем порог закрытия и отправляем сообщение в Telegram
-                    # Для отрицательных порогов: отправляем, когда спред становится хуже (меньше) порога
-                    # Для положительных порогов: отправляем, когда спред становится хуже (меньше) порога
+                    # Для положительных порогов: отправляем, когда closing_spread_display <= close_threshold_pct
+                    # (т.е. когда убыток при закрытии становится приемлемым)
+                    # Для отрицательных порогов: отправляем, когда closing_spread <= close_threshold_pct
                     threshold_met = False
                     if close_threshold_pct is not None and closing_spread is not None:
                         if close_threshold_pct < 0:
                             # Для отрицательных порогов: спред хуже (меньше) порога
                             threshold_met = closing_spread <= close_threshold_pct
                         else:
-                            # Для положительных порогов: спред хуже (меньше) порога - отправляем уведомление
-                            threshold_met = closing_spread <= close_threshold_pct
+                            # Для положительных порогов: используем closing_spread_display (уже инвертированное значение)
+                            # Закрываем, когда closing_spread_display <= close_threshold_pct
+                            threshold_met = closing_spread_display is not None and closing_spread_display <= close_threshold_pct
                     
                     if threshold_met:
                         # Проверяем интервал между отправками (раз в минуту)
@@ -756,7 +758,10 @@ class PerpArbitrageBot:
                                         # Обновляем время последней отправки
                                         last_sent_time[key] = current_time
                                         
-                                        logger.info(f"📱 Отправлено сообщение в Telegram: закрытие при спреде {closing_spread:.2f}% <= {close_threshold_pct:.2f}%")
+                                        # Используем closing_spread_display для лога (уже инвертированное значение)
+                                        closing_display_log = format_number(closing_spread_display) if closing_spread_display is not None else "N/A"
+                                        threshold_log = format_number(close_threshold_pct) if close_threshold_pct is not None else "N/A"
+                                        logger.info(f"📱 Отправлено сообщение в Telegram: закрытие при спреде {closing_display_log}% <= {threshold_log}%")
                                     else:
                                         logger.warning(f"📱 Telegram включен, но канал не настроен для режима {config.ENV_MODE}")
                             except Exception as e:
@@ -844,7 +849,7 @@ async def main():
                     else:
                         # Если ответ "Нет" на открытие позиций, спрашиваем про мониторинг
                         print("\nВключить мониторинг?")
-                        print("Введите 'Да' или 'Нет': если 'Да', то введите min цену закр, для отправки сообщения в тг")
+                        print("Введите 'Да' или 'Нет': если 'Да', то введите min цену (через .) закр, для отправки сообщения в тг")
                         answer2 = input().strip()
                         answer2_lower = answer2.lower()
                         monitor_yes = answer2_lower.startswith("да") or answer2_lower.startswith("yes") or answer2_lower.startswith("y")

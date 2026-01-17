@@ -4,14 +4,14 @@
 
 Проект поддерживает следующие криптовалютные биржи для арбитража на фьючерсах:
 
-1. **Bybit** (bybit)
-2. **Gate.io** (gate)
-3. **MEXC** (mexc)
-4. **XT.com** (xt)
-5. **Binance** (binance)
-6. **Bitget** (bitget)
+1. **Bybit** (bybit) готово
+2. **Gate.io** (gate) готово
+3. **MEXC** (mexc) жду
+4. **Binance** (binance) готово
+5. **Bitget** (bitget)
+6. **BingX** (bingx)
 7. **OKX** (okx)
-8. **BingX** (bingx)
+8. **XT.com** (xt)
 
 **Примечание:** LBank (lbank) имеет реализацию в коде, но временно отключен для арбитража.
 
