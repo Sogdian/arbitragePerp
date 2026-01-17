@@ -766,6 +766,61 @@ class PerpArbitrageBot:
                                         logger.warning(f"📱 Telegram включен, но канал не настроен для режима {config.ENV_MODE}")
                             except Exception as e:
                                 logger.warning(f"Ошибка отправки в Telegram: {e}", exc_info=True)
+                    
+                    # Дополнительная проверка: отправляем сообщение, когда fr_spread <= 0.05%
+                    fr_threshold_met = False
+                    if fr_spread is not None:
+                        fr_threshold_met = fr_spread <= 0.05
+                    
+                    if fr_threshold_met:
+                        # Проверяем интервал между отправками (раз в минуту) - используем отдельный ключ для fr_spread
+                        key_fr = (coin, long_exchange, short_exchange, "fr_spread")
+                        current_time = time.time()
+                        last_sent_fr = last_sent_time.get(key_fr, 0)
+                        
+                        if current_time - last_sent_fr >= SEND_INTERVAL_SEC:
+                            try:
+                                telegram = TelegramSender()
+                                if telegram.enabled:
+                                    # bot.py всегда использует FREE_CHANNEL_ID
+                                    channel_id = config.FREE_CHANNEL_ID
+                                    if channel_id:
+                                        # Формируем сообщение в новом формате
+                                        long_ex_capitalized = long_exchange.capitalize()
+                                        short_ex_capitalized = short_exchange.capitalize()
+                                        
+                                        message_lines = [
+                                            f"⏰ <b>Time to close {coin}:</b> Long ({long_ex_capitalized}) / Short ({short_ex_capitalized})",
+                                        ]
+                                        
+                                        exit_threshold = self.get_exit_threshold_pct()
+                                        # Используем closing_spread_display из лога (уже инвертированное значение)
+                                        if closing_spread_display is not None:
+                                            if close_threshold_pct is not None:
+                                                message_lines.append(f"🚩 <b>Close price:</b> {format_number(closing_spread_display)}% (min: {format_number(exit_threshold)}% цель: {format_number(close_threshold_pct)}%)")
+                                            else:
+                                                message_lines.append(f"🚩 <b>Close price:</b> {format_number(closing_spread_display)}% (min: {format_number(exit_threshold)}%)")
+                                        else:
+                                            message_lines.append(f"🚩 <b>Close price:</b> N/A (min: {format_number(exit_threshold)}%)")
+                                        
+                                        # Используем fr_spread и total_spread из лога, форматируем через format_number
+                                        fr_spread_formatted = format_number(fr_spread)
+                                        total_spread_formatted = format_number(total_spread)
+                                        message_lines.append(f"💰 fr_spread: {fr_spread_formatted} | 🎯 total_spread: {total_spread_formatted}")
+                                        
+                                        telegram_message = "\n".join(message_lines)
+                                        await telegram.send_message(telegram_message, channel_id=channel_id)
+                                        
+                                        # Обновляем время последней отправки
+                                        last_sent_time[key_fr] = current_time
+                                        
+                                        # Логируем отправку
+                                        fr_spread_log = format_number(fr_spread)
+                                        logger.info(f"📱 Отправлено сообщение в Telegram: fr_spread {fr_spread_log}% <= 0.05%")
+                                    else:
+                                        logger.warning(f"📱 Telegram включен, но канал не настроен для режима {config.ENV_MODE}")
+                            except Exception as e:
+                                logger.warning(f"Ошибка отправки в Telegram: {e}", exc_info=True)
                         else:
                             # Интервал не прошел, пропускаем отправку
                             remaining = SEND_INTERVAL_SEC - (current_time - last_sent)
