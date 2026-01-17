@@ -660,7 +660,13 @@ async def _binance_plan_leg(*, exchange_obj: Any, coin: str, direction: str, coi
     limit_price = _round_price_for_side(float(candidates[0]), tick, "buy" if side == "BUY" else "sell")
     notional = coin_amount * limit_price
     if min_notional > 0 and notional < min_notional:
-        return OpenLegResult(exchange="binance", direction=direction, ok=False, error=f"minNotional {min_notional_raw} > requested ~{_format_number(notional)}")
+        min_qty_needed = min_notional / limit_price if limit_price > 0 else 0
+        return OpenLegResult(
+            exchange="binance",
+            direction=direction,
+            ok=False,
+            error=f"минимальная номинальная стоимость ордера {min_notional_raw} USDT > запрошенная {_format_number(notional)} USDT (qty={_format_number(coin_amount)} {coin} × цена {_format_number(limit_price)}). Минимум монет: ~{_format_number(min_qty_needed)} {coin}"
+        )
 
     qty_str = _format_by_step(coin_amount, step_raw)
     candidates_str = "[" + ", ".join([_format_number(c) for c in candidates]) + "]"
