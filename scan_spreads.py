@@ -469,8 +469,8 @@ def _get_exchange_url(exchange: str, coin: str) -> str:
         symbol = f"{coin_upper}USDT"
         return f"https://www.bitget.com/ru/futures/{symbol}"
     elif exchange_lower == "bingx":
-        symbol = f"{coin_upper}USDT"
-        return f"https://bingx.com/ru-ru/futures/forward/{symbol}"
+        symbol = f"{coin_upper}-USDT"
+        return f"https://bingx.com/ru-ru/perpetual/{symbol}"
     elif exchange_lower == "mexc":
         symbol = f"{coin_upper}_USDT"
         return f"https://www.mexc.com/ru-RU/futures/{symbol}"
@@ -565,8 +565,8 @@ def _format_telegram_message(
     
     lines.append("")
     
-    # Стратегия
-    lines.append(f'💎 <b>Strategy:</b> {coin} Long ({long_ex_capitalized}), Short ({short_ex_capitalized})')
+    # Стратегия с ссылками
+    lines.append(f'💎 <b>Strategy:</b> {coin} Long (<a href="{long_url}">{long_ex_capitalized}</a>), Short (<a href="{short_url}">{short_ex_capitalized}</a>)')
     
     return "\n".join(lines)
 
@@ -631,8 +631,8 @@ def _format_combined_telegram_message(
             funding_spread_str = f" | Funding spread: {funding_spread:.3f}%"
         lines.append(f'• Price spread: {open_spread_pct:.3f}%{funding_spread_str}')
         
-        # Strategy
-        lines.append(f'💎 Strategy: {coin} Long ({long_ex_capitalized}), Short ({short_ex_capitalized})')
+        # Strategy с ссылками
+        lines.append(f'💎 Strategy: {coin} Long (<a href="{long_url}">{long_ex_capitalized}</a>), Short (<a href="{short_url}">{short_ex_capitalized}</a>)')
         lines.append("")
     
     return "\n".join(lines)
@@ -956,8 +956,10 @@ async def process_coin(
                             if table_image:
                                 max_spread_str = f"{max_total_spread:.3f}" if max_total_spread is not None else "N/A"
                                 if max_opp:
-                                    long_ex_cap = max_opp["long_ex"].capitalize()
-                                    short_ex_cap = max_opp["short_ex"].capitalize()
+                                    long_ex = max_opp["long_ex"]
+                                    short_ex = max_opp["short_ex"]
+                                    long_ex_cap = long_ex.capitalize()
+                                    short_ex_cap = short_ex.capitalize()
                                     caption = f'🔔 Signal: {coin} (for liq: {SCAN_COIN_INVEST:.1f} USDT)\n{coin} Long ({long_ex_cap}), Short ({short_ex_cap}) max total spread: {max_spread_str}'
                                 else:
                                     caption = f'🔔 Signal: {coin} (for liq: {SCAN_COIN_INVEST:.1f} USDT)\nmax total spread: {max_spread_str}'
