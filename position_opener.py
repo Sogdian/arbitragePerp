@@ -31,6 +31,10 @@ import httpx
 # Логируем в __main__, чтобы совпадало с основным логгером bot.py
 logger = logging.getLogger("__main__")
 
+# Максимальная глубина стакана для подбора цен и количества попыток исполнения (уровни 1..N).
+# Раньше использовалось 3, но по требованию увеличено до 10.
+MAX_ORDERBOOK_LEVELS = max(1, int(os.getenv("OPEN_ORDERBOOK_LEVELS", "10") or "10"))
+
 
 def _format_number(value: Optional[float], precision: int = 3) -> str:
     """
@@ -643,7 +647,7 @@ async def _binance_plan_leg(*, exchange_obj: Any, coin: str, direction: str, coi
         return OpenLegResult(exchange="binance", direction=direction, ok=False, error="missing BINANCE_API_KEY/BINANCE_API_SECRET in env")
 
     symbol = exchange_obj._normalize_symbol(coin)
-    ob = await exchange_obj.get_orderbook(coin, limit=3)
+    ob = await exchange_obj.get_orderbook(coin, limit=MAX_ORDERBOOK_LEVELS)
     if not ob or not ob.get("bids") or not ob.get("asks"):
         return OpenLegResult(exchange="binance", direction=direction, ok=False, error=f"orderbook not available for {coin}")
 
@@ -656,7 +660,7 @@ async def _binance_plan_leg(*, exchange_obj: Any, coin: str, direction: str, coi
     # Candidates (<=3 levels): prices where cumulative size >= qty
     candidates: list[float] = []
     cum = 0.0
-    for lvl in book_side[:3]:
+    for lvl in book_side[:MAX_ORDERBOOK_LEVELS]:
         try:
             p = float(lvl[0]); s = float(lvl[1])
         except Exception:
@@ -667,7 +671,12 @@ async def _binance_plan_leg(*, exchange_obj: Any, coin: str, direction: str, coi
         if cum + 1e-12 >= coin_amount:
             candidates.append(p)
     if not candidates:
-        return OpenLegResult(exchange="binance", direction=direction, ok=False, error=f"not enough depth in first 3 levels: need {coin_amount}, available {cum}")
+        return OpenLegResult(
+            exchange="binance",
+            direction=direction,
+            ok=False,
+            error=f"not enough depth in first {MAX_ORDERBOOK_LEVELS} levels: need {coin_amount}, available {cum}",
+        )
 
     f = await _binance_get_symbol_filters(exchange_obj=exchange_obj, symbol=symbol)
     tick_raw = f.get("tickSize")
@@ -697,8 +706,8 @@ async def _binance_plan_leg(*, exchange_obj: Any, coin: str, direction: str, coi
         )
 
     qty_str = _format_by_step(coin_amount, step_raw)
-    candidates_str = "[" + ", ".join([_format_number(c) for c in candidates]) + "]"
-    logger.info(f"План Binance: {direction} qty={qty_str} | best={_format_number(best_price)} | кандидаты уровней(<=3)={candidates_str}")
+    candidates_str = "[" + ", ".join([_format_number(c) for c in candidates[:MAX_ORDERBOOK_LEVELS]]) + "]"
+    logger.info(f"План Binance: {direction} qty={qty_str} | best={_format_number(best_price)} | кандидаты уровней(<=%d)=%s" % (MAX_ORDERBOOK_LEVELS, candidates_str))
 
     return {
         "exchange": "binance",
@@ -805,7 +814,7 @@ async def _binance_place_leg(*, planned: Dict[str, Any]) -> OpenLegResult:
     tick_raw = planned.get("tickSize")
     tick = float(tick_raw) if tick_raw else 0.0
     candidates = planned.get("candidate_prices_raw") or [float(planned["price_str"])]
-    attempts = candidates[:3]
+    attempts = candidates[:MAX_ORDERBOOK_LEVELS]
     for idx, px_raw in enumerate(attempts, start=1):
         px = _round_price_for_side(float(px_raw), tick, "buy" if side == "BUY" else "sell")
         px_str = _format_by_step(px, tick_raw)
@@ -845,7 +854,12 @@ async def _binance_place_leg(*, planned: Dict[str, Any]) -> OpenLegResult:
         if ok_full:
             return OpenLegResult(exchange="binance", direction=direction, ok=True, order_id=order_id, raw=data)
         logger.warning(f"Binance: не исполнилось полностью на уровне {idx} | исполнено={_format_number(executed)} | требовалось={_format_number(float(planned['qty']))}")
-    return OpenLegResult(exchange="binance", direction=direction, ok=False, error="не удалось исполнить ордер полностью за 3 попытки (уровни 1-3)")
+    return OpenLegResult(
+        exchange="binance",
+        direction=direction,
+        ok=False,
+        error=f"не удалось исполнить ордер полностью за {MAX_ORDERBOOK_LEVELS} попыток (уровни 1-{MAX_ORDERBOOK_LEVELS})",
+    )
 
 
 # =========================
@@ -922,7 +936,7 @@ async def _mexc_plan_leg(*, exchange_obj: Any, coin: str, direction: str, coin_a
         logger.warning(f"MEXC: предварительная проверка API ключа вернула ошибку: {test_resp}")
 
     symbol = exchange_obj._normalize_symbol(coin)
-    ob = await exchange_obj.get_orderbook(coin, limit=3)
+    ob = await exchange_obj.get_orderbook(coin, limit=MAX_ORDERBOOK_LEVELS)
     if not ob or not ob.get("bids") or not ob.get("asks"):
         return OpenLegResult(exchange="mexc", direction=direction, ok=False, error=f"orderbook not available for {coin}")
 
@@ -936,7 +950,7 @@ async def _mexc_plan_leg(*, exchange_obj: Any, coin: str, direction: str, coin_a
 
     candidates: list[float] = []
     cum = 0.0
-    for lvl in book_side[:3]:
+    for lvl in book_side[:MAX_ORDERBOOK_LEVELS]:
         try:
             p = float(lvl[0]); s = float(lvl[1])
         except Exception:
@@ -947,10 +961,15 @@ async def _mexc_plan_leg(*, exchange_obj: Any, coin: str, direction: str, coin_a
         if cum + 1e-12 >= coin_amount:
             candidates.append(p)
     if not candidates:
-        return OpenLegResult(exchange="mexc", direction=direction, ok=False, error=f"not enough depth in first 3 levels: need {coin_amount}, available {cum}")
+        return OpenLegResult(
+            exchange="mexc",
+            direction=direction,
+            ok=False,
+            error=f"not enough depth in first {MAX_ORDERBOOK_LEVELS} levels: need {coin_amount}, available {cum}",
+        )
 
-    candidates_str = "[" + ", ".join([_format_number(c) for c in candidates]) + "]"
-    logger.info(f"План MEXC: {direction} qty={_format_number(coin_amount)} | best={_format_number(best_price)} | кандидаты уровней(<=3)={candidates_str}")
+    candidates_str = "[" + ", ".join([_format_number(c) for c in candidates[:MAX_ORDERBOOK_LEVELS]]) + "]"
+    logger.info(f"План MEXC: {direction} qty={_format_number(coin_amount)} | best={_format_number(best_price)} | кандидаты уровней(<=%d)=%s" % (MAX_ORDERBOOK_LEVELS, candidates_str))
 
     # type code: best-effort "4" as FOK-like, fallback to "1" limit
     mexc_type = int(os.getenv("MEXC_ORDER_TYPE", "4"))
@@ -1044,7 +1063,7 @@ async def _mexc_place_leg(*, planned: Dict[str, Any]) -> OpenLegResult:
     open_type = planned["openType"]
     qty = planned["qty"]
     candidates = planned.get("candidate_prices_raw") or []
-    attempts = candidates[:3]
+    attempts = candidates[:MAX_ORDERBOOK_LEVELS]
     for idx, px_raw in enumerate(attempts, start=1):
         px = float(px_raw)
         px_str = _format_number(px)
@@ -1094,11 +1113,16 @@ async def _mexc_place_leg(*, planned: Dict[str, Any]) -> OpenLegResult:
         if ok_full:
             return OpenLegResult(exchange="mexc", direction=direction, ok=True, order_id=order_id_s, raw=data)
         logger.warning(f"MEXC: не исполнилось полностью на уровне {idx} | исполнено={_format_number(deal)} | требовалось={qty}")
-    return OpenLegResult(exchange="mexc", direction=direction, ok=False, error="не удалось исполнить ордер полностью за 3 попытки (уровни 1-3)")
+    return OpenLegResult(
+        exchange="mexc",
+        direction=direction,
+        ok=False,
+        error=f"не удалось исполнить ордер полностью за {MAX_ORDERBOOK_LEVELS} попыток (уровни 1-{MAX_ORDERBOOK_LEVELS})",
+    )
 
 
 # =========================
-# Bitget Futures trading (3 levels, FOK, full-fill)
+# Bitget Futures trading (levels 1..MAX_ORDERBOOK_LEVELS, FOK, full-fill)
 # =========================
 
 _BITGET_CONTRACT_CACHE: Dict[str, Dict[str, Optional[str]]] = {}
@@ -1254,11 +1278,13 @@ async def _bitget_plan_leg(*, exchange_obj: Any, coin: str, direction: str, coin
         return OpenLegResult(exchange="bitget", direction=direction, ok=False, error="Bitget требует passphrase (ACCESS-PASSPHRASE). Добавь BITGET_API_PASSPHRASE в .env")
 
     symbol = exchange_obj._normalize_symbol(coin)
-    ob = await exchange_obj.get_orderbook(coin, limit=3)
+    ob = await exchange_obj.get_orderbook(coin, limit=MAX_ORDERBOOK_LEVELS)
     if not ob or not ob.get("bids") or not ob.get("asks"):
         return OpenLegResult(exchange="bitget", direction=direction, ok=False, error=f"orderbook not available for {coin}")
 
-    side = "buy" if direction == "long" else "sell"
+    # Bitget может работать в unilateral (one-way) режиме, где ожидаются "unilateral" типы side:
+    # open_long/open_short вместо buy/sell. Это устраняет ошибку 40774.
+    side = "open_long" if direction == "long" else "open_short"
     book_side = ob["asks"] if direction == "long" else ob["bids"]
     best_price = float(book_side[0][0])
     if best_price <= 0:
@@ -1266,7 +1292,7 @@ async def _bitget_plan_leg(*, exchange_obj: Any, coin: str, direction: str, coin
 
     candidates: list[float] = []
     cum = 0.0
-    for lvl in book_side[:3]:
+    for lvl in book_side[:MAX_ORDERBOOK_LEVELS]:
         try:
             p = float(lvl[0]); s = float(lvl[1])
         except Exception:
@@ -1277,7 +1303,12 @@ async def _bitget_plan_leg(*, exchange_obj: Any, coin: str, direction: str, coin
         if cum + 1e-12 >= coin_amount:
             candidates.append(p)
     if not candidates:
-        return OpenLegResult(exchange="bitget", direction=direction, ok=False, error=f"not enough depth in first 3 levels: need {coin_amount}, available {cum}")
+        return OpenLegResult(
+            exchange="bitget",
+            direction=direction,
+            ok=False,
+            error=f"not enough depth in first {MAX_ORDERBOOK_LEVELS} levels: need {coin_amount}, available {cum}",
+        )
 
     f = await _bitget_get_contract_filters(exchange_obj=exchange_obj, symbol=symbol)
     tick_raw = f.get("tickSize")
@@ -1303,8 +1334,8 @@ async def _bitget_plan_leg(*, exchange_obj: Any, coin: str, direction: str, coin
 
     qty_str = _format_by_step(coin_amount, step_raw)
     px_str = _format_by_step(limit_price, tick_raw)
-    candidates_str = "[" + ", ".join([_format_number(c) for c in candidates]) + "]"
-    logger.info(f"План Bitget: {direction} qty={qty_str} | best={_format_number(best_price)} | кандидаты уровней(<=3)={candidates_str}")
+    candidates_str = "[" + ", ".join([_format_number(c) for c in candidates[:MAX_ORDERBOOK_LEVELS]]) + "]"
+    logger.info(f"План Bitget: {direction} qty={qty_str} | best={_format_number(best_price)} | кандидаты уровней(<=%d)=%s" % (MAX_ORDERBOOK_LEVELS, candidates_str))
 
     return {
         "exchange": "bitget",
@@ -1394,10 +1425,9 @@ async def _bitget_place_leg(*, planned: Dict[str, Any]) -> OpenLegResult:
     direction = planned["direction"]
     symbol = planned["symbol"]
     product_type = planned["productType"]
-    side = planned["side"]
     qty = planned["qty"]
     candidates = planned.get("candidate_prices_raw") or [float(planned["price_str"])]
-    attempts = candidates[:3]
+    attempts = candidates[:MAX_ORDERBOOK_LEVELS]
     tick_raw = planned.get("tickSize")
     tick = float(tick_raw) if tick_raw else 0.0
 
@@ -1412,7 +1442,7 @@ async def _bitget_place_leg(*, planned: Dict[str, Any]) -> OpenLegResult:
         if not bitget_margin_mode:
             bitget_margin_mode = "crossed"
 
-        body = {
+        base_body = {
             "symbol": symbol,
             "productType": product_type,
             "marginCoin": "USDT",
@@ -1420,30 +1450,75 @@ async def _bitget_place_leg(*, planned: Dict[str, Any]) -> OpenLegResult:
             "orderType": "limit",
             "price": px_str,
             "size": qty,
-            "side": side,
             "force": "fok",
             "clientOid": f"arb-{int(time.time()*1000)}-{direction}-{idx}",
         }
 
-        data = await _bitget_private_request(
-            exchange_obj=exchange_obj,
-            api_key=api_key,
-            api_secret=api_secret,
-            api_passphrase=api_pass,
-            method="POST",
-            path="/api/v2/mix/order/place-order",
-            body=body,
-        )
+        # Bitget режимы (unilateral/hedge) требуют разные поля. Пробуем несколько схем безопасно
+        # (ошибки типа "side mismatch"/"unilateral ..." возникают ДО создания ордера).
+        if direction == "long":
+            side_open = "open_long"
+            side_buy_sell = "buy"
+            pos_side = "long"
+        else:
+            side_open = "open_short"
+            side_buy_sell = "sell"
+            pos_side = "short"
 
-        code, msg = _bitget_extract_code_msg(data)
-        if isinstance(data, dict) and data.get("_error"):
-            return OpenLegResult(exchange="bitget", direction=direction, ok=False, error=f"api error: {data}", raw=data)
-        if code is not None and code != "00000":
-            # FOK can fail if not filled immediately -> try next level
-            if msg and ("fok" in msg.lower() or "fill" in msg.lower() or "immediately" in msg.lower()):
-                logger.warning(f"Bitget: FOK отклонён на уровне {idx} | причина={msg}")
-                continue
-            return OpenLegResult(exchange="bitget", direction=direction, ok=False, error=f"api error: {data}", raw=data)
+        candidate_bodies = [
+            {**base_body, "side": side_open},
+            {**base_body, "side": side_buy_sell, "tradeSide": "open", "posSide": pos_side},
+            {**base_body, "side": side_buy_sell, "posSide": pos_side},
+            {**base_body, "side": side_buy_sell, "tradeSide": "open", "holdSide": pos_side},
+            {**base_body, "side": side_buy_sell, "holdSide": pos_side},
+            {**base_body, "side": side_buy_sell, "tradeSide": side_open},
+        ]
+
+        data: Any = None
+        ok_created = False
+        for schema_i, body in enumerate(candidate_bodies, start=1):
+            data = await _bitget_private_request(
+                exchange_obj=exchange_obj,
+                api_key=api_key,
+                api_secret=api_secret,
+                api_passphrase=api_pass,
+                method="POST",
+                path="/api/v2/mix/order/place-order",
+                body=body,
+            )
+
+            code, msg = _bitget_extract_code_msg(data)
+
+            if code is not None and code != "00000":
+                msg_l = (msg or "").lower()
+                # Неверные ключи/подпись/passphrase обычно дают sign/signature/passphrase ошибки
+                if "sign" in msg_l or "signature" in msg_l or "passphrase" in msg_l:
+                    return OpenLegResult(
+                        exchange="bitget",
+                        direction=direction,
+                        ok=False,
+                        error=f"Bitget auth error (проверь BITGET_API_KEY/BITGET_API_SECRET/BITGET_API_PASSPHRASE): {msg}",
+                        raw=data,
+                    )
+
+                # Схема не подходит — пробуем следующую схему на этом же уровне цены
+                if "side mismatch" in msg_l or "unilateral" in msg_l or str(code) in ("400172", "40774"):
+                    logger.warning(f"Bitget: схема {schema_i}/{len(candidate_bodies)} не подошла | code={code} msg={msg}")
+                    continue
+
+                # FOK не исполнился мгновенно — переходим к следующему уровню цены
+                if msg and ("fok" in msg_l or "fill" in msg_l or "immediately" in msg_l):
+                    logger.warning(f"Bitget: FOK отклонён на уровне {idx} | причина={msg}")
+                    break
+
+                return OpenLegResult(exchange="bitget", direction=direction, ok=False, error=f"api error: {data}", raw=data)
+
+            ok_created = True
+            break
+
+        if not ok_created:
+            # Ни одна схема не подошла для этого уровня цены — идём на следующий уровень
+            continue
 
         item = data.get("data") if isinstance(data, dict) else None
         order_id = None
@@ -1460,11 +1535,16 @@ async def _bitget_place_leg(*, planned: Dict[str, Any]) -> OpenLegResult:
             return OpenLegResult(exchange="bitget", direction=direction, ok=True, order_id=order_id_s, raw=data)
         logger.warning(f"Bitget: не исполнилось полностью на уровне {idx} | исполнено={_format_number(filled)} | требовалось={qty}")
 
-    return OpenLegResult(exchange="bitget", direction=direction, ok=False, error="не удалось исполнить ордер полностью за 3 попытки (уровни 1-3)")
+    return OpenLegResult(
+        exchange="bitget",
+        direction=direction,
+        ok=False,
+        error=f"не удалось исполнить ордер полностью за {MAX_ORDERBOOK_LEVELS} попыток (уровни 1-{MAX_ORDERBOOK_LEVELS})",
+    )
 
 
 # =========================
-# BingX Futures trading (3 levels, FOK, full-fill)
+# BingX Futures trading (levels 1..MAX_ORDERBOOK_LEVELS, FOK, full-fill)
 # =========================
 
 _BINGX_CONTRACT_CACHE: Dict[str, Dict[str, Optional[str]]] = {}
@@ -1556,7 +1636,7 @@ async def _bingx_plan_leg(*, exchange_obj: Any, coin: str, direction: str, coin_
         return OpenLegResult(exchange="bingx", direction=direction, ok=False, error="missing BINGX_API_KEY/BINGX_API_SECRET in env")
 
     symbol = exchange_obj._normalize_symbol(coin)
-    ob = await exchange_obj.get_orderbook(coin, limit=3)
+    ob = await exchange_obj.get_orderbook(coin, limit=MAX_ORDERBOOK_LEVELS)
     if not ob or not ob.get("bids") or not ob.get("asks"):
         return OpenLegResult(exchange="bingx", direction=direction, ok=False, error=f"orderbook not available for {coin}")
 
@@ -1569,7 +1649,7 @@ async def _bingx_plan_leg(*, exchange_obj: Any, coin: str, direction: str, coin_
 
     candidates: list[float] = []
     cum = 0.0
-    for lvl in book_side[:3]:
+    for lvl in book_side[:MAX_ORDERBOOK_LEVELS]:
         try:
             p = float(lvl[0]); s = float(lvl[1])
         except Exception:
@@ -1580,7 +1660,12 @@ async def _bingx_plan_leg(*, exchange_obj: Any, coin: str, direction: str, coin_
         if cum + 1e-12 >= coin_amount:
             candidates.append(p)
     if not candidates:
-        return OpenLegResult(exchange="bingx", direction=direction, ok=False, error=f"not enough depth in first 3 levels: need {coin_amount}, available {cum}")
+        return OpenLegResult(
+            exchange="bingx",
+            direction=direction,
+            ok=False,
+            error=f"not enough depth in first {MAX_ORDERBOOK_LEVELS} levels: need {coin_amount}, available {cum}",
+        )
 
     f = await _bingx_get_contract_filters(exchange_obj=exchange_obj, symbol=symbol)
     tick_raw = f.get("tickSize")
@@ -1605,8 +1690,8 @@ async def _bingx_plan_leg(*, exchange_obj: Any, coin: str, direction: str, coin_
 
     qty_str = _format_by_step(coin_amount, step_raw)
     px_str = _format_by_step(limit_price, tick_raw)
-    candidates_str = "[" + ", ".join([_format_number(c) for c in candidates]) + "]"
-    logger.info(f"План BingX: {direction} qty={qty_str} | best={_format_number(best_price)} | кандидаты уровней(<=3)={candidates_str}")
+    candidates_str = "[" + ", ".join([_format_number(c) for c in candidates[:MAX_ORDERBOOK_LEVELS]]) + "]"
+    logger.info(f"План BingX: {direction} qty={qty_str} | best={_format_number(best_price)} | кандидаты уровней(<=%d)=%s" % (MAX_ORDERBOOK_LEVELS, candidates_str))
 
     return {
         "exchange": "bingx",
@@ -1657,6 +1742,10 @@ async def _bingx_wait_full_fill(*, planned: Dict[str, Any], order_id: str) -> Tu
             await asyncio.sleep(0.2)
             continue
 
+        # BingX query может возвращать вложенность data.order (как в ответе place order)
+        if isinstance(item.get("order"), dict):
+            item = item.get("order")  # type: ignore[assignment]
+
         status = str(item.get("status") or item.get("state") or "")
         filled_raw = item.get("executedQty") or item.get("filledQty") or item.get("dealQty") or item.get("dealSize") or item.get("filledSize")
         try:
@@ -1683,7 +1772,7 @@ async def _bingx_place_leg(*, planned: Dict[str, Any]) -> OpenLegResult:
     position_side = planned.get("positionSide")
     qty = planned["qty"]
     candidates = planned.get("candidate_prices_raw") or [float(planned["price_str"])]
-    attempts = candidates[:3]
+    attempts = candidates[:MAX_ORDERBOOK_LEVELS]
     tick_raw = planned.get("tickSize")
     tick = float(tick_raw) if tick_raw else 0.0
 
@@ -1759,7 +1848,9 @@ async def _bingx_place_leg(*, planned: Dict[str, Any]) -> OpenLegResult:
             except Exception:
                 exec0 = 0.0
         if status0.upper() in ("CANCELLED", "CANCELED") and exec0 <= 0:
-            logger.warning(f"BingX: FOK отменён на уровне {idx} | status={status0} | исполнено={_format_number(exec0)}")
+            logger.warning(
+                f"BingX: ордер создан (orderId={order_id_s}), но FOK отменён на уровне {idx} | status={status0} | исполнено={_format_number(exec0)}"
+            )
             continue
 
         ok_full, filled = await _bingx_wait_full_fill(planned={**planned, "price_str": px_str, "limit_price": float(px_str)}, order_id=order_id_s)
@@ -1767,7 +1858,12 @@ async def _bingx_place_leg(*, planned: Dict[str, Any]) -> OpenLegResult:
             return OpenLegResult(exchange="bingx", direction=direction, ok=True, order_id=order_id_s, raw=data)
         logger.warning(f"BingX: не исполнилось полностью на уровне {idx} | исполнено={_format_number(filled)} | требовалось={qty}")
 
-    return OpenLegResult(exchange="bingx", direction=direction, ok=False, error="не удалось исполнить ордер полностью за 3 попытки (уровни 1-3)")
+    return OpenLegResult(
+        exchange="bingx",
+        direction=direction,
+        ok=False,
+        error=f"не удалось исполнить ордер полностью за {MAX_ORDERBOOK_LEVELS} попыток (уровни 1-{MAX_ORDERBOOK_LEVELS})",
+    )
 
 
 async def _open_one_leg(
@@ -2132,7 +2228,7 @@ async def _bybit_plan_leg(*, exchange_obj: Any, coin: str, direction: str, coin_
     price_str = _format_by_step(limit_price, tick_raw)
 
     candidates_str = "[" + ", ".join([_format_number(c) for c in candidates]) + "]"
-    logger.info(f"План Bybit: {direction} qty={qty_str} | best={_format_number(best_price)} | кандидаты уровней(<=3)={candidates_str}")
+    logger.info(f"План Bybit: {direction} qty={qty_str} | best={_format_number(best_price)} | кандидаты уровней(<=%d)=%s" % (MAX_ORDERBOOK_LEVELS, candidates_str))
 
     return {
         "exchange": "bybit",
@@ -2159,8 +2255,8 @@ async def _bybit_place_leg(*, planned: Dict[str, Any]) -> OpenLegResult:
     tick = float(tick_raw) if tick_raw else 0.0
 
     candidates = planned.get("candidate_prices_raw") or [float(planned["price_str"])]
-    # максимум 3 попытки: уровень 1 -> 2 -> 3
-    attempts = candidates[:3]
+    # максимум N попыток: уровни 1..MAX_ORDERBOOK_LEVELS
+    attempts = candidates[:MAX_ORDERBOOK_LEVELS]
     for idx, px_raw in enumerate(attempts, start=1):
         px = _round_price_for_side(float(px_raw), tick, "buy" if side == "Buy" else "sell")
         px_str = _format_by_step(px, tick_raw)
@@ -2188,7 +2284,12 @@ async def _bybit_place_leg(*, planned: Dict[str, Any]) -> OpenLegResult:
         # если не исполнилось, пробуем следующий уровень
         logger.warning(f"Bybit: не исполнилось полностью на уровне {idx} | исполнено={_format_number(filled_qty)} | требовалось={_format_number(float(planned['qty']))}")
 
-    return OpenLegResult(exchange="bybit", direction=direction, ok=False, error="не удалось исполнить ордер полностью за 3 попытки (уровни 1-3)")
+    return OpenLegResult(
+        exchange="bybit",
+        direction=direction,
+        ok=False,
+        error=f"не удалось исполнить ордер полностью за {MAX_ORDERBOOK_LEVELS} попыток (уровни 1-{MAX_ORDERBOOK_LEVELS})",
+    )
 
 
 async def _gate_private_post(*, exchange_obj: Any, api_key: str, api_secret: str, path: str, body: Dict[str, Any]) -> Any:
@@ -2323,7 +2424,7 @@ async def _gate_plan_leg(*, exchange_obj: Any, coin: str, direction: str, coin_a
     limit_price = _round_price_for_side(limit_price_raw, price_step, side)
 
     candidates_str = "[" + ", ".join([_format_number(c) for c in candidates]) + "]"
-    logger.info(f"План Gate: {direction} contracts={contracts_i} | best_bid={_format_number(best_bid)} best_ask={_format_number(best_ask)} | кандидаты уровней(<=3)={candidates_str}")
+    logger.info(f"План Gate: {direction} contracts={contracts_i} | best_bid={_format_number(best_bid)} best_ask={_format_number(best_ask)} | кандидаты уровней(<=%d)=%s" % (MAX_ORDERBOOK_LEVELS, candidates_str))
 
     size_signed = contracts_i if direction == "long" else -contracts_i
     price_str = _format_by_step(limit_price, str(price_step) if price_step > 0 else None)
@@ -2348,7 +2449,7 @@ async def _gate_place_leg(*, planned: Dict[str, Any]) -> OpenLegResult:
     api_secret = planned["api_secret"]
     direction = planned["direction"]
     candidates = planned.get("candidate_prices_raw") or [float(planned["price_str"])]
-    attempts = candidates[:3]
+    attempts = candidates[:MAX_ORDERBOOK_LEVELS]
     for idx, px_raw in enumerate(attempts, start=1):
         px = float(px_raw)
         px_str = _format_by_step(px, None)
@@ -2374,6 +2475,11 @@ async def _gate_place_leg(*, planned: Dict[str, Any]) -> OpenLegResult:
             return OpenLegResult(exchange="gate", direction=direction, ok=False, order_id=order_id, error="частичное исполнение (не 100%)", raw=data)
         logger.warning("Gate: не исполнилось полностью на уровне %s (0 исполнено) — пробуем следующий", idx)
 
-    return OpenLegResult(exchange="gate", direction=direction, ok=False, error="не удалось исполнить ордер полностью за 3 попытки (уровни 1-3)")
+    return OpenLegResult(
+        exchange="gate",
+        direction=direction,
+        ok=False,
+        error=f"не удалось исполнить ордер полностью за {MAX_ORDERBOOK_LEVELS} попыток (уровни 1-{MAX_ORDERBOOK_LEVELS})",
+    )
 
 
