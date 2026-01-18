@@ -677,22 +677,18 @@ class PerpArbitrageBot:
                     closing_spread_display = -closing_spread if closing_spread is not None else None
                     if closing_spread_display is not None:
                         if close_threshold_pct is not None:
-                            closing_str = f"🚩 Закр: {closing_spread_display:.3f}% (min: {exit_threshold:.3f}% цель: {close_threshold_pct:.3f}%)"
+                            closing_str = f"🚩 Закр: {format_number(closing_spread_display)}% (min: {format_number(exit_threshold)}% цель: {format_number(close_threshold_pct)}%)"
                         else:
-                            closing_str = f"🚩 Закр: {closing_spread_display:.3f}% (min: {exit_threshold:.3f}%)"
+                            closing_str = f"🚩 Закр: {format_number(closing_spread_display)}% (min: {format_number(exit_threshold)}%)"
                     else:
                         if close_threshold_pct is not None:
-                            closing_str = f"🚩 Закр: N/A (min: {exit_threshold:.3f}% цель: {close_threshold_pct:.3f}%)"
+                            closing_str = f"🚩 Закр: N/A (min: {format_number(exit_threshold)}% цель: {format_number(close_threshold_pct)}%)"
                         else:
-                            closing_str = f"🚩 Закр: N/A (min: {exit_threshold:.3f}%)"
-                    opening_str = f"⛳ Откр: {opening_spread:.3f}%" if opening_spread is not None else "⛳ Откр: N/A"
+                            closing_str = f"🚩 Закр: N/A (min: {format_number(exit_threshold)}%)"
+                    opening_str = f"⛳ Откр: {format_number(opening_spread)}%" if opening_spread is not None else "⛳ Откр: N/A"
                     
-                    if fr_spread is not None:
-                        fr_spread_str = f"{fr_spread:.3f}"
-                    else:
-                        fr_spread_str = "N/A"
-                    
-                    total_spread_str = f"{total_spread:.3f}" if total_spread is not None else "N/A"
+                    fr_spread_str = format_number(fr_spread)
+                    total_spread_str = format_number(total_spread)
                     
                     # Формируем информацию о биржах и монете
                     long_ex_str = f"Long {long_exchange}"
