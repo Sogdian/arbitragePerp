@@ -18,6 +18,24 @@
 ## Описание проекта
 Бот для анализа арбитража криптовалюты на фьючерсах между биржами. Поддерживает следующие биржи: Bybit, Gate.io, MEXC, XT.com, Binance, Bitget, OKX, BingX.
 
+## ⚠️ Важные правила работы с терминалом
+
+**КРИТИЧЕСКИ ВАЖНО: НЕ использовать heredoc-команды в PowerShell/терминале**
+
+- **ЗАПРЕЩЕНО** использовать команды вида `python - <<'PY'` или подобные heredoc-синтаксисы
+- **Причина:** В PowerShell такие команды вызывают `SyntaxError: invalid syntax`, особенно если терминал находится внутри Python REPL (`>>>`)
+- **Правильный подход:** Использовать только простые команды вида `python -c "..."` или создавать временные `.py` файлы
+- **Если терминал в Python REPL:** Сначала выйти через `exit()` или `Ctrl+C`, затем выполнять команды
+- **Пример ошибки:**
+  ```
+  >>> python - <<'PY'
+  File "<stdin>", line 1
+    python - <<'PY'
+             ^^
+  SyntaxError: invalid syntax
+  ```
+- **Решение:** Всегда проверять, что терминал находится в обычном shell (PowerShell/CMD), а не в Python REPL, перед выполнением команд
+
 ## Спреды открытия и закрытия
 opening_spread = (bid_short - ask_long) / ask_long * 100
 closing_spread = (bid_long - ask_short) / ask_short * 100
@@ -1929,3 +1947,25 @@ TELEGRAM_REPEAT_INTERVAL=3
 на bingx - есть https://bingx.com/ru-ru/perpetual/SPORTFUN-USDT SPORTFUN  и https://bingx.com/ru-ru/perpetual/FUNTOKEN-USDT FUN
 на okx - монеты нет
 на bitget - есть https://www.bitget.com/ru/futures/usdt/FUNUSDT SPORTFUN и https://www.bitget.com/ru/futures/usdt/FUNTOKENUSDT FUN 
+
+## Известные проблемы и ограничения
+
+### Проблемы с терминалом и командами
+
+**КРИТИЧЕСКИ ВАЖНО: НЕ использовать heredoc-команды**
+
+- **Проблема:** Команды вида `python - <<'PY'` вызывают `SyntaxError: invalid syntax` в PowerShell, особенно если терминал находится внутри Python REPL (`>>>`)
+- **Причина:** PowerShell не поддерживает heredoc-синтаксис Unix-стиля, а Python REPL пытается интерпретировать такие команды как Python-код
+- **Решение:** 
+  - Использовать только простые команды: `python -c "..."` 
+  - Если терминал в Python REPL — сначала выйти через `exit()` или `Ctrl+C`
+  - Всегда проверять, что терминал находится в обычном shell (PowerShell/CMD), а не в Python REPL
+- **Пример ошибки:**
+  ```
+  >>> python - <<'PY'
+  File "<stdin>", line 1
+    python - <<'PY'
+             ^^
+  SyntaxError: invalid syntax
+  ```
+- **Правило для AI-ассистентов:** Никогда не использовать heredoc-команды в этом проекте. Всегда использовать простые команды или временные файлы.
