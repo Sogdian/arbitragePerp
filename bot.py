@@ -632,8 +632,8 @@ class PerpArbitrageBot:
         last_sent_time: Dict[tuple, float] = {}
         # Интервал между отправками сообщений о закрытии (секунды), читается из .env
         SEND_INTERVAL_SEC = float(os.getenv("CLOSE_INTERVAL", "60"))  # По умолчанию 60 секунд (1 минута)
-        # Окно авто-закрытия: если за CLOSE_INTERVAL*3 отправились 3 Telegram-сообщения "закрытие при спреде" — закрываем позиции.
-        close_alert_window_sec = SEND_INTERVAL_SEC * 3.0
+        # Окно авто-закрытия: если за 1 минуту (60 секунд) отправились 3 Telegram-сообщения "закрытие при спреде" — закрываем позиции.
+        close_alert_window_sec = 60.0  # Фиксированное окно: 1 минута
         close_alert_times: List[float] = []
         
         try:
