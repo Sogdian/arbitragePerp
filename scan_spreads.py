@@ -239,17 +239,17 @@ async def _get_news_cached(
     async def _get_exchange_news(ex: str) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], bool]:
         k = (coin, ex)
         cached = _news_cache.get(k)
-        if cached and cached[0] > now_m:
-            return cached[1], cached[2], True
+    if cached and cached[0] > now_m:
+        return cached[1], cached[2], True
 
         # Один сетевой проход на биржу: announcements для конкретной биржи
-        anns = await bot.news_monitor._fetch_exchange_announcements(
-            limit=200,
-            days_back=days_back,
+    anns = await bot.news_monitor._fetch_exchange_announcements(
+        limit=200,
+        days_back=days_back,
             exchanges=[ex],
-        )
+    )
 
-        delisting_news = await bot.news_monitor.find_delisting_news(anns, coin_symbol=coin, lookback=lookback)
+    delisting_news = await bot.news_monitor.find_delisting_news(anns, coin_symbol=coin, lookback=lookback)
 
         # X (optional): дергаем только если по официальным announcements ничего не нашли
         if (not delisting_news) and getattr(bot, "x_news_monitor", None) is not None and bot.x_news_monitor.enabled:
@@ -264,10 +264,10 @@ async def _get_news_cached(
             except Exception:
                 pass
 
-        security_news: List[Dict[str, Any]] = []
+    security_news: List[Dict[str, Any]] = []
         # Security проверяем только если делистинг не найден (экономим запросы/шум).
-        if not delisting_news:
-            security_news = await bot.announcements_monitor.find_security_news(anns, coin_symbol=coin, lookback=lookback)
+    if not delisting_news:
+        security_news = await bot.announcements_monitor.find_security_news(anns, coin_symbol=coin, lookback=lookback)
             # X (optional): дергаем только если security по announcements не нашли
             if (not security_news) and getattr(bot, "x_news_monitor", None) is not None and bot.x_news_monitor.enabled:
                 try:
@@ -282,7 +282,7 @@ async def _get_news_cached(
                     pass
 
         _news_cache[k] = (now_m + NEWS_CACHE_TTL_SEC, delisting_news, security_news)
-        return delisting_news, security_news, False
+    return delisting_news, security_news, False
 
     del_long, sec_long, c1 = await _get_exchange_news(long_ex)
     del_short, sec_short, c2 = await _get_exchange_news(short_ex)
@@ -731,7 +731,11 @@ def _generate_arbitrage_table_image(
                 "fr_spread": funding_spread_str,
                 "total_spread": f"{total_spread:.3f}",
                 "ex_spread": f"Long ({long_ex}), Short ({short_ex})",
+                "total_spread_num": total_spread if total_spread is not None else float('-inf'),  # Для сортировки
             })
+        
+        # Сортируем строки по total_spread в порядке убывания (от большего к меньшему)
+        rows.sort(key=lambda x: x["total_spread_num"], reverse=True)
         
         # Определяем ширину колонок
         col_widths = {
