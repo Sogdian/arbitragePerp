@@ -1406,10 +1406,17 @@ async def _bitget_place_leg(*, planned: Dict[str, Any]) -> OpenLegResult:
         px_str = _format_by_step(px, tick_raw)
         logger.info(f"Bitget: попытка {idx}/{len(attempts)} | {direction} qty={qty} | лимит={px_str}")
 
+        # Bitget требует указать marginMode в ордере (иначе: "The margin mode cannot be empty").
+        # Это НЕ про плечо; плечо мы не трогаем. Только обязательный флаг режима маржи для контракта.
+        bitget_margin_mode = (os.getenv("BITGET_MARGIN_MODE", "crossed") or "").strip()
+        if not bitget_margin_mode:
+            bitget_margin_mode = "crossed"
+
         body = {
             "symbol": symbol,
             "productType": product_type,
             "marginCoin": "USDT",
+            "marginMode": bitget_margin_mode,
             "orderType": "limit",
             "price": px_str,
             "size": qty,
@@ -1716,15 +1723,45 @@ async def _bingx_place_leg(*, planned: Dict[str, Any]) -> OpenLegResult:
             return OpenLegResult(exchange="bingx", direction=direction, ok=False, error=f"api error: {data}", raw=data)
 
         item = data.get("data")
+        # BingX часто возвращает вложенность: data.order.orderId / data.order.orderID
+        order_container = None
+        if isinstance(item, dict) and isinstance(item.get("order"), dict):
+            order_container = item.get("order")
+        elif isinstance(item, dict):
+            order_container = item
+        else:
+            order_container = None
+
         order_id = None
-        if isinstance(item, dict):
-            order_id = item.get("orderId") or item.get("id")
+        if isinstance(order_container, dict):
+            order_id = (
+                order_container.get("orderId")
+                or order_container.get("orderID")
+                or order_container.get("id")
+                or order_container.get("order_id")
+            )
         if not order_id:
             order_id = data.get("orderId") if isinstance(data, dict) else None
         if not order_id:
             return OpenLegResult(exchange="bingx", direction=direction, ok=False, error=f"no orderId in response: {data}", raw=data)
 
         order_id_s = str(order_id)
+
+        # Если BingX вернул сразу статус CANCELLED + executedQty=0 — это типичный результат FOK (не исполнился мгновенно).
+        # В этом случае пробуем следующий уровень (до 3).
+        status0 = ""
+        exec0 = 0.0
+        if isinstance(order_container, dict):
+            status0 = str(order_container.get("status") or "")
+            exec_raw0 = order_container.get("executedQty") or order_container.get("filledQty") or order_container.get("dealQty")
+            try:
+                exec0 = float(exec_raw0) if exec_raw0 is not None else 0.0
+            except Exception:
+                exec0 = 0.0
+        if status0.upper() in ("CANCELLED", "CANCELED") and exec0 <= 0:
+            logger.warning(f"BingX: FOK отменён на уровне {idx} | status={status0} | исполнено={_format_number(exec0)}")
+            continue
+
         ok_full, filled = await _bingx_wait_full_fill(planned={**planned, "price_str": px_str, "limit_price": float(px_str)}, order_id=order_id_s)
         if ok_full:
             return OpenLegResult(exchange="bingx", direction=direction, ok=True, order_id=order_id_s, raw=data)
