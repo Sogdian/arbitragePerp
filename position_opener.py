@@ -23,7 +23,7 @@ import math
 import os
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
@@ -893,6 +893,34 @@ async def _bitget_close_leg_partial_ioc(*, exchange_obj: Any, coin: str, positio
         pos_side = "short"
         book_side_name = "asks"
 
+    # Pre-check: если позиции нет — закрывать нечего (успех).
+    pos_resp, pos_path = await _bitget_fetch_positions_best_effort(
+        exchange_obj=exchange_obj,
+        api_key=api_key,
+        api_secret=api_secret,
+        api_passphrase=api_pass,
+        symbol=symbol,
+        product_type=str(product_type),
+        margin_coin="USDT",
+    )
+    if isinstance(pos_resp, dict):
+        pos_list = _bitget_extract_positions_list(pos_resp)
+        pos_qty, pos_mode = _bitget_parse_position_qty_and_mode(positions=pos_list, symbol=symbol, hold_side=pos_side)
+        if pos_mode:
+            logger.info(f"Bitget close: режим позиции (posMode)={pos_mode}")
+        # Debug: show first matching position fields (if any)
+        for p in pos_list:
+            if not isinstance(p, dict):
+                continue
+            p_sym = str(p.get("symbol") or "").strip()
+            p_hs = str(p.get("holdSide") or p.get("posSide") or "").lower().strip()
+            if p_sym == symbol and (not pos_side or not p_hs or p_hs == pos_side):
+                logger.info(f"Bitget close: position snapshot: {_bitget_extract_position_fields(p)}")
+                break
+        if pos_qty is not None and pos_qty <= 0:
+            logger.warning(f"Bitget close: позиции нет (по position API {pos_path or 'unknown'}) — закрывать нечего")
+            return True, None
+
     remaining = float(coin_amount)
     eps = max(1e-10, remaining * 1e-8)
 
@@ -944,19 +972,49 @@ async def _bitget_close_leg_partial_ioc(*, exchange_obj: Any, coin: str, positio
                 "clientOid": f"arb-close-{int(time.time()*1000)}-{pos_dir}-{order_n}-{lvl_i}",
             }
 
-            # Как и при открытии — пробуем несколько схем из-за unilateral/hedge режима.
-            candidate_bodies = [
+            # Bitget режимы (unilateral/hedge) требуют разные поля.
+            # В hedge_mode часто нужно явно указывать holdSide/posSide для закрытия нужной ноги.
+            pos_side_uc = pos_side.upper()
+            # Bitget hedge_mode sometimes expects non-intuitive side/tradeSide combinations.
+            # We'll try both "normal" side for closing and the opposite side as fallback, plus holdSide+posSide combos.
+            alt_side = "buy" if side_buy_sell == "sell" else "sell"
+
+            candidate_bodies: List[Dict[str, Any]] = [
+                # NOTE: close_long/close_short as "side" appears to cause side mismatch for some accounts,
+                # but we keep a couple of variants early for completeness.
                 {**base_body, "side": side_close_open_style},
-                {**base_body, "side": side_buy_sell, "tradeSide": "close", "posSide": pos_side},
-                {**base_body, "side": side_buy_sell, "posSide": pos_side},
+                {**base_body, "side": side_close_open_style, "holdSide": pos_side},
+                {**base_body, "side": side_close_open_style, "posSide": pos_side},
+
+                # === Primary: side_buy_sell + tradeSide=close ===
+                {**base_body, "side": side_buy_sell, "tradeSide": "close", "holdSide": pos_side, "posSide": pos_side},
+                {**base_body, "side": side_buy_sell, "tradeSide": "close", "holdSide": pos_side_uc, "posSide": pos_side_uc},
+                {**base_body, "side": side_buy_sell, "tradeSide": "close", "holdSide": pos_side, "posSide": pos_side_uc},
+                {**base_body, "side": side_buy_sell, "tradeSide": "close", "holdSide": pos_side_uc, "posSide": pos_side},
                 {**base_body, "side": side_buy_sell, "tradeSide": "close", "holdSide": pos_side},
+                {**base_body, "side": side_buy_sell, "tradeSide": "close", "posSide": pos_side},
+
+                # === Fallback: opposite side + tradeSide=close ===
+                {**base_body, "side": alt_side, "tradeSide": "close", "holdSide": pos_side, "posSide": pos_side},
+                {**base_body, "side": alt_side, "tradeSide": "close", "holdSide": pos_side_uc, "posSide": pos_side_uc},
+                {**base_body, "side": alt_side, "tradeSide": "close", "holdSide": pos_side},
+                {**base_body, "side": alt_side, "tradeSide": "close", "posSide": pos_side},
+
+                # === Extra: without tradeSide (some accounts behave like this) ===
+                {**base_body, "side": side_buy_sell, "holdSide": pos_side, "posSide": pos_side},
                 {**base_body, "side": side_buy_sell, "holdSide": pos_side},
-                {**base_body, "side": side_buy_sell, "tradeSide": side_close_open_style},
+                {**base_body, "side": side_buy_sell, "posSide": pos_side},
+
+                # Minimal close intent
+                {**base_body, "side": side_buy_sell, "tradeSide": "close"},
+                {**base_body, "side": alt_side, "tradeSide": "close"},
             ]
 
             data: Any = None
             ok_created = False
             saw_no_position = False
+            saw_side_mismatch = False
+            chosen_schema: Optional[int] = None
             for schema_i, body in enumerate(candidate_bodies, start=1):
                 data = await _bitget_private_request(
                     exchange_obj=exchange_obj,
@@ -971,12 +1029,17 @@ async def _bitget_close_leg_partial_ioc(*, exchange_obj: Any, coin: str, positio
                 if code is not None and code != "00000":
                     msg_l = (msg or "").lower()
                     if "side mismatch" in msg_l or "unilateral" in msg_l or str(code) in ("400172", "40774"):
-                        logger.warning(f"Bitget close: схема {schema_i}/{len(candidate_bodies)} не подошла | code={code} msg={msg}")
+                        saw_side_mismatch = True
+                        logger.warning(f"Bitget close: схема {schema_i}/{len(candidate_bodies)} не подошла | code={code} msg={msg} | req={{side:{body.get('side')}, tradeSide:{body.get('tradeSide')}, holdSide:{body.get('holdSide')}, posSide:{body.get('posSide')}}}")
                         continue
                     # Частая ситуация: позиции уже нет (или не тот режим/нога). Не считаем фатальной.
                     if str(code) == "22002" or "no position" in msg_l:
                         saw_no_position = True
-                        logger.warning(f"Bitget close: нет позиции для закрытия (schema {schema_i}/{len(candidate_bodies)}) | msg={msg}")
+                        logger.warning(f"Bitget close: нет позиции для закрытия (schema {schema_i}/{len(candidate_bodies)}) | msg={msg} | req={{side:{body.get('side')}, tradeSide:{body.get('tradeSide')}, holdSide:{body.get('holdSide')}, posSide:{body.get('posSide')}}}")
+                        continue
+                    # reduceOnly в Bitget часто не принимается в этом endpoint (40017) — не считаем фатальной, просто пропускаем схему
+                    if "reduceonly" in msg_l and str(code) in ("40017", "400017"):
+                        logger.warning(f"Bitget close: reduceOnly не поддержан (schema {schema_i}/{len(candidate_bodies)}) | msg={msg}")
                         continue
                     # IOC отказ/не исполнилось мгновенно — попробуем следующий уровень
                     if msg and ("ioc" in msg_l or "fill" in msg_l or "immediately" in msg_l):
@@ -985,14 +1048,15 @@ async def _bitget_close_leg_partial_ioc(*, exchange_obj: Any, coin: str, positio
                     logger.error(f"❌ Bitget close: api error: {data}")
                     return False, None
                 ok_created = True
+                chosen_schema = schema_i
                 break
 
             if not ok_created:
-                # Если все схемы сказали "No position to close" — считаем, что позиция уже закрыта.
-                if saw_no_position:
-                    logger.warning("Bitget close: позиция не найдена — считаем закрытой")
-                    avg_price = total_notional / total_filled if total_filled > 0 else None
-                    return True, avg_price
+                # Если мы уверены, что позиция существует (по pre-check), но все схемы говорят "No position to close",
+                # это означает несоответствие параметров/режима — прекращаем попытки быстрее.
+                if pos_qty is not None and pos_qty > eps and saw_no_position and not saw_side_mismatch:
+                    logger.error("❌ Bitget close: позиция есть, но API отвечает 'No position to close' — проверь posMode/holdSide/posSide и режим аккаунта")
+                    return False, None
                 continue
 
             item = data.get("data") if isinstance(data, dict) else None
@@ -1004,6 +1068,9 @@ async def _bitget_close_leg_partial_ioc(*, exchange_obj: Any, coin: str, positio
             if not order_id:
                 logger.error(f"❌ Bitget close: no orderId in response: {data}")
                 return False, None
+
+            if chosen_schema is not None:
+                logger.info(f"Bitget close: использована схема {chosen_schema}/{len(candidate_bodies)}")
 
             order_id_s = str(order_id)
             _done, filled = await _bitget_wait_done_get_filled_qty(
@@ -1024,6 +1091,22 @@ async def _bitget_close_leg_partial_ioc(*, exchange_obj: Any, coin: str, positio
 
     logger.error(f"❌ Bitget close: не удалось закрыть позицию полностью | осталось={_format_number(remaining)} {coin}")
     avg_price = total_notional / total_filled if total_filled > 0 else None
+    # Final verification: если позиция реально уже закрыта (вручную/внешне) — вернем успех.
+    pos_resp2, pos_path2 = await _bitget_fetch_positions_best_effort(
+        exchange_obj=exchange_obj,
+        api_key=api_key,
+        api_secret=api_secret,
+        api_passphrase=api_pass,
+        symbol=symbol,
+        product_type=str(product_type),
+        margin_coin="USDT",
+    )
+    if isinstance(pos_resp2, dict):
+        pos_list2 = _bitget_extract_positions_list(pos_resp2)
+        pos_qty2, _pos_mode2 = _bitget_parse_position_qty_and_mode(positions=pos_list2, symbol=symbol, hold_side=pos_side)
+        if pos_qty2 is not None and pos_qty2 <= eps:
+            logger.warning(f"Bitget close: позиция уже закрыта по position API {pos_path2 or 'unknown'} — считаем успехом")
+            return True, avg_price
     return False, avg_price
 
 
@@ -2044,6 +2127,126 @@ async def _bitget_get_contract_filters(*, exchange_obj: Any, symbol: str) -> Dic
     return {}
 
 
+async def _bitget_fetch_positions_best_effort(
+    *,
+    exchange_obj: Any,
+    api_key: str,
+    api_secret: str,
+    api_passphrase: str,
+    symbol: str,
+    product_type: str,
+    margin_coin: str = "USDT",
+) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """
+    Bitget endpoints vary between versions; try multiple known paths and return the first successful response.
+    Returns (response_json, used_path) or (None, None) on failure.
+    """
+    product_type_s = str(product_type)
+    symbol_s = str(symbol)
+    margin_coin_s = str(margin_coin)
+
+    candidates: List[Tuple[str, Dict[str, Any]]] = [
+        ("/api/v2/mix/position/single-position", {"symbol": symbol_s, "productType": product_type_s, "marginCoin": margin_coin_s}),
+        ("/api/v2/mix/position/get-single-position", {"symbol": symbol_s, "productType": product_type_s, "marginCoin": margin_coin_s}),
+        ("/api/v2/mix/position/all-position", {"productType": product_type_s, "marginCoin": margin_coin_s}),
+        ("/api/v2/mix/position/get-all-position", {"productType": product_type_s, "marginCoin": margin_coin_s}),
+    ]
+
+    for path, params in candidates:
+        data = await _bitget_private_request(
+            exchange_obj=exchange_obj,
+            api_key=api_key,
+            api_secret=api_secret,
+            api_passphrase=api_passphrase,
+            method="GET",
+            path=path,
+            params=params,
+        )
+        if not isinstance(data, dict):
+            continue
+        code, _msg = _bitget_extract_code_msg(data)
+        if code is None:
+            return data, path
+        if code == "00000":
+            return data, path
+    return None, None
+
+
+def _bitget_extract_positions_list(resp: Dict[str, Any]) -> List[Dict[str, Any]]:
+    data = resp.get("data")
+    if isinstance(data, list):
+        return [x for x in data if isinstance(x, dict)]
+    if isinstance(data, dict):
+        lst = data.get("list") or data.get("positions") or data.get("resultList")
+        if isinstance(lst, list):
+            return [x for x in lst if isinstance(x, dict)]
+        return [data]
+    return [resp] if isinstance(resp, dict) else []
+
+
+def _bitget_parse_position_qty_and_mode(
+    *,
+    positions: List[Dict[str, Any]],
+    symbol: Optional[str],
+    hold_side: str,
+) -> Tuple[Optional[float], Optional[str]]:
+    """
+    Parse total qty for a given hold side ("long"/"short") from Bitget position objects.
+    Returns (qty, posMode) where posMode can be None if not present.
+    """
+    hs = (hold_side or "").lower().strip()
+    qty_sum = 0.0
+    saw_any = False
+    mode: Optional[str] = None
+
+    sym = (symbol or "").strip()
+
+    for p in positions:
+        if not isinstance(p, dict):
+            continue
+        if mode is None:
+            pm = p.get("posMode") or p.get("positionMode")
+            if pm is not None:
+                mode = str(pm)
+
+        # Filter by symbol if provided
+        if sym:
+            p_sym = p.get("symbol") or p.get("instId") or p.get("contract") or p.get("contractCode")
+            p_sym_s = str(p_sym).strip() if p_sym is not None else ""
+            if p_sym_s and p_sym_s != sym:
+                continue
+
+        p_hs = p.get("holdSide") or p.get("posSide") or p.get("positionSide") or p.get("side")
+        p_hs_s = str(p_hs).lower().strip() if p_hs is not None else ""
+        if hs and p_hs_s and p_hs_s != hs:
+            continue
+
+        for key in ("total", "available", "holdSize", "positionAmt", "size", "pos"):
+            if key in p and p.get(key) is not None:
+                try:
+                    v = float(p.get(key))
+                    qty_sum += abs(v)
+                    saw_any = True
+                    break
+                except Exception:
+                    continue
+
+    if not saw_any:
+        return None, mode
+    return qty_sum, mode
+
+
+def _bitget_extract_position_fields(p: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Small helper for logging/debugging (no secrets).
+    """
+    out: Dict[str, Any] = {}
+    for k in ("symbol", "holdSide", "posSide", "posMode", "marginMode", "total", "available", "holdSize", "positionAmt", "size"):
+        if k in p:
+            out[k] = p.get(k)
+    return out
+
+
 async def _bitget_plan_leg(*, exchange_obj: Any, coin: str, direction: str, coin_amount: float) -> Any:
     api_key = _get_env("BITGET_API_KEY")
     api_secret = _get_env("BITGET_API_SECRET")
@@ -2258,6 +2461,7 @@ async def _bitget_place_leg(*, planned: Dict[str, Any]) -> OpenLegResult:
 
         data: Any = None
         ok_created = False
+        chosen_schema: Optional[int] = None
         for schema_i, body in enumerate(candidate_bodies, start=1):
             data = await _bitget_private_request(
                 exchange_obj=exchange_obj,
@@ -2296,11 +2500,15 @@ async def _bitget_place_leg(*, planned: Dict[str, Any]) -> OpenLegResult:
                 return OpenLegResult(exchange="bitget", direction=direction, ok=False, error=f"api error: {data}", raw=data)
 
             ok_created = True
+            chosen_schema = schema_i
             break
 
         if not ok_created:
             # Ни одна схема не подошла для этого уровня цены — идём на следующий уровень
             continue
+
+        if chosen_schema is not None:
+            logger.info(f"Bitget: использована схема {chosen_schema}/{len(candidate_bodies)}")
 
         item = data.get("data") if isinstance(data, dict) else None
         order_id = None

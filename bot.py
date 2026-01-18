@@ -869,8 +869,8 @@ class PerpArbitrageBot:
                                                     if ok_closed:
                                                         logger.info("✅ Авто-закрытие выполнено, мониторинг остановлен")
                                                         return
-                                                    logger.error("❌ Авто-закрытие не удалось, мониторинг продолжается")
-                                                    close_alert_times.clear()
+                                                    logger.error("❌ Авто-закрытие не удалось, мониторинг остановлен")
+                                                    return
                                             
                                             # Используем closing_spread_display для лога (уже инвертированное значение)
                                             closing_display_log = format_number(closing_spread_display) if closing_spread_display is not None else "N/A"
