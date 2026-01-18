@@ -964,7 +964,9 @@ async def process_coin(
                                     short_ex = max_opp["short_ex"]
                                     long_ex_cap = long_ex.capitalize()
                                     short_ex_cap = short_ex.capitalize()
-                                    caption = f'🔔 Signal: {coin} (for liq: {SCAN_COIN_INVEST:.1f} USDT)\n{coin} Long ({long_ex_cap}), Short ({short_ex_cap}) max total spread: {max_spread_str}'
+                                    long_url = _get_exchange_url(long_ex, coin)
+                                    short_url = _get_exchange_url(short_ex, coin)
+                                    caption = f'🔔 Signal: {coin} (for liq: {SCAN_COIN_INVEST:.1f} USDT)\n{coin} Long (<a href="{long_url}">{long_ex_cap}</a>), Short (<a href="{short_url}">{short_ex_cap}</a>) max total spread: {max_spread_str}'
                                 else:
                                     caption = f'🔔 Signal: {coin} (for liq: {SCAN_COIN_INVEST:.1f} USDT)\nmax total spread: {max_spread_str}'
                                 success = await telegram.send_photo(table_image, caption=caption, channel_id=channel_id)
