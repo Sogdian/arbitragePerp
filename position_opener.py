@@ -688,7 +688,7 @@ async def _binance_close_leg_partial_ioc(*, exchange_obj: Any, coin: str, positi
             else:
                 qty_str = str(qty_to_send)
 
-            logger.info(f"Binance close: ордер {order_n}/{max_orders_total} | lvl {lvl_i}/{MAX_ORDERBOOK_LEVELS} | side={side_close} qty={qty_str} | лимит={px_str}")
+            logger.debug(f"Binance close: ордер {order_n}/{max_orders_total} | lvl {lvl_i}/{MAX_ORDERBOOK_LEVELS} | side={side_close} qty={qty_str} | лимит={px_str}")
 
             def _post(params: Dict[str, Any]) -> Any:
                 return _binance_private_request(
@@ -720,7 +720,7 @@ async def _binance_close_leg_partial_ioc(*, exchange_obj: Any, coin: str, positi
 
                 # Binance: в некоторых режимах параметр reduceOnly запрещён ("not required")
                 if code == -1106 and "reduceonly" in msg_l:
-                    logger.warning("Binance close: reduceOnly не поддержан в текущем режиме — повторяем без reduceOnly")
+                    logger.debug("Binance close: reduceOnly не поддержан в текущем режиме — повторяем без reduceOnly")
                     data = await _post({**base_params_no_reduce, "positionSide": pos_side})
                     # если positionSide тоже не подходит — ниже отработает fallback
                     if isinstance(data, dict) and (data.get("_error") or data.get("code") is not None):
@@ -736,7 +736,7 @@ async def _binance_close_leg_partial_ioc(*, exchange_obj: Any, coin: str, positi
                         code2 = data.get("code")
                         msg2 = str(data.get("msg") or data.get("_body") or "")
                         if code2 == -1106 and "reduceonly" in msg2.lower():
-                            logger.warning("Binance close: reduceOnly не поддержан в текущем режиме — повторяем без reduceOnly")
+                            logger.debug("Binance close: reduceOnly не поддержан в текущем режиме — повторяем без reduceOnly")
                             data = await _post(base_params_no_reduce)
 
             if not isinstance(data, dict):
@@ -773,7 +773,7 @@ async def _binance_close_leg_partial_ioc(*, exchange_obj: Any, coin: str, positi
                 break
 
         if filled_any <= 0:
-            logger.warning(f"Binance close: 0 исполнено по уровням 1-{MAX_ORDERBOOK_LEVELS} | осталось={_format_number(remaining)} {coin}")
+            logger.debug(f"Binance close: 0 исполнено по уровням 1-{MAX_ORDERBOOK_LEVELS} | осталось={_format_number(remaining)} {coin}")
             continue
 
     logger.error(f"❌ Binance close: не удалось закрыть позицию полностью | осталось={_format_number(remaining)} {coin}")
@@ -834,7 +834,7 @@ async def _bitget_wait_done_get_filled_qty(*, planned: Dict[str, Any], order_id:
             filled = 0.0
 
         if status.lower() in ("filled", "full_fill", "complete", "completed", "success", "closed", "canceled", "cancelled", "rejected"):
-            logger.info(f"Bitget close: статус ордера {order_id}: {status} | исполнено={_format_number(filled)}")
+            logger.debug(f"Bitget close: статус ордера {order_id}: {status} | исполнено={_format_number(filled)}")
             return True, filled
 
         await asyncio.sleep(0.2)
@@ -905,20 +905,9 @@ async def _bitget_close_leg_partial_ioc(*, exchange_obj: Any, coin: str, positio
     )
     if isinstance(pos_resp, dict):
         pos_list = _bitget_extract_positions_list(pos_resp)
-        pos_qty, pos_mode = _bitget_parse_position_qty_and_mode(positions=pos_list, symbol=symbol, hold_side=pos_side)
-        if pos_mode:
-            logger.info(f"Bitget close: режим позиции (posMode)={pos_mode}")
-        # Debug: show first matching position fields (if any)
-        for p in pos_list:
-            if not isinstance(p, dict):
-                continue
-            p_sym = str(p.get("symbol") or "").strip()
-            p_hs = str(p.get("holdSide") or p.get("posSide") or "").lower().strip()
-            if p_sym == symbol and (not pos_side or not p_hs or p_hs == pos_side):
-                logger.info(f"Bitget close: position snapshot: {_bitget_extract_position_fields(p)}")
-                break
+        pos_qty, _pos_mode = _bitget_parse_position_qty_and_mode(positions=pos_list, symbol=symbol, hold_side=pos_side)
         if pos_qty is not None and pos_qty <= 0:
-            logger.warning(f"Bitget close: позиции нет (по position API {pos_path or 'unknown'}) — закрывать нечего")
+            logger.info(f"Bitget close: позиции нет (по position API {pos_path or 'unknown'}) — закрывать нечего")
             return True, None
 
     remaining = float(coin_amount)
@@ -958,7 +947,7 @@ async def _bitget_close_leg_partial_ioc(*, exchange_obj: Any, coin: str, positio
             else:
                 qty_str = str(qty_to_send)
 
-            logger.info(f"Bitget close: ордер {order_n}/{max_orders_total} | lvl {lvl_i}/{MAX_ORDERBOOK_LEVELS} | qty={qty_str} | лимит={px_str}")
+            logger.debug(f"Bitget close: ордер {order_n}/{max_orders_total} | lvl {lvl_i}/{MAX_ORDERBOOK_LEVELS} | qty={qty_str} | лимит={px_str}")
 
             base_body = {
                 "symbol": symbol,
@@ -972,16 +961,22 @@ async def _bitget_close_leg_partial_ioc(*, exchange_obj: Any, coin: str, positio
                 "clientOid": f"arb-close-{int(time.time()*1000)}-{pos_dir}-{order_n}-{lvl_i}",
             }
 
-            # Bitget hedge_mode: рабочая схема для закрытия — side + holdSide + posSide (без tradeSide).
-            # Для short: side=buy, holdSide=short, posSide=short
-            # Для long: side=sell, holdSide=long, posSide=long
+            # Bitget: закрытие может требовать "обратный" side (встречалось на практике),
+            # поэтому пробуем side_buy_sell и alt_side. Также оставляем несколько fallback-схем
+            # для разных режимов аккаунта (hedge/unilateral).
+            alt_side = "buy" if side_buy_sell == "sell" else "sell"
             candidate_bodies: List[Dict[str, Any]] = [
-                # Рабочая схема (проверена на hedge_mode)
+                # Primary: hedge-mode (часто работает)
                 {**base_body, "side": side_buy_sell, "holdSide": pos_side, "posSide": pos_side},
-                # Fallback варианты (на случай, если аккаунт в другом режиме)
+                {**base_body, "side": alt_side, "holdSide": pos_side, "posSide": pos_side},
+                # Fallback: tradeSide=close (на некоторых аккаунтах требуется)
                 {**base_body, "side": side_buy_sell, "tradeSide": "close", "holdSide": pos_side, "posSide": pos_side},
+                {**base_body, "side": alt_side, "tradeSide": "close", "holdSide": pos_side, "posSide": pos_side},
+                # Fallback: упрощённые варианты (иногда API требует меньше полей)
                 {**base_body, "side": side_buy_sell, "holdSide": pos_side},
+                {**base_body, "side": alt_side, "holdSide": pos_side},
                 {**base_body, "side": side_buy_sell, "posSide": pos_side},
+                {**base_body, "side": alt_side, "posSide": pos_side},
             ]
 
             data: Any = None
@@ -1039,7 +1034,7 @@ async def _bitget_close_leg_partial_ioc(*, exchange_obj: Any, coin: str, positio
                 break
 
         if filled_any <= 0:
-            logger.warning(f"Bitget close: 0 исполнено по уровням 1-{MAX_ORDERBOOK_LEVELS} | осталось={_format_number(remaining)} {coin}")
+            logger.debug(f"Bitget close: 0 исполнено по уровням 1-{MAX_ORDERBOOK_LEVELS} | осталось={_format_number(remaining)} {coin}")
             continue
 
     logger.error(f"❌ Bitget close: не удалось закрыть позицию полностью | осталось={_format_number(remaining)} {coin}")
@@ -1058,7 +1053,7 @@ async def _bitget_close_leg_partial_ioc(*, exchange_obj: Any, coin: str, positio
         pos_list2 = _bitget_extract_positions_list(pos_resp2)
         pos_qty2, _pos_mode2 = _bitget_parse_position_qty_and_mode(positions=pos_list2, symbol=symbol, hold_side=pos_side)
         if pos_qty2 is not None and pos_qty2 <= eps:
-            logger.warning(f"Bitget close: позиция уже закрыта по position API {pos_path2 or 'unknown'} — считаем успехом")
+            logger.debug(f"Bitget close: позиция уже закрыта по position API {pos_path2 or 'unknown'} — считаем успехом")
             return True, avg_price
     return False, avg_price
 
@@ -1610,7 +1605,7 @@ async def _binance_wait_full_fill(*, planned: Dict[str, Any], order_id: str) -> 
         except Exception:
             executed = 0.0
         if status.upper() in ("FILLED", "CANCELED", "CANCELLED", "EXPIRED", "REJECTED"):
-            logger.info(f"Binance: статус ордера {order_id}: {status} | исполнено={_format_number(executed)} | требовалось={_format_number(qty_req)}")
+            logger.debug(f"Binance: статус ордера {order_id}: {status} | исполнено={_format_number(executed)} | требовалось={_format_number(qty_req)}")
             return (executed + 1e-10 >= qty_req), executed
         await asyncio.sleep(0.2)
     return False, 0.0
