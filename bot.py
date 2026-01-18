@@ -872,7 +872,7 @@ async def main():
             else:
                 # Спрашиваем про открытие позиций
                 print("\nОткрыть позиции в лонг и шорт?")
-                print("Ведите 'Да' или 'Нет': если 'Да', то позиции будут открыты")
+                print("\nВедите 'Да' или 'Нет': если 'Да', то позиции будут открыты и введите min цену (через .) закр, для отправки сообщения в тг")
                 # Если запуск не интерактивный — не блокируемся.
                 if not sys.stdin or not sys.stdin.isatty() or os.getenv("BOT_NO_PROMPT") == "1":
                     should_monitor = False
@@ -886,6 +886,19 @@ async def main():
                     should_monitor = False
                     
                     if open_positions:
+                        # Парсим порог закрытия из ввода (формат: "Да, 0.05" или "Да 0.05" или "да, 0.05")
+                        match = re.search(r'([-]?\d+\.?\d*)', answer1)
+                        if match:
+                            try:
+                                close_threshold_pct = float(match.group(1))
+                            except ValueError:
+                                close_threshold_pct = None
+                        else:
+                            # Если цена не указана, выдаем ошибку
+                            logger.error(f"❌ Не указана min цена закрытия. Ожидается формат: 'Да, 0.05' или 'Да 0.05'")
+                            logger.error("Мониторинг не запущен")
+                            return
+                        
                         # Автоматическое открытие позиций (лонг+шорт) по API, затем мониторинг как обычно
                         opened_ok = await open_long_short_positions(
                             bot=bot,
@@ -896,8 +909,8 @@ async def main():
                         )
                         if opened_ok:
                             should_monitor = True
-                            # После успешного открытия позиций мониторинг запускается без порога закрытия
-                            close_threshold_pct = None
+                            # После успешного открытия позиций мониторинг запускается с указанным порогом закрытия
+                            # close_threshold_pct уже установлен выше
                     else:
                         # Если ответ "Нет" на открытие позиций, спрашиваем про мониторинг
                         print("\nВключить мониторинг?")

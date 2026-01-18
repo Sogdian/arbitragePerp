@@ -199,12 +199,17 @@ closing_spread = (bid_long - ask_short) / ask_short * 100
 - **Тикер фьючерса:** `/openApi/swap/v2/quote/ticker` - публичный API
 - **Фандинг:** `/openApi/swap/v2/quote/premiumIndex` - публичный API (текущая ставка фандинга)
 - **Orderbook:** `/openApi/swap/v2/quote/depth` - публичный API
+- **Торговля (приватный API):**
+  - Размещение ордера: `/openApi/swap/v2/trade/order` (POST)
+  - Проверка статуса: `/openApi/swap/v2/trade/query` (GET)
+  - Получение фильтров: `/openApi/swap/v2/quote/contracts` (для `priceScale`, `quantityScale`, `tickSize`, `stepSize`, `minTradeNum`, `minNotional`)
 - **Обязательные параметры:**
   - Тикер: `symbol=COIN-USDT` (USDT-M perpetual)
   - Фандинг: `symbol=COIN-USDT`
   - Orderbook: `symbol=COIN-USDT`, `limit` (от 5 до 200)
+  - Торговля: `symbol`, `side` ("BUY"/"SELL"), `positionSide` ("LONG"/"SHORT"), `type="LIMIT"`, `timeInForce="FOK"`, `price`, `quantity`
 - **Формат символов:** `COIN-USDT` (с дефисом, например, `CVC-USDT`, `BTC-USDT`)
-- **Примечание:**
+- **Примечание (публичный API):**
   - API полностью публичный, **API ключи не требуются**
   - Возвращает данные в формате `{"code": 0, "msg": "", "data": {...}}`
   - Успешные ответы имеют `code: 0` (число)
@@ -212,6 +217,13 @@ closing_spread = (bid_long - ask_short) / ask_short * 100
   - Фандинг возвращает текущую ставку в поле `data` с fallback на несколько ключей: `lastFundingRate`, `fundingRate`, `fundingRateNext` (в десятичном формате, например, 0.0001 = 0.01%)
   - Orderbook возвращает `bids` и `asks` как списки `[[price, size], ...]` в поле `data`
   - Если данные не получены или символ не найден, монета недоступна или произошла ошибка
+- **Примечание (торговля):**
+  - Требует **API ключи** (`BINGX_API_KEY`, `BINGX_API_SECRET`)
+  - Подпись: HMAC_SHA256(secret, urlencode(sorted(params))) с добавлением `timestamp` (ms) и `signature` в query параметры
+  - Заголовок: `X-BX-APIKEY` с API ключом
+  - `orderId` возвращается вложенным в `data.order.orderId` (не на верхнем уровне ответа)
+  - Если FOK ордер возвращает `status="CANCELLED"` с `executedQty=0`, это сигнал для retry на следующем уровне orderbook
+  - Формат символа: `COIN-USDT` (с дефисом)
 - **Проверка ошибок API:**
   - Реализован метод класса `_is_api_error()` для проверки поля `code` в ответе
   - Если `code` присутствует и не равен `0`, ответ считается ошибкой
@@ -432,12 +444,17 @@ closing_spread = (bid_long - ask_short) / ask_short * 100
 - **Тикер фьючерса:** `/api/v2/mix/market/ticker` - публичный API
 - **Фандинг:** `/api/v2/mix/market/current-fund-rate` - публичный API
 - **Orderbook:** `/api/v2/mix/market/merge-depth` - публичный API
+- **Торговля (приватный API):**
+  - Размещение ордера: `/api/v2/mix/order/place-order` (POST)
+  - Проверка статуса: `/api/v2/mix/order/detail` (fallback на `/api/mix/v1/order/detail`)
+  - Получение фильтров: `/api/v2/mix/market/contracts` (для `tickSize`, `stepSize`, `minQty`, `minNotional`)
 - **Обязательные параметры:**
-  - Тикер: `symbol=COINUSDT`, `productType=usdt-futures` (USDT-M perpetual)
-  - Фандинг: `symbol=COINUSDT`, `productType=usdt-futures`
-  - Orderbook: `symbol=COINUSDT`, `productType=usdt-futures`, `limit` (строка "50" или "max")
+  - Тикер: `symbol=COINUSDT`, `productType=USDT-FUTURES` (USDT-M perpetual)
+  - Фандинг: `symbol=COINUSDT`, `productType=USDT-FUTURES`
+  - Orderbook: `symbol=COINUSDT`, `productType=USDT-FUTURES`, `limit` (строка "50" или "max")
+  - Торговля: `symbol`, `productType`, `marginCoin="USDT"`, `marginMode` (обязательно: `"isolated"` или `"crossed"`), `orderType="limit"`, `force="fok"`, `side`, `price`, `size`
 - **Формат символов:** `COINUSDT` (без подчеркивания и суффиксов, например, `CVCUSDT`, `BTCUSDT`)
-- **Примечание:**
+- **Примечание (публичный API):**
   - API полностью публичный, **API ключи не требуются**
   - Возвращает данные в формате `{"code": "00000", "msg": "success", "data": {...}}`
   - Успешные ответы имеют `code: "00000"` или `code: 0`
@@ -445,6 +462,19 @@ closing_spread = (bid_long - ask_short) / ask_short * 100
   - Фандинг возвращает `fundingRate` в поле `data` (в десятичном формате, например, 0.0001 = 0.01%)
   - Orderbook возвращает `bids` и `asks` как списки `[[price, size], ...]` в поле `data`
   - Если данные не получены или символ не найден, монета недоступна или произошла ошибка
+- **Примечание (торговля):**
+  - Требует **API ключи** (`BITGET_API_KEY`, `BITGET_API_SECRET`, `BITGET_API_PASSPHRASE`)
+  - **`BITGET_API_PASSPHRASE` обязателен** (ACCESS-PASSPHRASE из настроек API ключа)
+  - Подпись: HMAC_SHA256(secret, timestamp + method + requestPath + body) с заголовками `ACCESS-KEY`, `ACCESS-SIGN`, `ACCESS-TIMESTAMP`, `ACCESS-PASSPHRASE`
+  - **`marginMode` обязателен** в теле ордера (по умолчанию `"isolated"`, можно переопределить через `BITGET_MARGIN_MODE` в .env)
+  - Поддерживает несколько схем `side` в зависимости от режима аккаунта (unilateral/hedge):
+    - Схема 1: `side="open_long"` / `side="open_short"`
+    - Схема 2: `side="buy"/"sell"` + `tradeSide="open"` + `posSide="long"/"short"`
+    - Схема 3: `side="buy"/"sell"` + `posSide="long"/"short"`
+    - И другие варианты (всего 6 схем)
+  - Бот автоматически пробует все схемы до успешного создания ордера
+  - `productType` должен быть `"USDT-FUTURES"` (не `"umcbl"`)
+  - Pre-check API ключей: тестовый запрос к `/api/v2/mix/account/get-account-list` для проверки прав доступа
 - **Проверка ошибок API:**
   - Реализован метод класса `_is_api_error()` для проверки наличия поля `code` в ответе
   - Если `code` присутствует и не равен `"00000"` или `0`, ответ считается ошибкой
@@ -1886,17 +1916,25 @@ TELEGRAM_REPEAT_INTERVAL=3
 **Основные требования:**
 - Ордера: **лимитные** по лучшим ценам стакана (ask для Long, bid для Short)
 - Режим исполнения: **строго полное исполнение** (100% или отмена)
-- Тип ордера: **FOK (Fill-Or-Kill)** для обеих бирж (Bybit и Gate)
-- Глубина стакана: **максимум 3 уровня**
-- Логика уровней: попытка на **лучшем уровне** → если не исполнилось, пробуем **2-й уровень** → затем **3-й уровень** (и всё)
+- Тип ордера: **FOK (Fill-Or-Kill)** для всех поддерживаемых бирж
+- Глубина стакана: **максимум 10 уровней**
+- Логика уровней: попытка на **лучшем уровне** → если не исполнилось, пробуем **2-й уровень** → ... → **10-й уровень** (максимум попыток)
 
 **Поддерживаемые биржи:**
 - **Bybit** (USDT-M Perp, v5): `/v5/order/create` с `timeInForce="FOK"`
 - **Gate.io** (USDT-M Perp, v4): `/api/v4/futures/usdt/orders` с `tif="fok"`
+- **MEXC** (USDT-M Perp, v1): `/api/v1/private/order/submit` с `orderType="LIMIT_ORDER"`, `force="IOC"`
+- **Binance** (USDT-M Perp, fapi): `/fapi/v1/order` с `timeInForce="FOK"`
+- **Bitget** (USDT-M Perp, v2): `/api/v2/mix/order/place-order` с `force="fok"`, `marginMode="isolated"` (по умолчанию)
+- **BingX** (USDT-M Perp, v2): `/openApi/swap/v2/trade/order` с `timeInForce="FOK"`
 
 **Переменные окружения:**
 - `BYBIT_API_KEY`, `BYBIT_API_SECRET`
 - `GATEIO_API_KEY`, `GATEIO_API_SECRET`
+- `MEXC_API_KEY`, `MEXC_API_SECRET`
+- `BINANCE_API_KEY`, `BINANCE_API_SECRET`
+- `BITGET_API_KEY`, `BITGET_API_SECRET`, `BITGET_API_PASSPHRASE` (обязательно для Bitget)
+- `BINGX_API_KEY`, `BINGX_API_SECRET`
 
 **Процесс открытия позиций:**
 
@@ -1907,7 +1945,7 @@ TELEGRAM_REPEAT_INTERVAL=3
    - Если на одной бирже проблема — ордера не выставляются
 
 2. **Планирование ордеров:**
-   - Выбор цены из стакана: берём первые 3 уровня, выбираем уровень, где cumulative size >= требуемого количества
+   - Выбор цены из стакана: берём первые 10 уровней, выбираем уровень, где cumulative size >= требуемого количества
    - Округление цены по tick size (для Long — вверх, для Short — вниз)
    - Округление количества по lot size
 
@@ -1918,6 +1956,10 @@ TELEGRAM_REPEAT_INTERVAL=3
 4. **Проверка fill** (после ~1-2 секунд):
    - Bybit: запрос `/v5/order/realtime` → если не найден, fallback на `/v5/order/history`
    - Gate: запрос `/api/v4/futures/usdt/orders/{order_id}`
+   - MEXC: запрос `/api/v1/private/order/detail/{order_id}`
+   - Binance: запрос `/fapi/v1/order` с `orderId` и `symbol`
+   - Bitget: запрос `/api/v2/mix/order/detail` (fallback на `/api/mix/v1/order/detail`)
+   - BingX: запрос `/openApi/swap/v2/trade/query` с `orderId` и `symbol`
    - Проверка, что `filled >= coin_amount` на обеих ногах
 
 5. **Логика уровней (1→2→…→10):**
@@ -1925,6 +1967,27 @@ TELEGRAM_REPEAT_INTERVAL=3
    - Если на лучшей цене ордер не исполнился полностью (FOK отменился) → пробуем следующий уровень
    - Максимум попыток: **10 уровней**
    - Если на 10-м уровне не исполнилось → операция считается неуспешной
+
+**Особенности по биржам:**
+
+**Bitget:**
+- Требует **обязательный параметр `marginMode`** в ордере (по умолчанию `"isolated"`, можно переопределить через `BITGET_MARGIN_MODE` в .env)
+- Требует **`BITGET_API_PASSPHRASE`** (ACCESS-PASSPHRASE из настроек API ключа)
+- Поддерживает несколько схем `side` в зависимости от режима аккаунта (unilateral/hedge):
+  - Схема 1: `side="open_long"` / `side="open_short"`
+  - Схема 2: `side="buy"/"sell"` + `tradeSide="open"` + `posSide="long"/"short"`
+  - Схема 3: `side="buy"/"sell"` + `posSide="long"/"short"`
+  - И другие варианты (всего 6 схем)
+- Бот автоматически пробует все схемы до успешного создания ордера
+- `productType` должен быть `"USDT-FUTURES"` (не `"umcbl"`)
+- Pre-check API ключей: тестовый запрос к `/api/v2/mix/account/get-account-list` для проверки прав доступа
+
+**BingX:**
+- Подпись запросов: HMAC_SHA256(secret, urlencode(sorted(params))) с добавлением `timestamp` и `signature` в query
+- Заголовок: `X-BX-APIKEY` с API ключом
+- `orderId` возвращается вложенным в `data.order.orderId` (не на верхнем уровне)
+- Если FOK ордер возвращает `status="CANCELLED"` с `executedQty=0`, это сигнал для retry на следующем уровне
+- Формат символа: `COIN-USDT` (с дефисом)
 
 **Результат:**
 - Если обе ноги исполнились полностью → запускается мониторинг спредов
