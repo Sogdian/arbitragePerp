@@ -1438,9 +1438,15 @@ async def _bitget_place_leg(*, planned: Dict[str, Any]) -> OpenLegResult:
 
         # Bitget требует указать marginMode в ордере (иначе: "The margin mode cannot be empty").
         # Это НЕ про плечо; плечо мы не трогаем. Только обязательный флаг режима маржи для контракта.
-        bitget_margin_mode = (os.getenv("BITGET_MARGIN_MODE", "crossed") or "").strip()
+        # По умолчанию открываем в isolated (требование пользователя).
+        # Можно переопределить через .env: BITGET_MARGIN_MODE=isolated|crossed
+        bitget_margin_mode = (os.getenv("BITGET_MARGIN_MODE", "isolated") or "").strip().lower()
         if not bitget_margin_mode:
+            bitget_margin_mode = "isolated"
+        if bitget_margin_mode == "cross":
             bitget_margin_mode = "crossed"
+        if bitget_margin_mode not in ("isolated", "crossed"):
+            bitget_margin_mode = "isolated"
 
         base_body = {
             "symbol": symbol,

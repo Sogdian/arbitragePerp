@@ -763,11 +763,12 @@ class PerpArbitrageBot:
                             except Exception as e:
                                 logger.warning(f"Ошибка отправки в Telegram: {e}", exc_info=True)
                     
-                    # Дополнительная проверка: отправляем сообщение, когда fr_spread <= 0.05%
+                    # Дополнительная проверка (Telegram) по fr_spread:
+                    # ВАЖНО: если порог закрытия не задан — уведомления ДОЛЖНЫ быть отключены полностью.
                     fr_threshold_met = False
-                    if fr_spread is not None:
+                    if close_threshold_pct is not None and fr_spread is not None:
                         fr_threshold_met = fr_spread <= 0.05
-                    
+
                     if fr_threshold_met:
                         # Проверяем интервал между отправками (раз в минуту) - используем отдельный ключ для fr_spread
                         key_fr = (coin, long_exchange, short_exchange, "fr_spread")
@@ -819,7 +820,7 @@ class PerpArbitrageBot:
                                 logger.warning(f"Ошибка отправки в Telegram: {e}", exc_info=True)
                         else:
                             # Интервал не прошел, пропускаем отправку
-                            remaining = SEND_INTERVAL_SEC - (current_time - last_sent)
+                            remaining = SEND_INTERVAL_SEC - (current_time - last_sent_fr)
                             logger.debug(f"Пропуск отправки: интервал не прошел (осталось {remaining:.1f}с)")
                 
                 # Ждем 1 секунду перед следующей итерацией
