@@ -8,8 +8,8 @@
 2. **Gate.io** (gate) готово
 3. **MEXC** (mexc) жду
 4. **Binance** (binance) готово
-5. **Bitget** (bitget)
-6. **BingX** (bingx)
+5. **Bitget** (bitget) готово
+6. **BingX** (bingx) готово
 7. **OKX** (okx)
 8. **XT.com** (xt)
 
