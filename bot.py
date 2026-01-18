@@ -24,7 +24,7 @@ from announcements_monitor import AnnouncementsMonitor
 from x_news_monitor import XNewsMonitor
 from telegram_sender import TelegramSender
 import config
-from position_opener import open_long_short_positions
+from position_opener import open_long_short_positions, close_long_short_positions
 
 # Настройка логирования
 logging.basicConfig(
@@ -602,7 +602,14 @@ class PerpArbitrageBot:
 
         return close_long_fee_pct + close_short_fee_pct + buffer_pct
     
-    async def monitor_spreads(self, coin: str, long_exchange: str, short_exchange: str, close_threshold_pct: Optional[float] = None):
+    async def monitor_spreads(
+        self,
+        coin: str,
+        long_exchange: str,
+        short_exchange: str,
+        close_threshold_pct: Optional[float] = None,
+        coin_amount: Optional[float] = None,
+    ):
         """
         Мониторинг спредов открытия и закрытия каждую секунду
         
@@ -611,6 +618,7 @@ class PerpArbitrageBot:
             long_exchange: Биржа для Long позиции
             short_exchange: Биржа для Short позиции
             close_threshold_pct: Порог закрытия в процентах (если указан, отправляет сообщение в Telegram при достижении)
+            coin_amount: Количество монет (base qty), нужно для авто-закрытия после N уведомлений
         """
         logger.info("=" * 60)
         logger.info(f"Начало мониторинга спредов для {coin}")
@@ -624,6 +632,9 @@ class PerpArbitrageBot:
         last_sent_time: Dict[tuple, float] = {}
         # Интервал между отправками сообщений о закрытии (секунды), читается из .env
         SEND_INTERVAL_SEC = float(os.getenv("CLOSE_INTERVAL", "60"))  # По умолчанию 60 секунд (1 минута)
+        # Окно авто-закрытия: если за CLOSE_INTERVAL*3 отправились 3 Telegram-сообщения "закрытие при спреде" — закрываем позиции.
+        close_alert_window_sec = SEND_INTERVAL_SEC * 3.0
+        close_alert_times: List[float] = []
         
         try:
             while True:
@@ -763,6 +774,29 @@ class PerpArbitrageBot:
                                         last_sent_time[key] = current_time
                                         last_sent_time[key_fr] = current_time
                                         last_sent_time[key_both] = current_time
+
+                                        # Учет "закрытие при спреде" для авто-закрытия
+                                        close_alert_times.append(current_time)
+                                        cutoff = current_time - close_alert_window_sec
+                                        close_alert_times[:] = [t for t in close_alert_times if t >= cutoff]
+                                        if len(close_alert_times) >= 3:
+                                            if coin_amount is None:
+                                                logger.error("❌ Авто-закрытие: неизвестно количество монет (coin_amount=None), закрытие пропущено")
+                                                close_alert_times.clear()
+                                            else:
+                                                logger.warning(f"🧯 Авто-закрытие: 3 уведомления о закрытии за {close_alert_window_sec:.0f}с — закрываем позиции")
+                                                ok_closed = await close_long_short_positions(
+                                                    bot=self,
+                                                    coin=coin,
+                                                    long_exchange=long_exchange,
+                                                    short_exchange=short_exchange,
+                                                    coin_amount=coin_amount,
+                                                )
+                                                if ok_closed:
+                                                    logger.info("✅ Авто-закрытие выполнено, мониторинг остановлен")
+                                                    return
+                                                logger.error("❌ Авто-закрытие не удалось, мониторинг продолжается")
+                                                close_alert_times.clear()
                                         
                                         closing_display_log = format_number(closing_spread_display) if closing_spread_display is not None else "N/A"
                                         threshold_log = format_number(close_threshold_pct) if close_threshold_pct is not None else "N/A"
@@ -814,6 +848,29 @@ class PerpArbitrageBot:
                                             
                                             # Обновляем время последней отправки
                                             last_sent_time[key] = current_time
+
+                                            # Учет "закрытие при спреде" для авто-закрытия
+                                            close_alert_times.append(current_time)
+                                            cutoff = current_time - close_alert_window_sec
+                                            close_alert_times[:] = [t for t in close_alert_times if t >= cutoff]
+                                            if len(close_alert_times) >= 3:
+                                                if coin_amount is None:
+                                                    logger.error("❌ Авто-закрытие: неизвестно количество монет (coin_amount=None), закрытие пропущено")
+                                                    close_alert_times.clear()
+                                                else:
+                                                    logger.warning(f"🧯 Авто-закрытие: 3 уведомления о закрытии за {close_alert_window_sec:.0f}с — закрываем позиции")
+                                                    ok_closed = await close_long_short_positions(
+                                                        bot=self,
+                                                        coin=coin,
+                                                        long_exchange=long_exchange,
+                                                        short_exchange=short_exchange,
+                                                        coin_amount=coin_amount,
+                                                    )
+                                                    if ok_closed:
+                                                        logger.info("✅ Авто-закрытие выполнено, мониторинг остановлен")
+                                                        return
+                                                    logger.error("❌ Авто-закрытие не удалось, мониторинг продолжается")
+                                                    close_alert_times.clear()
                                             
                                             # Используем closing_spread_display для лога (уже инвертированное значение)
                                             closing_display_log = format_number(closing_spread_display) if closing_spread_display is not None else "N/A"
@@ -995,7 +1052,8 @@ async def main():
                     monitoring_data["coin"],
                     monitoring_data["long_exchange"],
                     monitoring_data["short_exchange"],
-                    close_threshold_pct=close_threshold_pct
+                    close_threshold_pct=close_threshold_pct,
+                    coin_amount=monitoring_data.get("coin_amount"),
                 )
             else:
                 logger.info("Мониторинг не запущен")

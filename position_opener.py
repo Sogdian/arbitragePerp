@@ -251,6 +251,334 @@ async def open_long_short_positions(
     return ok_all
 
 
+async def close_long_short_positions(
+    *,
+    bot: Any,
+    coin: str,
+    long_exchange: str,
+    short_exchange: str,
+    coin_amount: float,
+) -> bool:
+    """
+    Автоматическое закрытие Long/Short позиций (две ноги) на coin_amount монет.
+
+    ВАЖНО (по требованию пользователя):
+    - закрываем ЛИМИТНЫМИ ордерами
+    - допускаем частичное исполнение
+    - можем отправлять несколько ордеров, пока весь объем не закроется
+    - пока реализовано только для Bybit и Gate
+    """
+    try:
+        coin_amount_f = float(coin_amount)
+    except Exception:
+        logger.error(f"❌ Некорректное количество монет для закрытия: {coin_amount!r}")
+        return False
+    if coin_amount_f <= 0:
+        logger.error(f"❌ Количество монет для закрытия должно быть > 0, получено: {coin_amount_f}")
+        return False
+
+    long_obj = (getattr(bot, "exchanges", {}) or {}).get(long_exchange)
+    short_obj = (getattr(bot, "exchanges", {}) or {}).get(short_exchange)
+    if long_obj is None or short_obj is None:
+        logger.error(f"❌ Не найдены биржи в bot.exchanges для закрытия: long={long_exchange} short={short_exchange}")
+        return False
+
+    logger.warning(
+        f"🧯 Авто-закрытие позиций: {coin} | Long {long_exchange} + Short {short_exchange} | qty={_format_number(coin_amount_f)} {coin}"
+    )
+
+    async def _close_one(exchange_name: str, exchange_obj: Any, position_direction: str) -> bool:
+        ex = (exchange_name or "").lower().strip()
+        if ex == "bybit":
+            return await _bybit_close_leg_partial_ioc(exchange_obj=exchange_obj, coin=coin, position_direction=position_direction, coin_amount=coin_amount_f)
+        if ex == "gate":
+            return await _gate_close_leg_partial_ioc(exchange_obj=exchange_obj, coin=coin, position_direction=position_direction, coin_amount=coin_amount_f)
+        logger.error(f"❌ Авто-закрытие пока не реализовано для биржи: {exchange_name}")
+        return False
+
+    # Закрываем обе ноги (параллельно)
+    # long_exchange содержит LONG позицию, short_exchange содержит SHORT позицию
+    long_task = _close_one(long_exchange, long_obj, "long")
+    short_task = _close_one(short_exchange, short_obj, "short")
+    long_ok, short_ok = await _gather2(long_task, short_task)
+
+    ok_all = bool(long_ok is True and short_ok is True)
+    if ok_all:
+        logger.info(f"✅ Позиции закрыты: {coin} | Long {long_exchange} + Short {short_exchange} | qty={_format_number(coin_amount_f)} {coin}")
+    else:
+        logger.error(f"❌ Не удалось закрыть обе позиции: {coin} | Long ok={bool(long_ok)} | Short ok={bool(short_ok)}")
+    return ok_all
+
+
+async def _bybit_close_leg_partial_ioc(*, exchange_obj: Any, coin: str, position_direction: str, coin_amount: float) -> bool:
+    """
+    Закрытие позиции на Bybit частями: limit + IOC + reduceOnly.
+    position_direction: "long" (закрываем Sell) или "short" (закрываем Buy).
+    """
+    api_key = _get_env("BYBIT_API_KEY")
+    api_secret = _get_env("BYBIT_API_SECRET")
+    if not api_key or not api_secret:
+        logger.error("❌ Bybit: missing BYBIT_API_KEY/BYBIT_API_SECRET in env")
+        return False
+
+    pos_dir = (position_direction or "").lower().strip()
+    if pos_dir not in ("long", "short"):
+        logger.error(f"❌ Bybit: некорректное направление позиции: {position_direction!r}")
+        return False
+
+    symbol = exchange_obj._normalize_symbol(coin)
+    f = await _bybit_fetch_instrument_filters(exchange_obj=exchange_obj, symbol=symbol)
+    qty_step_raw = f.get("qtyStep")
+    tick_raw = f.get("tickSize")
+    qty_step = float(qty_step_raw) if qty_step_raw else 0.0
+    tick = float(tick_raw) if tick_raw else 0.0
+
+    side_close = "Sell" if pos_dir == "long" else "Buy"
+    remaining = float(coin_amount)
+    eps = max(1e-10, remaining * 1e-8)
+
+    max_orders_total = max(10, MAX_ORDERBOOK_LEVELS * 3)
+    for order_n in range(1, max_orders_total + 1):
+        if remaining <= eps:
+            return True
+
+        ob = await exchange_obj.get_orderbook(coin, limit=MAX_ORDERBOOK_LEVELS)
+        if not ob or not ob.get("bids") or not ob.get("asks"):
+            logger.error(f"❌ Bybit: orderbook недоступен для закрытия {coin}")
+            return False
+
+        levels = ob["bids"] if side_close == "Sell" else ob["asks"]
+        filled_any = 0.0
+
+        for lvl_i, lvl in enumerate(levels[:MAX_ORDERBOOK_LEVELS], start=1):
+            try:
+                px_raw = float(lvl[0])
+            except Exception:
+                continue
+            if px_raw <= 0:
+                continue
+
+            qty_to_send = remaining
+            if qty_step > 0:
+                # не подгоняем в большую сторону — только форматируем по шагу
+                qty_str = _format_by_step(qty_to_send, qty_step_raw)
+            else:
+                qty_str = str(qty_to_send)
+
+            px = _round_price_for_side(px_raw, tick, "sell" if side_close == "Sell" else "buy")
+            px_str = _format_by_step(px, tick_raw)
+
+            logger.info(f"Bybit close: ордер {order_n}/{max_orders_total} | lvl {lvl_i}/{MAX_ORDERBOOK_LEVELS} | side={side_close} qty={qty_str} | лимит={px_str}")
+
+            body = {
+                "category": "linear",
+                "symbol": symbol,
+                "side": side_close,
+                "orderType": "Limit",
+                "qty": qty_str,
+                "price": px_str,
+                # Частичное исполнение допускается — используем IOC.
+                "timeInForce": "IOC",
+                # Важно: не открывать новую позицию, а уменьшать существующую.
+                "reduceOnly": True,
+            }
+            data = await _bybit_private_post(exchange_obj=exchange_obj, api_key=api_key, api_secret=api_secret, path="/v5/order/create", body=body)
+            if not isinstance(data, dict) or data.get("retCode") != 0:
+                logger.error(f"❌ Bybit close: api error: {data}")
+                return False
+
+            order_id = (data.get("result") or {}).get("orderId") if isinstance(data.get("result"), dict) else None
+            if not order_id:
+                logger.error(f"❌ Bybit close: no orderId in response: {data}")
+                return False
+
+            ok_full, filled = await _bybit_wait_full_fill(
+                planned={"exchange_obj": exchange_obj, "api_key": api_key, "api_secret": api_secret, "symbol": symbol, "qty": qty_str},
+                order_id=str(order_id),
+            )
+
+            if filled and filled > 0:
+                filled_any = float(filled)
+                remaining = max(0.0, remaining - filled_any)
+                logger.info(f"Bybit close: исполнено={_format_number(filled_any)} {coin} | осталось={_format_number(remaining)} {coin} | full={ok_full}")
+                break  # обновим стакан и продолжим закрывать остаток
+
+        if filled_any <= 0:
+            logger.warning(f"Bybit close: 0 исполнено по уровням 1-{MAX_ORDERBOOK_LEVELS} | осталось={_format_number(remaining)} {coin}")
+            # не крутимся бесконечно — попробуем еще раз на новом стакане
+            continue
+
+    logger.error(f"❌ Bybit close: не удалось закрыть позицию полностью | осталось={_format_number(remaining)} {coin}")
+    return False
+
+
+async def _gate_wait_done_get_filled_contracts(*, planned: Dict[str, Any], order_id: str) -> Tuple[bool, int]:
+    """
+    Gate: ждём завершения IOC-ордера и возвращаем количество исполненных контрактов (int).
+    """
+    api_key = planned["api_key"]
+    api_secret = planned["api_secret"]
+    exchange_obj = planned["exchange_obj"]
+    contract = planned["contract"]
+    size_abs_req = int(abs(int(planned.get("size") or 0)))
+
+    import asyncio
+    for _ in range(20):
+        data = await _gate_private_request(
+            exchange_obj=exchange_obj,
+            api_key=api_key,
+            api_secret=api_secret,
+            method="GET",
+            path=f"/api/v4/futures/usdt/orders/{order_id}",
+            params={"contract": contract},
+        )
+        if isinstance(data, dict) and data.get("_error"):
+            return False, 0
+        if not isinstance(data, dict):
+            await asyncio.sleep(0.2)
+            continue
+
+        status = str(data.get("status") or "")
+        try:
+            left = int(float(data.get("left") or 0))
+        except Exception:
+            left = 0
+        try:
+            size_abs = int(abs(int(float(data.get("size") or 0))))
+        except Exception:
+            size_abs = size_abs_req
+
+        filled_contracts = max(0, size_abs - max(0, left))
+
+        if status.lower() in ("finished", "cancelled", "canceled"):
+            logger.info(
+                f"Gate close: статус ордера {order_id}: {status} | исполнено_контрактов={filled_contracts} | требовалось_контрактов={size_abs_req}"
+            )
+            return True, filled_contracts
+
+        await asyncio.sleep(0.2)
+
+    return False, 0
+
+
+async def _gate_close_leg_partial_ioc(*, exchange_obj: Any, coin: str, position_direction: str, coin_amount: float) -> bool:
+    """
+    Закрытие позиции на Gate частями: limit + IOC.
+    position_direction: "long" (закрываем Sell => size отрицательный) или "short" (закрываем Buy => size положительный).
+    """
+    api_key = _get_env("GATEIO_API_KEY")
+    api_secret = _get_env("GATEIO_API_SECRET")
+    if not api_key or not api_secret:
+        logger.error("❌ Gate: missing GATEIO_API_KEY/GATEIO_API_SECRET in env")
+        return False
+
+    pos_dir = (position_direction or "").lower().strip()
+    if pos_dir not in ("long", "short"):
+        logger.error(f"❌ Gate: некорректное направление позиции: {position_direction!r}")
+        return False
+
+    contract = exchange_obj._normalize_symbol(coin)
+    cinfo = await _gate_fetch_contract_info(exchange_obj=exchange_obj, contract=contract)
+    if not isinstance(cinfo, dict):
+        logger.error(f"❌ Gate: contract info not available for {contract}")
+        return False
+
+    qmul_raw = cinfo.get("quanto_multiplier") or cinfo.get("contract_size") or cinfo.get("multiplier")
+    try:
+        qmul = float(qmul_raw)
+    except Exception:
+        qmul = 0.0
+    if qmul <= 0:
+        logger.error(f"❌ Gate: bad quanto_multiplier for {contract}: {qmul_raw}")
+        return False
+
+    contracts_exact = float(coin_amount) / qmul
+    contracts_total = int(round(contracts_exact))
+    if abs(contracts_exact - contracts_total) > 1e-9 or contracts_total <= 0:
+        logger.error(f"❌ Gate close: qty {coin_amount} {coin} not compatible with contract size (qmul={qmul}) => contracts={contracts_exact:.8f} (must be integer)")
+        return False
+
+    price_step = _gate_price_step_from_contract_info(cinfo) or 0.0
+    min_raw = cinfo.get("order_size_min")
+    try:
+        min_size = int(float(min_raw)) if min_raw is not None else None
+    except Exception:
+        min_size = None
+
+    # Для long позиции: закрытие = sell => size отрицательный. Для short: закрытие = buy => size положительный.
+    sign = -1 if pos_dir == "long" else 1
+    remaining_contracts = int(contracts_total)
+    max_orders_total = max(10, MAX_ORDERBOOK_LEVELS * 3)
+
+    for order_n in range(1, max_orders_total + 1):
+        if remaining_contracts <= 0:
+            return True
+
+        ob = await exchange_obj.get_orderbook(coin, limit=MAX_ORDERBOOK_LEVELS)
+        if not ob or not ob.get("bids") or not ob.get("asks"):
+            logger.error(f"❌ Gate: orderbook недоступен для закрытия {coin}")
+            return False
+
+        side = "buy" if pos_dir == "short" else "sell"
+        levels = ob["asks"] if side == "buy" else ob["bids"]
+
+        filled_any = 0
+        for lvl_i, lvl in enumerate(levels[:MAX_ORDERBOOK_LEVELS], start=1):
+            try:
+                px_raw = float(lvl[0])
+            except Exception:
+                continue
+            if px_raw <= 0:
+                continue
+
+            px = _round_price_for_side(px_raw, price_step, side)
+            px_str = _format_by_step(px, str(price_step) if price_step > 0 else None)
+            size_signed = int(sign * remaining_contracts)
+
+            logger.info(f"Gate close: ордер {order_n}/{max_orders_total} | lvl {lvl_i}/{MAX_ORDERBOOK_LEVELS} | side={side} size={size_signed} | лимит={px_str}")
+
+            body = {
+                "contract": contract,
+                "size": size_signed,
+                "price": px_str,
+                "tif": "ioc",
+                # Критично для закрытия, особенно если включён hedge/dual режим:
+                # reduce_only гарантирует, что ордер НЕ откроет/увеличит позицию, а только уменьшит существующую.
+                "reduce_only": True,
+            }
+            data = await _gate_private_post(exchange_obj=exchange_obj, api_key=api_key, api_secret=api_secret, path="/api/v4/futures/usdt/orders", body=body)
+            if not (isinstance(data, dict) and data.get("id") is not None and ("label" not in data) and ("message" not in data)):
+                # Частая причина остатков при закрытии — минимальный размер ордера.
+                if min_size is not None and remaining_contracts < min_size:
+                    logger.error(
+                        f"❌ Gate close: api error (возможная причина: остаток меньше min_size) | "
+                        f"остаток_контрактов={remaining_contracts} min_size={min_size} | resp={data}"
+                    )
+                else:
+                    logger.error(f"❌ Gate close: api error: {data}")
+                return False
+
+            order_id = str(data.get("id"))
+            done, filled_contracts = await _gate_wait_done_get_filled_contracts(
+                planned={"exchange_obj": exchange_obj, "api_key": api_key, "api_secret": api_secret, "contract": contract, "size": size_signed},
+                order_id=order_id,
+            )
+            if not done:
+                logger.warning(f"Gate close: не удалось подтвердить завершение ордера {order_id}, продолжаем")
+            if filled_contracts > 0:
+                filled_any = int(filled_contracts)
+                remaining_contracts = max(0, remaining_contracts - filled_any)
+                logger.info(f"Gate close: исполнено_контрактов={filled_any} | осталось_контрактов={remaining_contracts}")
+                break
+
+        if filled_any <= 0:
+            logger.warning(f"Gate close: 0 исполнено по уровням 1-{MAX_ORDERBOOK_LEVELS} | осталось_контрактов={remaining_contracts}")
+            continue
+
+    logger.error(f"❌ Gate close: не удалось закрыть позицию полностью | осталось_контрактов={remaining_contracts}")
+    return False
+
+
 async def _gather2(t1, t2):
     import asyncio
     r = await asyncio.gather(t1, t2, return_exceptions=True)
