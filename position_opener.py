@@ -296,6 +296,10 @@ async def close_long_short_positions(
             return await _bybit_close_leg_partial_ioc(exchange_obj=exchange_obj, coin=coin, position_direction=position_direction, coin_amount=coin_amount_f)
         if ex == "gate":
             return await _gate_close_leg_partial_ioc(exchange_obj=exchange_obj, coin=coin, position_direction=position_direction, coin_amount=coin_amount_f)
+        if ex == "binance":
+            return await _binance_close_leg_partial_ioc(exchange_obj=exchange_obj, coin=coin, position_direction=position_direction, coin_amount=coin_amount_f)
+        if ex == "bitget":
+            return await _bitget_close_leg_partial_ioc(exchange_obj=exchange_obj, coin=coin, position_direction=position_direction, coin_amount=coin_amount_f)
         logger.error(f"❌ Авто-закрытие пока не реализовано для биржи: {exchange_name}")
         return False, None
 
@@ -617,6 +621,409 @@ async def _gate_close_leg_partial_ioc(*, exchange_obj: Any, coin: str, position_
 
     logger.error(f"❌ Gate close: не удалось закрыть позицию полностью | осталось_контрактов={remaining_contracts}")
     avg_price = total_notional / total_filled_base if total_filled_base > 0 else None
+    return False, avg_price
+
+
+async def _binance_close_leg_partial_ioc(*, exchange_obj: Any, coin: str, position_direction: str, coin_amount: float) -> Tuple[bool, Optional[float]]:
+    """
+    Binance USDT-M Futures: закрытие позиции частями лимитными IOC ордерами.
+    position_direction: "long" (закрываем SELL) или "short" (закрываем BUY).
+    """
+    api_key = _get_env("BINANCE_API_KEY")
+    api_secret = _get_env("BINANCE_API_SECRET")
+    if not api_key or not api_secret:
+        logger.error("❌ Binance: missing BINANCE_API_KEY/BINANCE_API_SECRET in env")
+        return False, None
+
+    pos_dir = (position_direction or "").lower().strip()
+    if pos_dir not in ("long", "short"):
+        logger.error(f"❌ Binance: некорректное направление позиции: {position_direction!r}")
+        return False, None
+
+    symbol = exchange_obj._normalize_symbol(coin)
+    f = await _binance_get_symbol_filters(exchange_obj=exchange_obj, symbol=symbol)
+    tick_raw = f.get("tickSize")
+    step_raw = f.get("stepSize")
+    tick = float(tick_raw) if tick_raw else 0.0
+    step = float(step_raw) if step_raw else 0.0
+
+    side_close = "SELL" if pos_dir == "long" else "BUY"
+    # Для hedge-mode: positionSide может требоваться, для one-way — запрещаться.
+    pos_side = "LONG" if pos_dir == "long" else "SHORT"
+
+    remaining = float(coin_amount)
+    eps = max(1e-10, remaining * 1e-8)
+
+    total_notional = 0.0
+    total_filled = 0.0
+
+    max_orders_total = max(10, MAX_ORDERBOOK_LEVELS * 3)
+    for order_n in range(1, max_orders_total + 1):
+        if remaining <= eps:
+            avg_price = total_notional / total_filled if total_filled > 0 else None
+            return True, avg_price
+
+        ob = await exchange_obj.get_orderbook(coin, limit=MAX_ORDERBOOK_LEVELS)
+        if not ob or not ob.get("bids") or not ob.get("asks"):
+            logger.error(f"❌ Binance: orderbook недоступен для закрытия {coin}")
+            return False, None
+
+        levels = ob["bids"] if side_close == "SELL" else ob["asks"]
+        filled_any = 0.0
+
+        for lvl_i, lvl in enumerate(levels[:MAX_ORDERBOOK_LEVELS], start=1):
+            try:
+                px_raw = float(lvl[0])
+            except Exception:
+                continue
+            if px_raw <= 0:
+                continue
+
+            px = _round_price_for_side(px_raw, tick, "sell" if side_close == "SELL" else "buy")
+            px_str = _format_by_step(px, tick_raw)
+
+            qty_to_send = remaining
+            if step > 0:
+                qty_str = _format_by_step(qty_to_send, step_raw)
+            else:
+                qty_str = str(qty_to_send)
+
+            logger.info(f"Binance close: ордер {order_n}/{max_orders_total} | lvl {lvl_i}/{MAX_ORDERBOOK_LEVELS} | side={side_close} qty={qty_str} | лимит={px_str}")
+
+            def _post(params: Dict[str, Any]) -> Any:
+                return _binance_private_request(
+                    exchange_obj=exchange_obj,
+                    api_key=api_key,
+                    api_secret=api_secret,
+                    method="POST",
+                    path="/fapi/v1/order",
+                    params=params,
+                )
+
+            base_params = {
+                "symbol": symbol,
+                "side": side_close,
+                "type": "LIMIT",
+                "timeInForce": "IOC",
+                "quantity": qty_str,
+                "price": px_str,
+                "reduceOnly": "true",
+            }
+            base_params_no_reduce = {k: v for k, v in base_params.items() if k != "reduceOnly"}
+
+            # 1) пробуем с positionSide (hedge)
+            data = await _post({**base_params, "positionSide": pos_side})
+            if isinstance(data, dict) and (data.get("_error") or data.get("code") is not None):
+                code = data.get("code")
+                msg = str(data.get("msg") or data.get("_body") or "")
+                msg_l = msg.lower()
+
+                # Binance: в некоторых режимах параметр reduceOnly запрещён ("not required")
+                if code == -1106 and "reduceonly" in msg_l:
+                    logger.warning("Binance close: reduceOnly не поддержан в текущем режиме — повторяем без reduceOnly")
+                    data = await _post({**base_params_no_reduce, "positionSide": pos_side})
+                    # если positionSide тоже не подходит — ниже отработает fallback
+                    if isinstance(data, dict) and (data.get("_error") or data.get("code") is not None):
+                        code2 = data.get("code")
+                        msg2 = str(data.get("msg") or data.get("_body") or "")
+                        if code2 == -4061 or "position side" in msg2.lower():
+                            data = await _post(base_params_no_reduce)
+
+                # position side mismatch — пробуем без positionSide (one-way)
+                elif code == -4061 or "position side" in msg_l:
+                    data = await _post(base_params)
+                    if isinstance(data, dict) and (data.get("_error") or data.get("code") is not None):
+                        code2 = data.get("code")
+                        msg2 = str(data.get("msg") or data.get("_body") or "")
+                        if code2 == -1106 and "reduceonly" in msg2.lower():
+                            logger.warning("Binance close: reduceOnly не поддержан в текущем режиме — повторяем без reduceOnly")
+                            data = await _post(base_params_no_reduce)
+
+            if not isinstance(data, dict):
+                logger.error(f"❌ Binance close: api error: {data}")
+                return False, None
+
+            if data.get("_error") or data.get("code") is not None:
+                logger.error(f"❌ Binance close: api error: {data}")
+                return False, None
+
+            order_id = str(data.get("orderId") or "")
+            if not order_id:
+                logger.error(f"❌ Binance close: no orderId in response: {data}")
+                return False, None
+
+            # Для IOC: ордер завершится быстро (FILLED / CANCELED).
+            ok_full, executed = await _binance_wait_full_fill(
+                planned={"exchange_obj": exchange_obj, "api_key": api_key, "api_secret": api_secret, "symbol": symbol, "qty": qty_str},
+                order_id=order_id,
+            )
+            if executed and executed > 0:
+                filled_any = float(executed)
+                # Best-effort avgPrice from API (если есть)
+                avg_px = None
+                try:
+                    avg_px = float(data.get("avgPrice")) if data.get("avgPrice") is not None else None
+                except Exception:
+                    avg_px = None
+                use_px = avg_px if (avg_px is not None and avg_px > 0) else px
+                total_notional += filled_any * float(use_px)
+                total_filled += filled_any
+                remaining = max(0.0, remaining - filled_any)
+                logger.info(f"Binance close: исполнено={_format_number(filled_any)} {coin} | осталось={_format_number(remaining)} {coin} | full={ok_full}")
+                break
+
+        if filled_any <= 0:
+            logger.warning(f"Binance close: 0 исполнено по уровням 1-{MAX_ORDERBOOK_LEVELS} | осталось={_format_number(remaining)} {coin}")
+            continue
+
+    logger.error(f"❌ Binance close: не удалось закрыть позицию полностью | осталось={_format_number(remaining)} {coin}")
+    avg_price = total_notional / total_filled if total_filled > 0 else None
+    return False, avg_price
+
+
+async def _bitget_wait_done_get_filled_qty(*, planned: Dict[str, Any], order_id: str) -> Tuple[bool, float]:
+    """
+    Bitget: ждём завершения IOC-ордера и возвращаем исполненное количество (base qty).
+    """
+    exchange_obj = planned["exchange_obj"]
+    api_key = planned["api_key"]
+    api_secret = planned["api_secret"]
+    api_pass = planned["api_passphrase"]
+    symbol = planned["symbol"]
+    product_type = planned["productType"]
+
+    import asyncio
+    for _ in range(20):
+        data = await _bitget_private_request(
+            exchange_obj=exchange_obj,
+            api_key=api_key,
+            api_secret=api_secret,
+            api_passphrase=api_pass,
+            method="GET",
+            path="/api/v2/mix/order/detail",
+            params={"symbol": symbol, "productType": product_type, "orderId": order_id},
+        )
+        if isinstance(data, dict) and data.get("_error"):
+            # try v1 fallback
+            data = await _bitget_private_request(
+                exchange_obj=exchange_obj,
+                api_key=api_key,
+                api_secret=api_secret,
+                api_passphrase=api_pass,
+                method="GET",
+                path="/api/mix/v1/order/detail",
+                params={"symbol": symbol, "orderId": order_id, "marginCoin": "USDT"},
+            )
+
+        code, _msg = _bitget_extract_code_msg(data)
+        if code is not None and code != "00000":
+            return False, 0.0
+
+        item = None
+        if isinstance(data, dict):
+            item = data.get("data") or data.get("result") or data
+        if not isinstance(item, dict):
+            await asyncio.sleep(0.2)
+            continue
+
+        status = str(item.get("state") or item.get("status") or "")
+        filled_raw = item.get("filledQty") or item.get("fillSz") or item.get("filledSize") or item.get("dealSize") or item.get("baseVolume") or item.get("accBaseVolume")
+        try:
+            filled = float(filled_raw) if filled_raw is not None else 0.0
+        except Exception:
+            filled = 0.0
+
+        if status.lower() in ("filled", "full_fill", "complete", "completed", "success", "closed", "canceled", "cancelled", "rejected"):
+            logger.info(f"Bitget close: статус ордера {order_id}: {status} | исполнено={_format_number(filled)}")
+            return True, filled
+
+        await asyncio.sleep(0.2)
+
+    return False, 0.0
+
+
+async def _bitget_close_leg_partial_ioc(*, exchange_obj: Any, coin: str, position_direction: str, coin_amount: float) -> Tuple[bool, Optional[float]]:
+    """
+    Bitget USDT-M Futures: закрытие позиции частями лимитными IOC ордерами.
+    position_direction: "long" (закрываем Sell) или "short" (закрываем Buy).
+    """
+    api_key = _get_env("BITGET_API_KEY")
+    api_secret = _get_env("BITGET_API_SECRET")
+    api_pass = os.getenv("BITGET_API_PASSPHRASE", "").strip()
+    if not api_key or not api_secret:
+        logger.error("❌ Bitget: missing BITGET_API_KEY/BITGET_API_SECRET in env")
+        return False, None
+    if not api_pass:
+        logger.error("❌ Bitget: missing BITGET_API_PASSPHRASE in env")
+        return False, None
+
+    pos_dir = (position_direction or "").lower().strip()
+    if pos_dir not in ("long", "short"):
+        logger.error(f"❌ Bitget: некорректное направление позиции: {position_direction!r}")
+        return False, None
+
+    symbol = exchange_obj._normalize_symbol(coin)
+    f = await _bitget_get_contract_filters(exchange_obj=exchange_obj, symbol=symbol)
+    tick_raw = f.get("tickSize")
+    step_raw = f.get("stepSize")
+    product_type = f.get("productType") or getattr(exchange_obj, "PRODUCT_TYPE", "USDT-FUTURES")
+    tick = float(tick_raw) if tick_raw else 0.0
+    step = float(step_raw) if step_raw else 0.0
+
+    # marginMode обязателен; по умолчанию isolated
+    bitget_margin_mode = (os.getenv("BITGET_MARGIN_MODE", "isolated") or "").strip().lower()
+    if not bitget_margin_mode:
+        bitget_margin_mode = "isolated"
+    if bitget_margin_mode == "cross":
+        bitget_margin_mode = "crossed"
+    if bitget_margin_mode not in ("isolated", "crossed"):
+        bitget_margin_mode = "isolated"
+
+    # Для закрытия:
+    # - long позиция закрывается sell / close_long
+    # - short позиция закрывается buy / close_short
+    if pos_dir == "long":
+        side_close_open_style = "close_long"
+        side_buy_sell = "sell"
+        pos_side = "long"
+        book_side_name = "bids"
+    else:
+        side_close_open_style = "close_short"
+        side_buy_sell = "buy"
+        pos_side = "short"
+        book_side_name = "asks"
+
+    remaining = float(coin_amount)
+    eps = max(1e-10, remaining * 1e-8)
+
+    total_notional = 0.0
+    total_filled = 0.0
+
+    max_orders_total = max(10, MAX_ORDERBOOK_LEVELS * 3)
+    for order_n in range(1, max_orders_total + 1):
+        if remaining <= eps:
+            avg_price = total_notional / total_filled if total_filled > 0 else None
+            return True, avg_price
+
+        ob = await exchange_obj.get_orderbook(coin, limit=MAX_ORDERBOOK_LEVELS)
+        if not ob or not ob.get("bids") or not ob.get("asks"):
+            logger.error(f"❌ Bitget: orderbook недоступен для закрытия {coin}")
+            return False, None
+
+        levels = ob.get(book_side_name) or []
+        filled_any = 0.0
+
+        for lvl_i, lvl in enumerate(levels[:MAX_ORDERBOOK_LEVELS], start=1):
+            try:
+                px_raw = float(lvl[0])
+            except Exception:
+                continue
+            if px_raw <= 0:
+                continue
+
+            px = _round_price_for_side(px_raw, tick, "sell" if pos_dir == "long" else "buy")
+            px_str = _format_by_step(px, tick_raw)
+
+            qty_to_send = remaining
+            if step > 0:
+                qty_str = _format_by_step(qty_to_send, step_raw)
+            else:
+                qty_str = str(qty_to_send)
+
+            logger.info(f"Bitget close: ордер {order_n}/{max_orders_total} | lvl {lvl_i}/{MAX_ORDERBOOK_LEVELS} | qty={qty_str} | лимит={px_str}")
+
+            base_body = {
+                "symbol": symbol,
+                "productType": str(product_type),
+                "marginCoin": "USDT",
+                "marginMode": bitget_margin_mode,
+                "orderType": "limit",
+                "price": px_str,
+                "size": qty_str,
+                "force": "ioc",
+                "clientOid": f"arb-close-{int(time.time()*1000)}-{pos_dir}-{order_n}-{lvl_i}",
+            }
+
+            # Как и при открытии — пробуем несколько схем из-за unilateral/hedge режима.
+            candidate_bodies = [
+                {**base_body, "side": side_close_open_style},
+                {**base_body, "side": side_buy_sell, "tradeSide": "close", "posSide": pos_side},
+                {**base_body, "side": side_buy_sell, "posSide": pos_side},
+                {**base_body, "side": side_buy_sell, "tradeSide": "close", "holdSide": pos_side},
+                {**base_body, "side": side_buy_sell, "holdSide": pos_side},
+                {**base_body, "side": side_buy_sell, "tradeSide": side_close_open_style},
+            ]
+
+            data: Any = None
+            ok_created = False
+            saw_no_position = False
+            for schema_i, body in enumerate(candidate_bodies, start=1):
+                data = await _bitget_private_request(
+                    exchange_obj=exchange_obj,
+                    api_key=api_key,
+                    api_secret=api_secret,
+                    api_passphrase=api_pass,
+                    method="POST",
+                    path="/api/v2/mix/order/place-order",
+                    body=body,
+                )
+                code, msg = _bitget_extract_code_msg(data)
+                if code is not None and code != "00000":
+                    msg_l = (msg or "").lower()
+                    if "side mismatch" in msg_l or "unilateral" in msg_l or str(code) in ("400172", "40774"):
+                        logger.warning(f"Bitget close: схема {schema_i}/{len(candidate_bodies)} не подошла | code={code} msg={msg}")
+                        continue
+                    # Частая ситуация: позиции уже нет (или не тот режим/нога). Не считаем фатальной.
+                    if str(code) == "22002" or "no position" in msg_l:
+                        saw_no_position = True
+                        logger.warning(f"Bitget close: нет позиции для закрытия (schema {schema_i}/{len(candidate_bodies)}) | msg={msg}")
+                        continue
+                    # IOC отказ/не исполнилось мгновенно — попробуем следующий уровень
+                    if msg and ("ioc" in msg_l or "fill" in msg_l or "immediately" in msg_l):
+                        logger.warning(f"Bitget close: IOC отклонён на уровне {lvl_i} | причина={msg}")
+                        break
+                    logger.error(f"❌ Bitget close: api error: {data}")
+                    return False, None
+                ok_created = True
+                break
+
+            if not ok_created:
+                # Если все схемы сказали "No position to close" — считаем, что позиция уже закрыта.
+                if saw_no_position:
+                    logger.warning("Bitget close: позиция не найдена — считаем закрытой")
+                    avg_price = total_notional / total_filled if total_filled > 0 else None
+                    return True, avg_price
+                continue
+
+            item = data.get("data") if isinstance(data, dict) else None
+            order_id = None
+            if isinstance(item, dict):
+                order_id = item.get("orderId") or item.get("id")
+            if not order_id and isinstance(data, dict):
+                order_id = data.get("orderId") or data.get("id")
+            if not order_id:
+                logger.error(f"❌ Bitget close: no orderId in response: {data}")
+                return False, None
+
+            order_id_s = str(order_id)
+            _done, filled = await _bitget_wait_done_get_filled_qty(
+                planned={"exchange_obj": exchange_obj, "api_key": api_key, "api_secret": api_secret, "api_passphrase": api_pass, "symbol": symbol, "productType": str(product_type)},
+                order_id=order_id_s,
+            )
+            if filled and filled > 0:
+                filled_any = float(filled)
+                total_notional += filled_any * px
+                total_filled += filled_any
+                remaining = max(0.0, remaining - filled_any)
+                logger.info(f"Bitget close: исполнено={_format_number(filled_any)} {coin} | осталось={_format_number(remaining)} {coin}")
+                break
+
+        if filled_any <= 0:
+            logger.warning(f"Bitget close: 0 исполнено по уровням 1-{MAX_ORDERBOOK_LEVELS} | осталось={_format_number(remaining)} {coin}")
+            continue
+
+    logger.error(f"❌ Bitget close: не удалось закрыть позицию полностью | осталось={_format_number(remaining)} {coin}")
+    avg_price = total_notional / total_filled if total_filled > 0 else None
     return False, avg_price
 
 
