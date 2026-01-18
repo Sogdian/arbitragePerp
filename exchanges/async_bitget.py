@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 class AsyncBitgetExchange(AsyncBaseExchange):
     BASE_URL = "https://api.bitget.com"
-    PRODUCT_TYPE = "umcbl"  # USDT-M Futures (Perpetual)
+    PRODUCT_TYPE = "USDT-FUTURES"  # USDT-M Futures (Perpetual)
 
     def __init__(self, pool_limit: int = 100):
         super().__init__("Bitget", pool_limit)
@@ -81,17 +81,33 @@ class AsyncBitgetExchange(AsyncBaseExchange):
             params = {"symbol": symbol, "productType": self.PRODUCT_TYPE}
 
             data = await self._request_json("GET", url, params=params)
-            if not data or self._is_api_error(data):
+            if not data:
+                logger.debug(f"Bitget: пустой ответ ticker для {coin} (symbol={symbol})")
+                return None
+            if self._is_api_error(data):
+                code = data.get("code")
+                msg = data.get("msg")
+                logger.debug(f"Bitget: ticker API error для {coin} (symbol={symbol}, code={code}, msg={msg})")
                 return None
 
             d = data.get("data")
             if isinstance(d, list) and d:
                 d = d[0]
             if not isinstance(d, dict):
+                logger.debug(f"Bitget: ticker data не dict для {coin} (symbol={symbol}, data={data})")
                 return None
 
-            last = float(d.get("lastPr"))
+            last_raw = d.get("lastPr")
+            if last_raw is None:
+                logger.debug(f"Bitget: нет lastPr в ticker для {coin} (symbol={symbol}, d_keys={list(d.keys())[:10]})")
+                return None
+            try:
+                last = float(last_raw)
+            except (TypeError, ValueError) as e:
+                logger.debug(f"Bitget: lastPr не число для {coin} (symbol={symbol}, lastPr={last_raw}): {e}")
+                return None
             if last <= 0:
+                logger.debug(f"Bitget: lastPr <= 0 для {coin} (symbol={symbol}, last={last})")
                 return None
 
             bid = self._safe_px(d.get("bidPr"), last)
