@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import base64
 import json
 import logging
 import math
@@ -284,6 +285,10 @@ async def _plan_one_leg(
         return await _binance_plan_leg(exchange_obj=exchange_obj, coin=coin, direction=direction, coin_amount=coin_amount)
     if ex == "mexc":
         return await _mexc_plan_leg(exchange_obj=exchange_obj, coin=coin, direction=direction, coin_amount=coin_amount)
+    if ex == "bitget":
+        return await _bitget_plan_leg(exchange_obj=exchange_obj, coin=coin, direction=direction, coin_amount=coin_amount)
+    if ex == "bingx":
+        return await _bingx_plan_leg(exchange_obj=exchange_obj, coin=coin, direction=direction, coin_amount=coin_amount)
     return OpenLegResult(exchange=exchange_name, direction=direction, ok=False, error="trading not implemented for this exchange")
 
 
@@ -297,6 +302,10 @@ async def _place_one_leg(*, planned: Dict[str, Any]) -> OpenLegResult:
         return await _binance_place_leg(planned=planned)
     if ex == "mexc":
         return await _mexc_place_leg(planned=planned)
+    if ex == "bitget":
+        return await _bitget_place_leg(planned=planned)
+    if ex == "bingx":
+        return await _bingx_place_leg(planned=planned)
     return OpenLegResult(exchange=str(planned.get("exchange")), direction=str(planned.get("direction")), ok=False, error="unknown exchange in plan")
 
 
@@ -336,6 +345,10 @@ async def _check_filled_full(*, planned: Dict[str, Any], order_id: str) -> Tuple
         return await _binance_wait_full_fill(planned=planned, order_id=order_id)
     if ex == "mexc":
         return await _mexc_wait_full_fill(planned=planned, order_id=order_id)
+    if ex == "bitget":
+        return await _bitget_wait_full_fill(planned=planned, order_id=order_id)
+    if ex == "bingx":
+        return await _bingx_wait_full_fill(planned=planned, order_id=order_id)
     return False, 0.0
 
 
@@ -1082,6 +1095,642 @@ async def _mexc_place_leg(*, planned: Dict[str, Any]) -> OpenLegResult:
             return OpenLegResult(exchange="mexc", direction=direction, ok=True, order_id=order_id_s, raw=data)
         logger.warning(f"MEXC: не исполнилось полностью на уровне {idx} | исполнено={_format_number(deal)} | требовалось={qty}")
     return OpenLegResult(exchange="mexc", direction=direction, ok=False, error="не удалось исполнить ордер полностью за 3 попытки (уровни 1-3)")
+
+
+# =========================
+# Bitget Futures trading (3 levels, FOK, full-fill)
+# =========================
+
+_BITGET_CONTRACT_CACHE: Dict[str, Dict[str, Optional[str]]] = {}
+
+
+def _step_str_from_precision(prec: int) -> Optional[str]:
+    try:
+        p = int(prec)
+    except Exception:
+        return None
+    if p < 0:
+        return None
+    if p == 0:
+        return "1"
+    return "0." + ("0" * (p - 1)) + "1"
+
+
+def _bitget_extract_code_msg(data: Any) -> Tuple[Optional[str], Optional[str]]:
+    if not isinstance(data, dict):
+        return None, None
+    code = data.get("code")
+    msg = data.get("msg") or data.get("message")
+    return (str(code) if code is not None else None), (str(msg) if msg is not None else None)
+
+
+async def _bitget_private_request(
+    *,
+    exchange_obj: Any,
+    api_key: str,
+    api_secret: str,
+    api_passphrase: str,
+    method: str,
+    path: str,
+    params: Optional[Dict[str, Any]] = None,
+    body: Optional[Dict[str, Any]] = None,
+) -> Any:
+    """
+    Bitget private request signing (official pattern):
+    prehash = timestamp + method + requestPath + ("?" + queryString if any) + bodyString
+    sign = base64(HMAC_SHA256(secret, prehash))
+    headers: ACCESS-KEY, ACCESS-SIGN, ACCESS-TIMESTAMP, ACCESS-PASSPHRASE
+    """
+    from urllib.parse import urlencode
+
+    ts = str(int(time.time() * 1000))
+    method_u = method.upper()
+    params = params or {}
+    body_json = json.dumps(body, separators=(",", ":"), ensure_ascii=False) if body else ""
+
+    pairs = [(k, str(v)) for k, v in params.items() if v is not None]
+    pairs = sorted(pairs, key=lambda kv: kv[0])
+    query = urlencode(pairs, doseq=True) if pairs else ""
+    path_with_query = f"{path}?{query}" if query else path
+
+    prehash = f"{ts}{method_u}{path_with_query}{body_json}"
+    sign = base64.b64encode(hmac.new(api_secret.encode("utf-8"), prehash.encode("utf-8"), hashlib.sha256).digest()).decode("utf-8")
+
+    headers = {
+        "ACCESS-KEY": api_key,
+        "ACCESS-SIGN": sign,
+        "ACCESS-TIMESTAMP": ts,
+        "ACCESS-PASSPHRASE": api_passphrase,
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+
+    try:
+        resp = await exchange_obj.client.request(
+            method_u,
+            path,
+            params=pairs if pairs else None,
+            headers=headers,
+            content=body_json if body_json else None,
+        )
+    except Exception as e:
+        return {"_error": f"http error: {type(e).__name__}: {e}"}
+
+    if resp.status_code < 200 or resp.status_code >= 300:
+        txt = (resp.text or "")[:600]
+        try:
+            j = resp.json()
+            if isinstance(j, dict):
+                return {"_error": f"http {resp.status_code}", **j, "_body": txt}
+        except Exception:
+            pass
+        return {"_error": f"http {resp.status_code}", "_body": txt}
+    try:
+        return resp.json()
+    except Exception:
+        return {"_error": "bad json", "_body": (resp.text or "")[:600]}
+
+
+async def _bitget_get_contract_filters(*, exchange_obj: Any, symbol: str) -> Dict[str, Optional[str]]:
+    """
+    Best-effort: fetch tick/step/minQty from Bitget public contracts endpoint.
+    Falls back to empty dict if unavailable.
+    """
+    if symbol in _BITGET_CONTRACT_CACHE:
+        return _BITGET_CONTRACT_CACHE[symbol]
+    product_type = getattr(exchange_obj, "PRODUCT_TYPE", "umcbl")
+    url = "/api/v2/mix/market/contracts"
+    for pt in (product_type, "USDT-FUTURES"):
+        try:
+            data = await exchange_obj._request_json("GET", url, params={"productType": pt, "symbol": symbol})
+            if not isinstance(data, dict):
+                continue
+            code, msg = _bitget_extract_code_msg(data)
+            if code is not None and code != "00000":
+                continue
+            items = data.get("data")
+            if isinstance(items, list) and items:
+                item = items[0]
+            elif isinstance(items, dict):
+                item = items
+            else:
+                item = None
+            if not isinstance(item, dict):
+                continue
+
+            # Common fields (best-effort):
+            # pricePlace/pricePrecision -> tickSize
+            # sizePlace/quantityPrecision -> stepSize
+            price_prec = item.get("pricePlace") or item.get("pricePrecision") or item.get("priceScale")
+            qty_prec = item.get("sizePlace") or item.get("quantityPrecision") or item.get("volumePlace")
+            tick_raw = item.get("tickSize") or _step_str_from_precision(int(price_prec)) if price_prec is not None else None
+            step_raw = item.get("sizeMultiplier") or item.get("stepSize") or _step_str_from_precision(int(qty_prec)) if qty_prec is not None else None
+
+            min_qty_raw = item.get("minTradeNum") or item.get("minOrderQty") or item.get("minTradeSize") or item.get("minSize")
+            min_notional_raw = item.get("minNotional") or item.get("minTradeUSDT") or item.get("minTradeValue")
+
+            out = {
+                "tickSize": str(tick_raw) if tick_raw is not None else None,
+                "stepSize": str(step_raw) if step_raw is not None else None,
+                "minQty": str(min_qty_raw) if min_qty_raw is not None else None,
+                "minNotional": str(min_notional_raw) if min_notional_raw is not None else None,
+                "productType": str(pt),
+            }
+            _BITGET_CONTRACT_CACHE[symbol] = out
+            return out
+        except Exception:
+            continue
+    _BITGET_CONTRACT_CACHE[symbol] = {}
+    return {}
+
+
+async def _bitget_plan_leg(*, exchange_obj: Any, coin: str, direction: str, coin_amount: float) -> Any:
+    api_key = _get_env("BITGET_API_KEY")
+    api_secret = _get_env("BITGET_API_SECRET")
+    api_pass = os.getenv("BITGET_API_PASSPHRASE", "").strip()
+    if not api_key or not api_secret:
+        return OpenLegResult(exchange="bitget", direction=direction, ok=False, error="missing BITGET_API_KEY/BITGET_API_SECRET in env")
+    if not api_pass:
+        return OpenLegResult(exchange="bitget", direction=direction, ok=False, error="Bitget требует passphrase (ACCESS-PASSPHRASE). Добавь BITGET_API_PASSPHRASE в .env")
+
+    symbol = exchange_obj._normalize_symbol(coin)
+    ob = await exchange_obj.get_orderbook(coin, limit=3)
+    if not ob or not ob.get("bids") or not ob.get("asks"):
+        return OpenLegResult(exchange="bitget", direction=direction, ok=False, error=f"orderbook not available for {coin}")
+
+    side = "buy" if direction == "long" else "sell"
+    book_side = ob["asks"] if direction == "long" else ob["bids"]
+    best_price = float(book_side[0][0])
+    if best_price <= 0:
+        return OpenLegResult(exchange="bitget", direction=direction, ok=False, error="bad orderbook best price")
+
+    candidates: list[float] = []
+    cum = 0.0
+    for lvl in book_side[:3]:
+        try:
+            p = float(lvl[0]); s = float(lvl[1])
+        except Exception:
+            continue
+        if p <= 0 or s <= 0:
+            continue
+        cum += s
+        if cum + 1e-12 >= coin_amount:
+            candidates.append(p)
+    if not candidates:
+        return OpenLegResult(exchange="bitget", direction=direction, ok=False, error=f"not enough depth in first 3 levels: need {coin_amount}, available {cum}")
+
+    f = await _bitget_get_contract_filters(exchange_obj=exchange_obj, symbol=symbol)
+    tick_raw = f.get("tickSize")
+    step_raw = f.get("stepSize")
+    min_qty_raw = f.get("minQty")
+    min_notional_raw = f.get("minNotional")
+    product_type = f.get("productType") or getattr(exchange_obj, "PRODUCT_TYPE", "umcbl")
+
+    tick = float(tick_raw) if tick_raw else 0.0
+    step = float(step_raw) if step_raw else 0.0
+    min_qty = float(min_qty_raw) if min_qty_raw else 0.0
+    min_notional = float(min_notional_raw) if min_notional_raw else 0.0
+
+    if step > 0 and not _is_multiple_of_step(coin_amount, step):
+        return OpenLegResult(exchange="bitget", direction=direction, ok=False, error=f"qty {coin_amount} not multiple of stepSize {step_raw}")
+    if min_qty > 0 and coin_amount < min_qty:
+        return OpenLegResult(exchange="bitget", direction=direction, ok=False, error=f"qty {coin_amount} < minQty {min_qty_raw}")
+
+    limit_price = _round_price_for_side(float(candidates[0]), tick, "buy" if direction == "long" else "sell")
+    notional = coin_amount * limit_price
+    if min_notional > 0 and notional < min_notional:
+        return OpenLegResult(exchange="bitget", direction=direction, ok=False, error=f"minNotional {min_notional_raw} > requested ~{_format_number(notional)}")
+
+    qty_str = _format_by_step(coin_amount, step_raw)
+    px_str = _format_by_step(limit_price, tick_raw)
+    candidates_str = "[" + ", ".join([_format_number(c) for c in candidates]) + "]"
+    logger.info(f"План Bitget: {direction} qty={qty_str} | best={_format_number(best_price)} | кандидаты уровней(<=3)={candidates_str}")
+
+    return {
+        "exchange": "bitget",
+        "direction": direction,
+        "exchange_obj": exchange_obj,
+        "symbol": symbol,
+        "productType": str(product_type),
+        "marginCoin": "USDT",
+        "side": side,
+        "qty": qty_str,
+        "price_str": px_str,
+        "limit_price": float(px_str),
+        "candidate_prices_raw": candidates,
+        "api_key": api_key,
+        "api_secret": api_secret,
+        "api_passphrase": api_pass,
+        "tickSize": tick_raw,
+        "stepSize": step_raw,
+    }
+
+
+async def _bitget_wait_full_fill(*, planned: Dict[str, Any], order_id: str) -> Tuple[bool, float]:
+    exchange_obj = planned["exchange_obj"]
+    api_key = planned["api_key"]
+    api_secret = planned["api_secret"]
+    api_pass = planned["api_passphrase"]
+    symbol = planned["symbol"]
+    product_type = planned["productType"]
+    qty_req = float(planned["qty"])
+    import asyncio
+
+    # Best-effort endpoints: v2 detail first, fallback to v1 detail
+    for _ in range(20):
+        data = await _bitget_private_request(
+            exchange_obj=exchange_obj,
+            api_key=api_key,
+            api_secret=api_secret,
+            api_passphrase=api_pass,
+            method="GET",
+            path="/api/v2/mix/order/detail",
+            params={"symbol": symbol, "productType": product_type, "orderId": order_id},
+        )
+        if isinstance(data, dict) and data.get("_error"):
+            # try v1 fallback
+            data = await _bitget_private_request(
+                exchange_obj=exchange_obj,
+                api_key=api_key,
+                api_secret=api_secret,
+                api_passphrase=api_pass,
+                method="GET",
+                path="/api/mix/v1/order/detail",
+                params={"symbol": symbol, "orderId": order_id, "marginCoin": "USDT"},
+            )
+
+        code, msg = _bitget_extract_code_msg(data)
+        if code is not None and code != "00000":
+            return False, 0.0
+
+        item = None
+        if isinstance(data, dict):
+            item = data.get("data") or data.get("result") or data
+        if not isinstance(item, dict):
+            await asyncio.sleep(0.2)
+            continue
+
+        status = str(item.get("state") or item.get("status") or "")
+        filled_raw = item.get("filledQty") or item.get("fillSz") or item.get("filledSize") or item.get("dealSize") or item.get("baseVolume") or item.get("accBaseVolume")
+        try:
+            filled = float(filled_raw) if filled_raw is not None else 0.0
+        except Exception:
+            filled = 0.0
+
+        if status.lower() in ("filled", "full_fill", "complete", "completed", "success", "closed", "canceled", "cancelled", "rejected"):
+            logger.info(f"Bitget: статус ордера {order_id}: {status} | исполнено={_format_number(filled)} | требовалось={_format_number(qty_req)}")
+            return (filled + 1e-10 >= qty_req) and status.lower() in ("filled", "full_fill", "complete", "completed", "success", "closed"), filled
+
+        await asyncio.sleep(0.2)
+
+    return False, 0.0
+
+
+async def _bitget_place_leg(*, planned: Dict[str, Any]) -> OpenLegResult:
+    exchange_obj = planned["exchange_obj"]
+    api_key = planned["api_key"]
+    api_secret = planned["api_secret"]
+    api_pass = planned["api_passphrase"]
+    direction = planned["direction"]
+    symbol = planned["symbol"]
+    product_type = planned["productType"]
+    side = planned["side"]
+    qty = planned["qty"]
+    candidates = planned.get("candidate_prices_raw") or [float(planned["price_str"])]
+    attempts = candidates[:3]
+    tick_raw = planned.get("tickSize")
+    tick = float(tick_raw) if tick_raw else 0.0
+
+    for idx, px_raw in enumerate(attempts, start=1):
+        px = _round_price_for_side(float(px_raw), tick, "buy" if direction == "long" else "sell")
+        px_str = _format_by_step(px, tick_raw)
+        logger.info(f"Bitget: попытка {idx}/{len(attempts)} | {direction} qty={qty} | лимит={px_str}")
+
+        body = {
+            "symbol": symbol,
+            "productType": product_type,
+            "marginCoin": "USDT",
+            "orderType": "limit",
+            "price": px_str,
+            "size": qty,
+            "side": side,
+            "force": "fok",
+            "clientOid": f"arb-{int(time.time()*1000)}-{direction}-{idx}",
+        }
+
+        data = await _bitget_private_request(
+            exchange_obj=exchange_obj,
+            api_key=api_key,
+            api_secret=api_secret,
+            api_passphrase=api_pass,
+            method="POST",
+            path="/api/v2/mix/order/place-order",
+            body=body,
+        )
+
+        code, msg = _bitget_extract_code_msg(data)
+        if isinstance(data, dict) and data.get("_error"):
+            return OpenLegResult(exchange="bitget", direction=direction, ok=False, error=f"api error: {data}", raw=data)
+        if code is not None and code != "00000":
+            # FOK can fail if not filled immediately -> try next level
+            if msg and ("fok" in msg.lower() or "fill" in msg.lower() or "immediately" in msg.lower()):
+                logger.warning(f"Bitget: FOK отклонён на уровне {idx} | причина={msg}")
+                continue
+            return OpenLegResult(exchange="bitget", direction=direction, ok=False, error=f"api error: {data}", raw=data)
+
+        item = data.get("data") if isinstance(data, dict) else None
+        order_id = None
+        if isinstance(item, dict):
+            order_id = item.get("orderId") or item.get("id")
+        if not order_id and isinstance(data, dict):
+            order_id = data.get("orderId") or data.get("id")
+        if not order_id:
+            return OpenLegResult(exchange="bitget", direction=direction, ok=False, error=f"no orderId in response: {data}", raw=data)
+
+        order_id_s = str(order_id)
+        ok_full, filled = await _bitget_wait_full_fill(planned={**planned, "price_str": px_str, "limit_price": float(px_str)}, order_id=order_id_s)
+        if ok_full:
+            return OpenLegResult(exchange="bitget", direction=direction, ok=True, order_id=order_id_s, raw=data)
+        logger.warning(f"Bitget: не исполнилось полностью на уровне {idx} | исполнено={_format_number(filled)} | требовалось={qty}")
+
+    return OpenLegResult(exchange="bitget", direction=direction, ok=False, error="не удалось исполнить ордер полностью за 3 попытки (уровни 1-3)")
+
+
+# =========================
+# BingX Futures trading (3 levels, FOK, full-fill)
+# =========================
+
+_BINGX_CONTRACT_CACHE: Dict[str, Dict[str, Optional[str]]] = {}
+
+
+async def _bingx_get_contract_filters(*, exchange_obj: Any, symbol: str) -> Dict[str, Optional[str]]:
+    if symbol in _BINGX_CONTRACT_CACHE:
+        return _BINGX_CONTRACT_CACHE[symbol]
+    try:
+        data = await exchange_obj._request_json("GET", "/openApi/swap/v2/quote/contracts", params={})
+        if not isinstance(data, dict) or str(data.get("code")) != "0":
+            _BINGX_CONTRACT_CACHE[symbol] = {}
+            return {}
+        items = data.get("data") or []
+        if not isinstance(items, list):
+            _BINGX_CONTRACT_CACHE[symbol] = {}
+            return {}
+        item = None
+        for it in items:
+            if isinstance(it, dict) and it.get("symbol") == symbol:
+                item = it
+                break
+        if not item:
+            _BINGX_CONTRACT_CACHE[symbol] = {}
+            return {}
+
+        # Best-effort fields:
+        price_prec = item.get("priceScale") or item.get("pricePrecision") or item.get("priceDecimal")
+        qty_prec = item.get("quantityScale") or item.get("quantityPrecision") or item.get("volumePrecision")
+        tick_raw = item.get("tickSize") or (_step_str_from_precision(int(price_prec)) if price_prec is not None else None)
+        step_raw = item.get("stepSize") or (_step_str_from_precision(int(qty_prec)) if qty_prec is not None else None)
+        min_qty_raw = item.get("minTradeNum") or item.get("minTradeQty") or item.get("minQty") or item.get("tradeMinQuantity")
+        min_notional_raw = item.get("minNotional") or item.get("minTradeValue") or item.get("minTradeUSDT")
+
+        out = {
+            "tickSize": str(tick_raw) if tick_raw is not None else None,
+            "stepSize": str(step_raw) if step_raw is not None else None,
+            "minQty": str(min_qty_raw) if min_qty_raw is not None else None,
+            "minNotional": str(min_notional_raw) if min_notional_raw is not None else None,
+        }
+        _BINGX_CONTRACT_CACHE[symbol] = out
+        return out
+    except Exception:
+        _BINGX_CONTRACT_CACHE[symbol] = {}
+        return {}
+
+
+async def _bingx_private_request(
+    *,
+    exchange_obj: Any,
+    api_key: str,
+    api_secret: str,
+    method: str,
+    path: str,
+    params: Dict[str, Any],
+) -> Any:
+    """
+    BingX swap signing (common pattern):
+    - add timestamp (ms)
+    - sign HMAC_SHA256(secret, urlencode(sorted(params))) as hex
+    - send signature as query param
+    - header: X-BX-APIKEY
+    """
+    from urllib.parse import urlencode
+
+    ts = str(int(time.time() * 1000))
+    p = {**params, "timestamp": ts}
+    pairs = sorted([(k, str(v)) for k, v in p.items() if v is not None], key=lambda kv: kv[0])
+    query = urlencode(pairs, doseq=True)
+    sign = hmac.new(api_secret.encode("utf-8"), query.encode("utf-8"), hashlib.sha256).hexdigest()
+    pairs.append(("signature", sign))
+    headers = {"X-BX-APIKEY": api_key, "Accept": "application/json"}
+    try:
+        resp = await exchange_obj.client.request(method.upper(), path, params=pairs, headers=headers)
+    except Exception as e:
+        return {"_error": f"http error: {type(e).__name__}: {e}"}
+    if resp.status_code < 200 or resp.status_code >= 300:
+        return {"_error": f"http {resp.status_code}", "_body": (resp.text or "")[:600]}
+    try:
+        return resp.json()
+    except Exception:
+        return {"_error": "bad json", "_body": (resp.text or "")[:600]}
+
+
+async def _bingx_plan_leg(*, exchange_obj: Any, coin: str, direction: str, coin_amount: float) -> Any:
+    api_key = _get_env("BINGX_API_KEY")
+    api_secret = _get_env("BINGX_API_SECRET")
+    if not api_key or not api_secret:
+        return OpenLegResult(exchange="bingx", direction=direction, ok=False, error="missing BINGX_API_KEY/BINGX_API_SECRET in env")
+
+    symbol = exchange_obj._normalize_symbol(coin)
+    ob = await exchange_obj.get_orderbook(coin, limit=3)
+    if not ob or not ob.get("bids") or not ob.get("asks"):
+        return OpenLegResult(exchange="bingx", direction=direction, ok=False, error=f"orderbook not available for {coin}")
+
+    side = "BUY" if direction == "long" else "SELL"
+    position_side = "LONG" if direction == "long" else "SHORT"
+    book_side = ob["asks"] if direction == "long" else ob["bids"]
+    best_price = float(book_side[0][0])
+    if best_price <= 0:
+        return OpenLegResult(exchange="bingx", direction=direction, ok=False, error="bad orderbook best price")
+
+    candidates: list[float] = []
+    cum = 0.0
+    for lvl in book_side[:3]:
+        try:
+            p = float(lvl[0]); s = float(lvl[1])
+        except Exception:
+            continue
+        if p <= 0 or s <= 0:
+            continue
+        cum += s
+        if cum + 1e-12 >= coin_amount:
+            candidates.append(p)
+    if not candidates:
+        return OpenLegResult(exchange="bingx", direction=direction, ok=False, error=f"not enough depth in first 3 levels: need {coin_amount}, available {cum}")
+
+    f = await _bingx_get_contract_filters(exchange_obj=exchange_obj, symbol=symbol)
+    tick_raw = f.get("tickSize")
+    step_raw = f.get("stepSize")
+    min_qty_raw = f.get("minQty")
+    min_notional_raw = f.get("minNotional")
+
+    tick = float(tick_raw) if tick_raw else 0.0
+    step = float(step_raw) if step_raw else 0.0
+    min_qty = float(min_qty_raw) if min_qty_raw else 0.0
+    min_notional = float(min_notional_raw) if min_notional_raw else 0.0
+
+    if step > 0 and not _is_multiple_of_step(coin_amount, step):
+        return OpenLegResult(exchange="bingx", direction=direction, ok=False, error=f"qty {coin_amount} not multiple of stepSize {step_raw}")
+    if min_qty > 0 and coin_amount < min_qty:
+        return OpenLegResult(exchange="bingx", direction=direction, ok=False, error=f"qty {coin_amount} < minQty {min_qty_raw}")
+
+    limit_price = _round_price_for_side(float(candidates[0]), tick, "buy" if direction == "long" else "sell")
+    notional = coin_amount * limit_price
+    if min_notional > 0 and notional < min_notional:
+        return OpenLegResult(exchange="bingx", direction=direction, ok=False, error=f"minNotional {min_notional_raw} > requested ~{_format_number(notional)}")
+
+    qty_str = _format_by_step(coin_amount, step_raw)
+    px_str = _format_by_step(limit_price, tick_raw)
+    candidates_str = "[" + ", ".join([_format_number(c) for c in candidates]) + "]"
+    logger.info(f"План BingX: {direction} qty={qty_str} | best={_format_number(best_price)} | кандидаты уровней(<=3)={candidates_str}")
+
+    return {
+        "exchange": "bingx",
+        "direction": direction,
+        "exchange_obj": exchange_obj,
+        "symbol": symbol,
+        "side": side,
+        "positionSide": position_side,
+        "qty": qty_str,
+        "price_str": px_str,
+        "limit_price": float(px_str),
+        "candidate_prices_raw": candidates,
+        "api_key": api_key,
+        "api_secret": api_secret,
+        "tickSize": tick_raw,
+        "stepSize": step_raw,
+    }
+
+
+async def _bingx_wait_full_fill(*, planned: Dict[str, Any], order_id: str) -> Tuple[bool, float]:
+    exchange_obj = planned["exchange_obj"]
+    api_key = planned["api_key"]
+    api_secret = planned["api_secret"]
+    symbol = planned["symbol"]
+    qty_req = float(planned["qty"])
+    import asyncio
+
+    for _ in range(20):
+        data = await _bingx_private_request(
+            exchange_obj=exchange_obj,
+            api_key=api_key,
+            api_secret=api_secret,
+            method="GET",
+            path="/openApi/swap/v2/trade/order",
+            params={"symbol": symbol, "orderId": order_id},
+        )
+        if isinstance(data, dict) and data.get("_error"):
+            return False, 0.0
+        if not isinstance(data, dict):
+            await asyncio.sleep(0.2)
+            continue
+        code = str(data.get("code")) if data.get("code") is not None else None
+        if code is not None and code != "0":
+            return False, 0.0
+
+        item = data.get("data") if isinstance(data, dict) else None
+        if not isinstance(item, dict):
+            await asyncio.sleep(0.2)
+            continue
+
+        status = str(item.get("status") or item.get("state") or "")
+        filled_raw = item.get("executedQty") or item.get("filledQty") or item.get("dealQty") or item.get("dealSize") or item.get("filledSize")
+        try:
+            filled = float(filled_raw) if filled_raw is not None else 0.0
+        except Exception:
+            filled = 0.0
+
+        if status.upper() in ("FILLED", "CANCELED", "CANCELLED", "REJECTED", "EXPIRED"):
+            logger.info(f"BingX: статус ордера {order_id}: {status} | исполнено={_format_number(filled)} | требовалось={_format_number(qty_req)}")
+            return (filled + 1e-10 >= qty_req) and status.upper() == "FILLED", filled
+
+        await asyncio.sleep(0.2)
+
+    return False, 0.0
+
+
+async def _bingx_place_leg(*, planned: Dict[str, Any]) -> OpenLegResult:
+    exchange_obj = planned["exchange_obj"]
+    api_key = planned["api_key"]
+    api_secret = planned["api_secret"]
+    direction = planned["direction"]
+    symbol = planned["symbol"]
+    side = planned["side"]
+    position_side = planned.get("positionSide")
+    qty = planned["qty"]
+    candidates = planned.get("candidate_prices_raw") or [float(planned["price_str"])]
+    attempts = candidates[:3]
+    tick_raw = planned.get("tickSize")
+    tick = float(tick_raw) if tick_raw else 0.0
+
+    for idx, px_raw in enumerate(attempts, start=1):
+        px = _round_price_for_side(float(px_raw), tick, "buy" if direction == "long" else "sell")
+        px_str = _format_by_step(px, tick_raw)
+        logger.info(f"BingX: попытка {idx}/{len(attempts)} | {direction} qty={qty} | лимит={px_str}")
+
+        params = {
+            "symbol": symbol,
+            "side": side,
+            "type": "LIMIT",
+            "price": px_str,
+            "quantity": qty,
+            "timeInForce": "FOK",
+        }
+        if position_side:
+            params["positionSide"] = position_side
+
+        data = await _bingx_private_request(
+            exchange_obj=exchange_obj,
+            api_key=api_key,
+            api_secret=api_secret,
+            method="POST",
+            path="/openApi/swap/v2/trade/order",
+            params=params,
+        )
+        if not isinstance(data, dict) or data.get("_error"):
+            return OpenLegResult(exchange="bingx", direction=direction, ok=False, error=f"api error: {data}", raw=data)
+        code = str(data.get("code")) if data.get("code") is not None else None
+        msg = str(data.get("msg") or "")
+        if code is not None and code != "0":
+            # FOK rejection -> try next level
+            if "fok" in msg.lower() or "fill" in msg.lower() or "immediately" in msg.lower():
+                logger.warning(f"BingX: FOK отклонён на уровне {idx} | причина={msg}")
+                continue
+            return OpenLegResult(exchange="bingx", direction=direction, ok=False, error=f"api error: {data}", raw=data)
+
+        item = data.get("data")
+        order_id = None
+        if isinstance(item, dict):
+            order_id = item.get("orderId") or item.get("id")
+        if not order_id:
+            order_id = data.get("orderId") if isinstance(data, dict) else None
+        if not order_id:
+            return OpenLegResult(exchange="bingx", direction=direction, ok=False, error=f"no orderId in response: {data}", raw=data)
+
+        order_id_s = str(order_id)
+        ok_full, filled = await _bingx_wait_full_fill(planned={**planned, "price_str": px_str, "limit_price": float(px_str)}, order_id=order_id_s)
+        if ok_full:
+            return OpenLegResult(exchange="bingx", direction=direction, ok=True, order_id=order_id_s, raw=data)
+        logger.warning(f"BingX: не исполнилось полностью на уровне {idx} | исполнено={_format_number(filled)} | требовалось={qty}")
+
+    return OpenLegResult(exchange="bingx", direction=direction, ok=False, error="не удалось исполнить ордер полностью за 3 попытки (уровни 1-3)")
 
 
 async def _open_one_leg(
