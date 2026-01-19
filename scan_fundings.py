@@ -53,6 +53,7 @@ SCAN_INTERVAL_SEC = float(os.getenv("SCAN_FUNDING_INTERVAL_SEC", "60"))  # ка�
 MAX_CONCURRENCY = int(os.getenv("SCAN_FUNDING_MAX_CONCURRENCY", "20"))  # сколько одновременных http запросов
 COIN_BATCH_SIZE = int(os.getenv("SCAN_FUNDING_COIN_BATCH_SIZE", "50"))  # сколько монет обрабатывать за пачку
 REQ_TIMEOUT_SEC = float(os.getenv("SCAN_FUNDING_REQ_TIMEOUT_SEC", "12"))  # таймаут на запрос к бирже
+SCAN_FUNDING_MIN_TIME_TO_PAY = float(os.getenv("SCAN_FUNDING_MIN_TIME_TO_PAY", "0"))  # минимальное время до выплаты в минутах (если >= этого значения, не отправляем в Telegram)
 EXCLUDE_EXCHANGES = {"lbank"}  # не использовать
 
 # Монеты для исключения из поиска фандингов (через запятую, например: EXCLUDE_COINS=FLOW,BTC)
@@ -260,14 +261,23 @@ async def process_coin(
             "minutes_until": minutes_until,
         }
         
-        # Отправляем уведомление в Telegram сразу после нахождения возможности
-        if telegram and telegram.enabled and channel_id:
+        # Отправляем уведомление в Telegram только если время до выплаты < SCAN_FUNDING_MIN_TIME_TO_PAY
+        # Если minutes_until is None или >= SCAN_FUNDING_MIN_TIME_TO_PAY, не отправляем
+        should_send_telegram = False
+        if minutes_until is not None:
+            if minutes_until < SCAN_FUNDING_MIN_TIME_TO_PAY:
+                should_send_telegram = True
+        # Если minutes_until is None, не отправляем (неизвестно время до выплаты)
+        
+        if should_send_telegram and telegram and telegram.enabled and channel_id:
             try:
                 message = format_telegram_message(opportunity)
                 await telegram.send_message(message, channel_id=channel_id)
-                logger.debug(f"📱 Отправлено сообщение в Telegram для {coin} {exchange_name}")
+                logger.debug(f"📱 Отправлено сообщение в Telegram для {coin} {exchange_name} (время до выплаты: {minutes_until} мин)")
             except Exception as e:
                 logger.warning(f"Ошибка отправки сообщения в Telegram для {coin} {exchange_name}: {e}", exc_info=True)
+        elif minutes_until is not None and minutes_until >= SCAN_FUNDING_MIN_TIME_TO_PAY:
+            logger.debug(f"⏭️ Пропущена отправка в Telegram для {coin} {exchange_name} (время до выплаты {minutes_until} мин >= {SCAN_FUNDING_MIN_TIME_TO_PAY} мин)")
         
         return opportunity
     
@@ -362,6 +372,7 @@ async def main():
         exclude_coins_info = f"exclude_coins={sorted(EXCLUDE_COINS)}" if EXCLUDE_COINS else "exclude_coins=none"
         logger.info(
             f"scan_fundings started | mode={config.ENV_MODE} | MIN_FUNDING_SPREAD={MIN_FUNDING_SPREAD:.2f}% | "
+            f"MIN_TIME_TO_PAY={SCAN_FUNDING_MIN_TIME_TO_PAY:.0f} мин | "
             f"interval={SCAN_INTERVAL_SEC}s | exchanges={exchanges} | "
             f"max_concurrency={MAX_CONCURRENCY} | timeout={REQ_TIMEOUT_SEC:.1f}s | "
             f"telegram={telegram_status} | {channel_info} | {exclude_coins_info}"
