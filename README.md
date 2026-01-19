@@ -38,7 +38,7 @@ python bot.py "STO Long (mexc), Short (bybit) 30" --no-monitor (30 = колич�
 ```bash
 python3 scan_spreads.py 
 python3 bot.py "CVC Long (bybit), Short (gate) 30" --no-monitor
-python bot.py "CVC Long (bybit), Short (gate)" --no-monitor
+python3 bot.py "CVC Long (bybit), Short (gate)" --no-monitor
 python3 one_coin_bot.py CLO
 ```
 

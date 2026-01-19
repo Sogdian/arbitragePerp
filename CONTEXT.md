@@ -466,15 +466,22 @@ closing_spread = (bid_long - ask_short) / ask_short * 100
   - Требует **API ключи** (`BITGET_API_KEY`, `BITGET_API_SECRET`, `BITGET_API_PASSPHRASE`)
   - **`BITGET_API_PASSPHRASE` обязателен** (ACCESS-PASSPHRASE из настроек API ключа)
   - Подпись: HMAC_SHA256(secret, timestamp + method + requestPath + body) с заголовками `ACCESS-KEY`, `ACCESS-SIGN`, `ACCESS-TIMESTAMP`, `ACCESS-PASSPHRASE`
-  - **`marginMode` обязателен** в теле ордера (по умолчанию `"isolated"`, можно переопределить через `BITGET_MARGIN_MODE` в .env)
-  - Поддерживает несколько схем `side` в зависимости от режима аккаунта (unilateral/hedge):
-    - Схема 1: `side="open_long"` / `side="open_short"`
-    - Схема 2: `side="buy"/"sell"` + `tradeSide="open"` + `posSide="long"/"short"`
-    - Схема 3: `side="buy"/"sell"` + `posSide="long"/"short"`
-    - И другие варианты (всего 6 схем)
+- **`marginMode` обязателен** в теле ордера (по умолчанию `"isolated"`, можно переопределить через `BITGET_MARGIN_MODE` в .env)
+- **Открытие позиций:** Поддерживает несколько схем `side` в зависимости от режима аккаунта (unilateral/hedge):
+  - Схема 1: `side="open_long"` / `side="open_short"` (unilateral режим)
+  - Схема 2: `side="buy"/"sell"` + `tradeSide="open"` + `posSide="long"/"short"` (hedge режим)
+  - Схема 3: `side="buy"/"sell"` + `posSide="long"/"short"` (hedge режим)
+  - И другие варианты (всего 6 схем)
   - Бот автоматически пробует все схемы до успешного создания ордера
-  - `productType` должен быть `"USDT-FUTURES"` (не `"umcbl"`)
-  - Pre-check API ключей: тестовый запрос к `/api/v2/mix/account/get-account-list` для проверки прав доступа
+- **Закрытие позиций:** Использует `force="ioc"` для частичного исполнения, поддерживает несколько схем:
+  - Primary: `side="sell"/"buy"` + `holdSide="long"/"short"` + `posSide="long"/"short"` (hedge-mode)
+  - Fallback: `side` с `tradeSide="close"` (на некоторых аккаунтах требуется)
+  - Fallback: упрощённые варианты с `holdSide` или `posSide` отдельно
+  - **Особенность:** Закрытие может требовать "обратный" `side` (встречалось на практике), поэтому пробуются оба варианта
+  - Pre-check позиции: перед закрытием проверяется наличие позиции через `/api/v2/mix/position/*` endpoints
+  - Final verification: после всех попыток проверяется, что позиция реально закрыта (вручную/внешне)
+- `productType` должен быть `"USDT-FUTURES"` (не `"umcbl"`)
+- Pre-check API ключей: тестовый запрос к `/api/v2/mix/account/get-account-list` для проверки прав доступа
 - **Проверка ошибок API:**
   - Реализован метод класса `_is_api_error()` для проверки наличия поля `code` в ответе
   - Если `code` присутствует и не равен `"00000"` или `0`, ответ считается ошибкой
@@ -2015,6 +2022,8 @@ TELEGRAM_REPEAT_INTERVAL=3
 **Поддерживаемые биржи (закрытие):**
 - **Bybit** (USDT-M Perp, v5): `/v5/order/create` с `timeInForce="IOC"`, `reduceOnly=True`
 - **Gate.io** (USDT-M Perp, v4): `/api/v4/futures/usdt/orders` с `tif="ioc"`, `reduce_only=True`
+- **Binance** (USDT-M Perp): `/fapi/v1/order` с `timeInForce="IOC"`, `reduceOnly="true"`
+- **Bitget** (USDT-M Perp, v2): `/api/v2/mix/order/place-order` с `force="ioc"`, `marginMode` (обязательно)
 
 **Основные требования:**
 - Ордера: **лимитные** по ценам из стакана
@@ -2080,6 +2089,29 @@ TELEGRAM_REPEAT_INTERVAL=3
 - `tif="ioc"` для частичного исполнения
 - Конвертация контрактов в базовую монету через `quanto_multiplier` для расчета VWAP
 - Если остаток меньше `order_size_min` → возможна ошибка API (логируется с деталями)
+
+**Binance:**
+- Используется `reduceOnly="true"` в теле ордера
+- `timeInForce="IOC"` для частичного исполнения
+- Поддержка hedge-mode (с `positionSide`) и one-way режима (без `positionSide`)
+- Автоматический fallback: если `reduceOnly` не поддерживается в текущем режиме → повтор без `reduceOnly`
+- Если `positionSide` не поддерживается (one-way) → повтор без `positionSide`
+- Отслеживание исполнения через `/fapi/v1/order` (статус `FILLED`, `executedQty`)
+- Используется `avgPrice` из ответа API для расчета VWAP (если доступен)
+
+**Bitget:**
+- Используется `force="ioc"` для частичного исполнения
+- **`marginMode` обязателен** в теле ордера (по умолчанию `"isolated"`, можно переопределить через `BITGET_MARGIN_MODE` в .env)
+- Поддержка hedge-mode и unilateral режима через несколько схем `side`:
+  - Primary: `side="sell"/"buy"` + `holdSide="long"/"short"` + `posSide="long"/"short"` (hedge-mode)
+  - Fallback: `side` с `tradeSide="close"` (на некоторых аккаунтах требуется)
+  - Fallback: упрощённые варианты с `holdSide` или `posSide` отдельно
+- **Особенность:** Закрытие может требовать "обратный" `side` (встречалось на практике), поэтому пробуются оба варианта (`side_buy_sell` и `alt_side`)
+- Pre-check позиции: перед закрытием проверяется наличие позиции через `/api/v2/mix/position/*` endpoints (best-effort)
+- Если позиции нет → возвращается успех (закрывать нечего)
+- Final verification: после всех попыток проверяется, что позиция реально закрыта (вручную/внешне) → возвращается успех
+- Отслеживание исполнения через `/api/v2/mix/order/detail` (fallback на `/api/mix/v1/order/detail`)
+- Обработка ошибок: игнорируются `"side mismatch"`, `"unilateral"`, `"no position"`, `"reduceonly"` (продолжаем пробовать другие схемы)
 
 **Интеграция с bot.py:**
 - Вызывается автоматически из `monitor_spreads()` при достижении триггера (3 сообщения за 1 минуту)
