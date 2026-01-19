@@ -499,7 +499,7 @@ def _format_telegram_message(
 ) -> str:
     """Форматирует сообщение для Telegram на английском языке, используя только данные из сканера"""
     # Заголовок
-    lines = [f'🔔 <b>Signal: {coin}</b> (Liq: {SCAN_COIN_INVEST:.1f} USDT)']
+    lines = [f'🔔 💰<b>Signal: {coin}</b> (Liq: {SCAN_COIN_INVEST:.1f} USDT)']
     lines.append("")
     
     # Long данные - используем price, если есть, иначе среднее от bid/ask
@@ -576,7 +576,7 @@ def _format_combined_telegram_message(
     opportunities: List[Dict[str, Any]],
 ) -> str:
     """Форматирует объединенное сообщение для Telegram с несколькими возможностями по одной монете"""
-    lines = [f'🔔 <b>Signal: {coin}</b> (Liq: {SCAN_COIN_INVEST:.1f} USDT)']
+    lines = [f'🔔 💰<b>Signal: {coin}</b> (Liq: {SCAN_COIN_INVEST:.1f} USDT)']
     lines.append("")
     
     for opp in opportunities:
@@ -966,9 +966,9 @@ async def process_coin(
                                     short_ex_cap = short_ex.capitalize()
                                     long_url = _get_exchange_url(long_ex, coin)
                                     short_url = _get_exchange_url(short_ex, coin)
-                                    caption = f'🔔 Signal: {coin} (for liq: {SCAN_COIN_INVEST:.1f} USDT)\n{coin} Long (<a href="{long_url}">{long_ex_cap}</a>), Short (<a href="{short_url}">{short_ex_cap}</a>) max total spread: {max_spread_str}'
+                                    caption = f'🔔 💰Signal: {coin} (for liq: {SCAN_COIN_INVEST:.1f} USDT)\n{coin} Long (<a href="{long_url}">{long_ex_cap}</a>), Short (<a href="{short_url}">{short_ex_cap}</a>) max total spread: {max_spread_str}'
                                 else:
-                                    caption = f'🔔 Signal: {coin} (for liq: {SCAN_COIN_INVEST:.1f} USDT)\nmax total spread: {max_spread_str}'
+                                    caption = f'🔔 💰Signal: {coin} (for liq: {SCAN_COIN_INVEST:.1f} USDT)\nmax total spread: {max_spread_str}'
                                 success = await telegram.send_photo(table_image, caption=caption, channel_id=channel_id)
                                 if success:
                                     logger.debug(f"📱 Отправлено изображение таблицы в Telegram для {coin} ({len(opportunities)} opportunities, режим: {config.ENV_MODE})")
