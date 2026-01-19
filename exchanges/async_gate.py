@@ -216,6 +216,56 @@ class AsyncGateExchange(AsyncBaseExchange):
             logger.error(f"Gate: ошибка при получении фандинга для {coin}: {e}", exc_info=True)
             return None
 
+    async def get_funding_info(self, coin: str) -> Optional[Dict]:
+        """
+        Получить информацию о фандинге (ставка и время до следующей выплаты)
+        
+        Gate:
+        - /futures/usdt/contracts/{contract} -> текущая ставка и funding_next_apply_time
+        
+        Returns:
+            Словарь с данными:
+            {
+                "funding_rate": float,  # Ставка фандинга (например, 0.0001 = 0.01%)
+                "next_funding_time": int,  # Timestamp следующей выплаты в секундах
+            }
+            или None если ошибка
+        """
+        try:
+            symbol = self._normalize_symbol(coin)
+            url = f"/api/v4/futures/usdt/contracts/{symbol}"
+            data = await self._request_json("GET", url)
+
+            if not isinstance(data, dict):
+                return None
+
+            # приоритет: funding_rate (обычно то, что UI показывает как текущую)
+            r = data.get("funding_rate")
+            if r is None:
+                # иногда полезно взять indicative
+                r = data.get("funding_rate_indicative")
+            if r is None:
+                return None
+
+            # Gate возвращает funding_next_apply_time в секундах (Unix timestamp)
+            next_funding_time_raw = data.get("funding_next_apply_time")
+
+            try:
+                funding_rate = float(r)
+                next_funding_time = int(next_funding_time_raw) if next_funding_time_raw is not None else None
+                # Gate возвращает в секундах, но для единообразия можем оставить как есть
+                # или конвертировать в миллисекунды, но лучше оставить в секундах
+                return {
+                    "funding_rate": funding_rate,
+                    "next_funding_time": next_funding_time,
+                }
+            except (TypeError, ValueError):
+                return None
+
+        except Exception as e:
+            logger.error(f"Gate: ошибка при получении funding info для {coin}: {e}", exc_info=True)
+            return None
+
     async def get_orderbook(self, coin: str, limit: int = 50) -> Optional[Dict]:
         """
         Получить orderbook (книгу заявок) для монеты

@@ -164,6 +164,53 @@ class AsyncBinanceExchange(AsyncBaseExchange):
             logger.error(f"Binance: ошибка при получении фандинга для {coin}: {e}", exc_info=True)
             return None
 
+    async def get_funding_info(self, coin: str) -> Optional[Dict]:
+        """
+        Получить информацию о фандинге (ставка и время до следующей выплаты)
+
+        Returns:
+            Словарь с данными:
+            {
+                "funding_rate": float,  # Ставка фандинга (например, 0.0001 = 0.01%)
+                "next_funding_time": int,  # Timestamp следующей выплаты в миллисекундах
+            }
+            или None если ошибка
+        """
+        try:
+            symbol = self._normalize_symbol(coin)
+            url = "/fapi/v1/premiumIndex"
+            params = {"symbol": symbol}
+
+            data = await self._request_json("GET", url, params=params)
+            if not data:
+                return None
+
+            if self._is_api_error(data):
+                return None
+
+            if not isinstance(data, dict):
+                return None
+
+            funding_rate_raw = data.get("lastFundingRate")
+            next_funding_time_raw = data.get("nextFundingTime")
+
+            if funding_rate_raw is None:
+                return None
+
+            try:
+                funding_rate = float(funding_rate_raw)
+                next_funding_time = int(next_funding_time_raw) if next_funding_time_raw is not None else None
+                return {
+                    "funding_rate": funding_rate,
+                    "next_funding_time": next_funding_time,
+                }
+            except (TypeError, ValueError):
+                return None
+
+        except Exception as e:
+            logger.error(f"Binance: ошибка при получении funding info для {coin}: {e}", exc_info=True)
+            return None
+
     async def get_orderbook(self, coin: str, limit: int = 50) -> Optional[Dict]:
         """
         Получить книгу заявок (orderbook) для монеты
