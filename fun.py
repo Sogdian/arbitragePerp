@@ -73,6 +73,7 @@ TEST_OB_LEVELS = int(os.getenv("FUN_TEST_OB_LEVELS", "15"))
 MAIN_OB_LEVELS = int(os.getenv("FUN_MAIN_OB_LEVELS", "15"))
 POLL_SEC = float(os.getenv("FUN_POLL_SEC", "0.2"))
 NEWS_DAYS_BACK = int(os.getenv("FUN_NEWS_DAYS_BACK", "60"))
+BALANCE_BUFFER_USDT = float(os.getenv("FUN_BALANCE_BUFFER_USDT", "0"))
 
 
 YES_WORDS = {"да", "y", "yes", "д"}
@@ -223,6 +224,7 @@ async def _bybit_place_limit(
     price_str: str,
     tif: str,  # "FOK" | "IOC" | "GTC"
     reduce_only: Optional[bool] = None,
+    position_idx: Optional[int] = None,
 ) -> str:
     symbol = exchange_obj._normalize_symbol(coin)
     body: Dict[str, Any] = {
@@ -236,6 +238,8 @@ async def _bybit_place_limit(
     }
     if reduce_only is not None:
         body["reduceOnly"] = bool(reduce_only)
+    if position_idx is not None:
+        body["positionIdx"] = int(position_idx)
     data = await po._bybit_private_post(
         exchange_obj=exchange_obj,
         api_key=api_key,
@@ -260,6 +264,7 @@ async def _bybit_place_stop_market(
     side: str,  # "Buy" closes short
     qty_str: str,
     trigger_price_str: str,
+    position_idx: Optional[int] = None,
 ) -> str:
     """
     Best-effort stop-market. Bybit v5:
@@ -280,6 +285,8 @@ async def _bybit_place_stop_market(
         "triggerBy": "LastPrice",
         "reduceOnly": True,
     }
+    if position_idx is not None:
+        body["positionIdx"] = int(position_idx)
     data = await po._bybit_private_post(
         exchange_obj=exchange_obj,
         api_key=api_key,
@@ -308,6 +315,61 @@ async def _bybit_cancel_order(*, exchange_obj: Any, api_key: str, api_secret: st
     if isinstance(data, dict) and data.get("retCode") == 0:
         return True
     return False
+
+
+async def _bybit_get_usdt_available(*, exchange_obj: Any, api_key: str, api_secret: str) -> Optional[float]:
+    """
+    Best-effort fetch of available USDT balance for derivatives trading.
+    We try multiple accountType values to support different Bybit account modes.
+    """
+
+    def _extract(data: Any) -> Optional[float]:
+        if not isinstance(data, dict):
+            return None
+        if data.get("retCode") != 0:
+            return None
+        res = data.get("result") or {}
+        lst = res.get("list") or []
+        if not isinstance(lst, list):
+            return None
+        for acc in lst:
+            if not isinstance(acc, dict):
+                continue
+            coins = acc.get("coin") or acc.get("coins") or []
+            if isinstance(coins, dict):
+                coins = [coins]
+            if not isinstance(coins, list):
+                continue
+            for c in coins:
+                if not isinstance(c, dict):
+                    continue
+                if str(c.get("coin") or "").upper() != "USDT":
+                    continue
+                for key in ("availableToWithdraw", "availableBalance", "walletBalance", "equity"):
+                    raw = c.get(key)
+                    if raw is None:
+                        continue
+                    try:
+                        v = float(raw)
+                    except Exception:
+                        continue
+                    if v >= 0:
+                        return v
+        return None
+
+    for account_type in ("UNIFIED", "CONTRACT"):
+        data = await po._bybit_private_request(
+            exchange_obj=exchange_obj,
+            api_key=api_key,
+            api_secret=api_secret,
+            method="GET",
+            path="/v5/account/wallet-balance",
+            params={"accountType": account_type, "coin": "USDT"},
+        )
+        v = _extract(data)
+        if v is not None:
+            return v
+    return None
 
 
 async def _bybit_get_order_status(
@@ -423,7 +485,7 @@ async def _bybit_test_orders(bot: PerpArbitrageBot, coin: str, qty_test: float) 
     qty_step_raw = f.get("qtyStep")
     qty_str = po._format_by_step(qty_test, qty_step_raw)
 
-    # 1) Open short (Sell) FOK at price where cum bids >= qty (within first 15 levels)
+    # 1) Open test Short (Sell) FOK at price where cum bids >= qty (within first 15 levels)
     bids = ob["bids"][:TEST_OB_LEVELS]
     px_level, _cum = po._price_level_for_target_size(bids, qty_test)
     if px_level is None:
@@ -434,17 +496,33 @@ async def _bybit_test_orders(bot: PerpArbitrageBot, coin: str, qty_test: float) 
 
     logger.info(f"🧪 Тест: открываем Short (Sell FOK) | qty={qty_str} | лимит={px_str}")
     try:
-        short_order_id = await _bybit_place_limit(
-            exchange_obj=exchange_obj,
-            api_key=api_key,
-            api_secret=api_secret,
-            coin=coin,
-            side="Sell",
-            qty_str=qty_str,
-            price_str=px_str,
-            tif="FOK",
-            reduce_only=None,
-        )
+        # hedge-mode: positionIdx=2 for short; one-way: omit it
+        try:
+            short_order_id = await _bybit_place_limit(
+                exchange_obj=exchange_obj,
+                api_key=api_key,
+                api_secret=api_secret,
+                coin=coin,
+                side="Sell",
+                qty_str=qty_str,
+                price_str=px_str,
+                tif="FOK",
+                reduce_only=None,
+                position_idx=2,
+            )
+        except Exception:
+            short_order_id = await _bybit_place_limit(
+                exchange_obj=exchange_obj,
+                api_key=api_key,
+                api_secret=api_secret,
+                coin=coin,
+                side="Sell",
+                qty_str=qty_str,
+                price_str=px_str,
+                tif="FOK",
+                reduce_only=None,
+                position_idx=None,
+            )
     except Exception as e:
         logger.error(f"❌ Bybit test: не удалось создать Short ордер: {e}")
         return False
@@ -458,18 +536,73 @@ async def _bybit_test_orders(bot: PerpArbitrageBot, coin: str, qty_test: float) 
         return False
     logger.info(f"✅ Тест: Short открыт | order={short_order_id} | filled={_fmt(filled)} {coin}")
 
-    # 2) Close short immediately (this is our "test long" buy-back)
-    logger.info("🧪 Тест: закрываем Short (Buy IOC reduceOnly) по стакану")
-    ok_close, avg_px = await po._bybit_close_leg_partial_ioc(
-        exchange_obj=exchange_obj,
-        coin=coin,
-        position_direction="short",
-        coin_amount=qty_test,
-    )
-    if not ok_close:
-        logger.error("❌ Bybit test: не удалось закрыть Short")
+    # 2) Open test Long (Buy) after short is opened, at best ask (FOK) for the same qty
+    asks = ob["asks"][:TEST_OB_LEVELS]
+    px_level_a, _cum_a = po._price_level_for_target_size(asks, qty_test)
+    if px_level_a is None:
+        logger.error(f"❌ Bybit test: недостаточно ликвидности в asks (1-{TEST_OB_LEVELS}) для qty={_fmt(qty_test)}")
+        # close short best-effort
+        await po._bybit_close_leg_partial_ioc(exchange_obj=exchange_obj, coin=coin, position_direction="short", coin_amount=qty_test)
         return False
-    logger.info(f"✅ Тест: Short закрыт | avg_buy_px={_fmt(avg_px)}")
+    px_a = po._round_price_for_side(float(px_level_a), tick, "buy")
+    px_a_str = po._format_by_step(px_a, tick_raw)
+
+    logger.info(f"🧪 Тест: открываем Long (Buy FOK) | qty={qty_str} | лимит={px_a_str}")
+    try:
+        # hedge-mode: positionIdx=1 for long; one-way: omit it
+        try:
+            long_order_id = await _bybit_place_limit(
+                exchange_obj=exchange_obj,
+                api_key=api_key,
+                api_secret=api_secret,
+                coin=coin,
+                side="Buy",
+                qty_str=qty_str,
+                price_str=px_a_str,
+                tif="FOK",
+                reduce_only=None,
+                position_idx=1,
+            )
+        except Exception:
+            long_order_id = await _bybit_place_limit(
+                exchange_obj=exchange_obj,
+                api_key=api_key,
+                api_secret=api_secret,
+                coin=coin,
+                side="Buy",
+                qty_str=qty_str,
+                price_str=px_a_str,
+                tif="FOK",
+                reduce_only=None,
+                position_idx=None,
+            )
+    except Exception as e:
+        logger.error(f"❌ Bybit test: не удалось создать Long ордер: {e}")
+        await po._bybit_close_leg_partial_ioc(exchange_obj=exchange_obj, coin=coin, position_direction="short", coin_amount=qty_test)
+        return False
+
+    ok_full_l, filled_l = await po._bybit_wait_full_fill(
+        planned={"exchange_obj": exchange_obj, "api_key": api_key, "api_secret": api_secret, "symbol": exchange_obj._normalize_symbol(coin), "qty": qty_str},
+        order_id=str(long_order_id),
+    )
+    if not ok_full_l:
+        logger.error(f"❌ Bybit test: Long не исполнился полностью | filled={_fmt(filled_l)}")
+        # close both best-effort
+        await po._bybit_close_leg_partial_ioc(exchange_obj=exchange_obj, coin=coin, position_direction="short", coin_amount=qty_test)
+        await po._bybit_close_leg_partial_ioc(exchange_obj=exchange_obj, coin=coin, position_direction="long", coin_amount=qty_test)
+        return False
+    logger.info(f"✅ Тест: Long открыт | order={long_order_id} | filled={_fmt(filled_l)} {coin}")
+
+    # 3) Close both test positions at best prices from orderbook (IOC reduceOnly, partial allowed)
+    logger.info("🧪 Тест: закрываем обе позиции (Short+Long) по стакану")
+    close_short_t = po._bybit_close_leg_partial_ioc(exchange_obj=exchange_obj, coin=coin, position_direction="short", coin_amount=qty_test)
+    close_long_t = po._bybit_close_leg_partial_ioc(exchange_obj=exchange_obj, coin=coin, position_direction="long", coin_amount=qty_test)
+    ok_s, avg_s = await close_short_t
+    ok_l, avg_l = await close_long_t
+    if not (ok_s and ok_l):
+        logger.error(f"❌ Bybit test: не удалось закрыть обе позиции | short_ok={ok_s} long_ok={ok_l}")
+        return False
+    logger.info(f"✅ Тест: позиции закрыты | avg_close_short_buy={_fmt(avg_s)} | avg_close_long_sell={_fmt(avg_l)}")
     return True
 
 
@@ -525,10 +658,29 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
         logger.error(f"❌ Недостаточно ликвидности в bids (1-{MAIN_OB_LEVELS}) | need={_fmt(p.coin_qty)} {p.coin} | available={_fmt(cum_bids)}")
         return 2
 
+    asks = ob["asks"][:MAIN_OB_LEVELS]
+    px_long_level, cum_asks = po._price_level_for_target_size(asks, p.coin_qty)
+    if px_long_level is None:
+        logger.error(f"❌ Недостаточно ликвидности в asks (1-{MAIN_OB_LEVELS}) | need={_fmt(p.coin_qty)} {p.coin} | available={_fmt(cum_asks)}")
+        return 2
+
+    # Balance check (best-effort): estimate required USDT for isolated 1x opening both legs.
+    # We use worst prices from the current 15-level window.
+    bid_entry_est = float(px_short_level)
+    ask_worst_est = float(asks[min(len(asks), MAIN_OB_LEVELS) - 1][0]) if asks else float(px_long_level)
+    required_usdt = float(p.coin_qty) * (max(0.0, bid_entry_est) + max(0.0, ask_worst_est)) + max(0.0, BALANCE_BUFFER_USDT)
+    avail_usdt = await _bybit_get_usdt_available(exchange_obj=exchange_obj, api_key=api_key, api_secret=api_secret)
+    if avail_usdt is None:
+        logger.error("❌ Не удалось получить баланс USDT на Bybit (wallet-balance). Останавливаемся для безопасности.")
+        return 2
+    if avail_usdt + 1e-6 < required_usdt:
+        logger.error(f"❌ Недостаточно баланса USDT | доступно={_fmt(avail_usdt, 3)} | нужно~{_fmt(required_usdt, 3)} (isolated 1x, оценка по стакану)")
+        return 2
+
     logger.info(
         f"✅ Подготовка OK | exchange=bybit | coin={p.coin} | qty={_fmt(p.coin_qty)} | "
         f"funding={_fmt(p.funding_pct*100, 3)}% | offset={_fmt(p.offset_pct*100, 3)}% | "
-        f"min_test_qty~{_fmt(min_test_qty)}"
+        f"min_test_qty~{_fmt(min_test_qty)} | usdt_avail={_fmt(avail_usdt, 3)} | usdt_need~{_fmt(required_usdt, 3)}"
     )
 
     # Ask about test orders

@@ -33,6 +33,7 @@ python scan_spreads.py (тут SCAN_COIN_INVEST)
 python one_coin_bot.py CLO (тут SCAN_COIN_INVEST)
 python bot.py "STO Long (mexc), Short (bybit) 30" --no-monitor (30 = количество монет CVC)
 python scan_fundings.py
+python fun.py "STO Bybit 30 -2% 12:00 -0.3%"
 ```
 
 **macOS:**
