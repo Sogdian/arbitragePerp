@@ -96,6 +96,7 @@ def is_ignored_coin(coin: str) -> bool:
 def calculate_minutes_until_funding(next_funding_time: Optional[int], exchange: str) -> Optional[int]:
     """
     Вычисляет количество минут до следующей выплаты фандинга.
+    Использует только данные из API, без хардкода расписания.
     
     Args:
         next_funding_time: Timestamp следующей выплаты (в миллисекундах для Bybit/Binance, в секундах для Gate)
@@ -121,8 +122,8 @@ def calculate_minutes_until_funding(next_funding_time: Optional[int], exchange: 
         seconds_until = funding_timestamp - now_timestamp
         
         if seconds_until < 0:
-            # Если время уже прошло, возвращаем 0
-            return 0
+            # Если время уже прошло, возвращаем None (не вычисляем искусственно)
+            return None
         
         minutes_until = int(seconds_until / 60)
         return minutes_until
@@ -159,10 +160,10 @@ async def fetch_funding_info(
             )
         return funding_info
     except asyncio.TimeoutError:
-        logger.debug(f"Timeout: {exchange_name} {coin} funding > {REQ_TIMEOUT_SEC:.1f}s")
+        logger.info(f"Timeout: {exchange_name} {coin} funding > {REQ_TIMEOUT_SEC:.1f}s")
         return None
     except Exception as e:
-        logger.debug(f"Fetch error: {exchange_name} {coin} funding: {e}")
+        logger.info(f"Fetch error: {exchange_name} {coin} funding: {e}")
         return None
 
 
@@ -193,9 +194,12 @@ async def process_coin(
     exchange_name: str,
     coin: str,
     sem: asyncio.Semaphore,
+    telegram: Optional[TelegramSender] = None,
+    channel_id: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     Обрабатывает одну монету: запрашивает информацию о фандинге и проверяет условие.
+    Отправляет уведомление в Telegram сразу после нахождения возможности.
     
     Returns:
         Словарь с данными о найденной возможности или None
@@ -203,10 +207,12 @@ async def process_coin(
     funding_info = await fetch_funding_info(bot, exchange_name, coin, sem)
     
     if not funding_info:
+        logger.info(f"💲 {coin} {exchange_name} | Фандинг: N/A")
         return None
     
     funding_rate = funding_info.get("funding_rate")
     if funding_rate is None:
+        logger.info(f"💲 {coin} {exchange_name} | Фандинг: N/A")
         return None
     
     # Проверяем условие: фандинг >= MIN_FUNDING_SPREAD
@@ -240,12 +246,12 @@ async def process_coin(
     # Логируем найденную возможность
     minutes_str = f"{minutes_until} мин" if minutes_until is not None else "N/A"
     logger.info(
-        f"💲 {coin} {exchange_name}| Фандинг: {funding_rate_pct:.3f}% | "
+        f"💲 {coin} {exchange_name} | Фандинг: {funding_rate_pct:.3f}% | "
         f"Время выплаты: {minutes_str} {verdict}"
     )
     
     if ok:
-        return {
+        opportunity = {
             "coin": coin,
             "exchange": exchange_name,
             "funding_rate": funding_rate,
@@ -253,6 +259,17 @@ async def process_coin(
             "next_funding_time": next_funding_time,
             "minutes_until": minutes_until,
         }
+        
+        # Отправляем уведомление в Telegram сразу после нахождения возможности
+        if telegram and telegram.enabled and channel_id:
+            try:
+                message = format_telegram_message(opportunity)
+                await telegram.send_message(message, channel_id=channel_id)
+                logger.debug(f"📱 Отправлено сообщение в Telegram для {coin} {exchange_name}")
+            except Exception as e:
+                logger.warning(f"Ошибка отправки сообщения в Telegram для {coin} {exchange_name}: {e}", exc_info=True)
+        
+        return opportunity
     
     return None
 
@@ -272,11 +289,10 @@ def format_telegram_message(opportunity: Dict[str, Any]) -> str:
     funding_rate_pct = opportunity["funding_rate_pct"]
     minutes_until = opportunity["minutes_until"]
     
-    minutes_str = f"{minutes_until} мин" if minutes_until is not None else "N/A"
+    minutes_str = f"{minutes_until} min" if minutes_until is not None else "N/A"
     
     lines = [
-        f"{exchange} {coin}",
-        f"",
+        f"🔔💲 {exchange} {coin}",
         f"funding: {funding_rate_pct:.3f}%",
         f"time to pay: {minutes_str}",
     ]
@@ -294,8 +310,12 @@ async def scan_once(
     Один проход по всем монетам батчами.
     
     Обрабатывает монеты параллельно батчами размера COIN_BATCH_SIZE.
-    Отправляет уведомления в Telegram при найденных возможностях.
+    Уведомления в Telegram отправляются сразу после нахождения каждой возможности.
     """
+    # Инициализируем Telegram один раз для всех монет
+    telegram = TelegramSender()
+    channel_id = config.TEST_CHANNEL_ID if telegram.enabled else None
+    
     opportunities: List[Dict[str, Any]] = []
     
     for exchange_name in exchanges:
@@ -309,7 +329,7 @@ async def scan_once(
         for i in range(0, total, COIN_BATCH_SIZE):
             batch = coins_list[i:i + COIN_BATCH_SIZE]
             results = await asyncio.gather(
-                *(process_coin(bot, exchange_name, coin, sem) for coin in batch),
+                *(process_coin(bot, exchange_name, coin, sem, telegram, channel_id) for coin in batch),
                 return_exceptions=True
             )
             
@@ -320,22 +340,6 @@ async def scan_once(
                     opportunities.append(result)
             
             logger.debug(f"Progress {exchange_name}: {min(i + COIN_BATCH_SIZE, total)}/{total} coins processed")
-    
-    # Отправляем уведомления в Telegram для найденных возможностей
-    if opportunities:
-        try:
-            telegram = TelegramSender()
-            if telegram.enabled:
-                channel_id = config.TEST_CHANNEL_ID
-                if channel_id:
-                    for opp in opportunities:
-                        message = format_telegram_message(opp)
-                        await telegram.send_message(message, channel_id=channel_id)
-                        logger.debug(f"📱 Отправлено сообщение в Telegram для {opp['coin']} {opp['exchange']}")
-                else:
-                    logger.warning(f"📱 Telegram включен, но канал не настроен для режима {config.ENV_MODE}")
-        except Exception as e:
-            logger.warning(f"Ошибка отправки сообщений в Telegram: {e}", exc_info=True)
 
 
 async def main():

@@ -222,6 +222,7 @@ class AsyncGateExchange(AsyncBaseExchange):
         
         Gate:
         - /futures/usdt/contracts/{contract} -> текущая ставка и funding_next_apply_time
+        - Также пробуем получить время из истории фандингов
         
         Returns:
             Словарь с данными:
@@ -248,13 +249,55 @@ class AsyncGateExchange(AsyncBaseExchange):
                 return None
 
             # Gate возвращает funding_next_apply_time в секундах (Unix timestamp)
-            next_funding_time_raw = data.get("funding_next_apply_time")
+            # Также может быть в других полях: funding_next_apply_time, next_funding_time, funding_time
+            next_funding_time_raw = (
+                data.get("funding_next_apply_time") or
+                data.get("next_funding_time") or
+                data.get("funding_time") or
+                data.get("next_funding_apply_time")
+            )
+
+            # Если не нашли в contracts, пробуем получить из истории фандингов
+            if next_funding_time_raw is None:
+                try:
+                    url_history = "/api/v4/futures/usdt/funding_rate"
+                    params_history = {"contract": symbol, "limit": 1}
+                    data_history = await self._request_json("GET", url_history, params=params_history)
+                    
+                    if isinstance(data_history, list) and data_history:
+                        item = data_history[0]
+                        # В истории может быть время следующей выплаты или время последней выплаты
+                        next_funding_time_raw = (
+                            item.get("t") or  # timestamp последней выплаты
+                            item.get("time") or
+                            item.get("next_time")
+                        )
+                        # Если получили время последней выплаты, добавляем 8 часов (28800 секунд)
+                        if next_funding_time_raw is not None:
+                            try:
+                                last_time = int(next_funding_time_raw)
+                                # Добавляем 8 часов для следующей выплаты
+                                next_funding_time_raw = last_time + 28800
+                            except (TypeError, ValueError):
+                                next_funding_time_raw = None
+                except Exception:
+                    # Если не удалось получить из истории, оставляем None
+                    pass
 
             try:
                 funding_rate = float(r)
-                next_funding_time = int(next_funding_time_raw) if next_funding_time_raw is not None else None
-                # Gate возвращает в секундах, но для единообразия можем оставить как есть
-                # или конвертировать в миллисекунды, но лучше оставить в секундах
+                next_funding_time = None
+                if next_funding_time_raw is not None:
+                    try:
+                        # Может быть строка или число
+                        if isinstance(next_funding_time_raw, str):
+                            next_funding_time = int(float(next_funding_time_raw))
+                        else:
+                            next_funding_time = int(next_funding_time_raw)
+                    except (TypeError, ValueError):
+                        # Если не удалось распарсить, оставляем None
+                        pass
+                
                 return {
                     "funding_rate": funding_rate,
                     "next_funding_time": next_funding_time,
