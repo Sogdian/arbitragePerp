@@ -336,7 +336,14 @@ async def close_long_short_positions(
     return ok_all
 
 
-async def _bybit_close_leg_partial_ioc(*, exchange_obj: Any, coin: str, position_direction: str, coin_amount: float) -> Tuple[bool, Optional[float]]:
+async def _bybit_close_leg_partial_ioc(
+    *,
+    exchange_obj: Any,
+    coin: str,
+    position_direction: str,
+    coin_amount: float,
+    position_idx: Optional[int] = None,
+) -> Tuple[bool, Optional[float]]:
     """
     Закрытие позиции на Bybit частями: limit + IOC + reduceOnly.
     position_direction: "long" (закрываем Sell) или "short" (закрываем Buy).
@@ -413,6 +420,8 @@ async def _bybit_close_leg_partial_ioc(*, exchange_obj: Any, coin: str, position
                 # Важно: не открывать новую позицию, а уменьшать существующую.
                 "reduceOnly": True,
             }
+            if position_idx is not None:
+                body["positionIdx"] = int(position_idx)
             data = await _bybit_private_post(exchange_obj=exchange_obj, api_key=api_key, api_secret=api_secret, path="/v5/order/create", body=body)
             if not isinstance(data, dict) or data.get("retCode") != 0:
                 logger.error(f"❌ Bybit close: api error: {data}")
