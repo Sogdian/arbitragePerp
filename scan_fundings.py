@@ -208,12 +208,12 @@ async def process_coin(
     funding_info = await fetch_funding_info(bot, exchange_name, coin, sem)
     
     if not funding_info:
-        logger.info(f"💲 {coin} {exchange_name} | Фандинг: N/A")
+        logger.debug(f"💲 {coin} {exchange_name} | Фандинг: N/A (funding_info is None)")
         return None
     
     funding_rate = funding_info.get("funding_rate")
     if funding_rate is None:
-        logger.info(f"💲 {coin} {exchange_name} | Фандинг: N/A")
+        logger.debug(f"💲 {coin} {exchange_name} | Фандинг: N/A (funding_rate is None)")
         return None
     
     # Проверяем условие: фандинг >= MIN_FUNDING_SPREAD

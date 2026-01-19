@@ -32,14 +32,15 @@ LOG_LEVEL=INFO
 python scan_spreads.py (тут SCAN_COIN_INVEST)
 python one_coin_bot.py CLO (тут SCAN_COIN_INVEST)
 python bot.py "STO Long (mexc), Short (bybit) 30" --no-monitor (30 = количество монет CVC)
+python scan_fundings.py
 ```
 
 **macOS:**
 ```bash
 python3 scan_spreads.py 
 python3 bot.py "CVC Long (bybit), Short (gate) 30" --no-monitor
-python3 bot.py "CVC Long (bybit), Short (gate)" --no-monitor
-python3 one_coin_bot.py CLO
+python3 bot.py "CVC Long (bybit), Shor
+python3 scan_fundings.py
 ```
 
 ### Способ 2: Интерактивный ввод
