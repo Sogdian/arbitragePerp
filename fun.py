@@ -1044,8 +1044,14 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
         logger.error("❌ Не удалось зафиксировать цену (last price) в 11:59:59")
         return 2
 
-    fair_price = close_price * (1.0 + p.funding_pct)
-    long_target_price = close_price * (1.0 + p.funding_pct + p.offset_pct)
+    # fair_price = close_price - (close_price × (|funding_pct| + |offset_pct|))
+    # 1. Складываем проценты фандинга и отступа (в абсолютных значениях)
+    total_pct_abs = abs(p.funding_pct) + abs(p.offset_pct)  # 0.00941 + 0.002 = 0.01141
+    # 2. Находим этот процент от close_price
+    deduction = close_price * total_pct_abs  # 0.10412 × 0.01141 ≈ 0.00118801
+    # 3. Вычитаем от close_price
+    fair_price = close_price - deduction  # 0.10412 - 0.00118801 ≈ 0.10293199
+    long_target_price = fair_price  # long_target = fair (одинаковая формула)
     logger.info(
         f"📌 Фиксация: close_price={_fmt(close_price)} | fair={_fmt(fair_price)} | long_target={_fmt(long_target_price)} "
         f"(funding={_fmt(p.funding_pct*100,3)}%, offset={_fmt(p.offset_pct*100,3)}%)"
