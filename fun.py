@@ -580,6 +580,9 @@ def _bybit_calc_pnl_usdt_from_execs(execs: List[Dict[str, Any]]) -> Tuple[Option
     avg_buy = (buy_notional / buy_qty) if buy_qty > 0 else None
     avg_sell = (sell_notional / sell_qty) if sell_qty > 0 else None
     pnl = sell_notional - buy_notional
+    # Вычитаем комиссии: 0.01 USDT за каждую сделку (execution)
+    commission_total = (buys + sells) * 0.01
+    pnl = pnl - commission_total
     return pnl, buys, sells, avg_buy, avg_sell
 
 
@@ -732,7 +735,7 @@ async def _bybit_test_orders(bot: PerpArbitrageBot, coin: str, qty_test: float) 
         execs = await _bybit_fetch_executions(exchange_obj=exchange_obj, api_key=api_key, api_secret=api_secret, coin=coin, start_ms=t0_ms, end_ms=t1_ms)
         pnl_total, buys_n, sells_n, avg_buy, avg_sell = _bybit_calc_pnl_usdt_from_execs(execs)
         logger.info(
-            f"📊 Итог (ТЕСТ): монета={coin} | период_ms={t0_ms}-{t1_ms} | "
+            f"📊 Итог (ТЕСТ): монета={coin} | "
             f"ср_цена_покупки={_fmt(avg_buy)} | ср_цена_продажи={_fmt(avg_sell)} | "
             f"покупок={buys_n} продаж={sells_n} | PnL_USDT_итого={_fmt(pnl_total, 3) if pnl_total is not None else 'N/A'}"
         )
@@ -784,7 +787,7 @@ async def _bybit_test_orders(bot: PerpArbitrageBot, coin: str, qty_test: float) 
         execs = await _bybit_fetch_executions(exchange_obj=exchange_obj, api_key=api_key, api_secret=api_secret, coin=coin, start_ms=t0_ms, end_ms=t1_ms)
         pnl_total, buys_n, sells_n, avg_buy, avg_sell = _bybit_calc_pnl_usdt_from_execs(execs)
         logger.info(
-            f"📊 Итог (ТЕСТ): монета={coin} | период_ms={t0_ms}-{t1_ms} | "
+            f"📊 Итог (ТЕСТ): монета={coin} | "
             f"ср_цена_покупки={_fmt(avg_buy)} | ср_цена_продажи={_fmt(avg_sell)} | "
             f"покупок={buys_n} продаж={sells_n} | PnL_USDT_итого={_fmt(pnl_total, 3) if pnl_total is not None else 'N/A'}"
         )
@@ -814,7 +817,7 @@ async def _bybit_test_orders(bot: PerpArbitrageBot, coin: str, qty_test: float) 
         execs = await _bybit_fetch_executions(exchange_obj=exchange_obj, api_key=api_key, api_secret=api_secret, coin=coin, start_ms=t0_ms, end_ms=t1_ms)
         pnl_total, buys_n, sells_n, avg_buy, avg_sell = _bybit_calc_pnl_usdt_from_execs(execs)
         logger.info(
-            f"📊 Итог (ТЕСТ): монета={coin} | период_ms={t0_ms}-{t1_ms} | "
+            f"📊 Итог (ТЕСТ): монета={coin} | "
             f"ср_цена_покупки={_fmt(avg_buy)} | ср_цена_продажи={_fmt(avg_sell)} | "
             f"покупок={buys_n} продаж={sells_n} | PnL_USDT_итого={_fmt(pnl_total, 3) if pnl_total is not None else 'N/A'}"
         )
@@ -847,7 +850,7 @@ async def _bybit_test_orders(bot: PerpArbitrageBot, coin: str, qty_test: float) 
     execs = await _bybit_fetch_executions(exchange_obj=exchange_obj, api_key=api_key, api_secret=api_secret, coin=coin, start_ms=t0_ms, end_ms=t1_ms)
     pnl_total, buys_n, sells_n, avg_buy, avg_sell = _bybit_calc_pnl_usdt_from_execs(execs)
     logger.info(
-        f"📊 Итог (ТЕСТ): монета={coin} | период_ms={t0_ms}-{t1_ms} | "
+        f"📊 Итог (ТЕСТ): монета={coin} | "
         f"ср_цена_покупки={_fmt(avg_buy)} | ср_цена_продажи={_fmt(avg_sell)} | "
         f"покупок={buys_n} продаж={sells_n} | PnL_USDT_итого={_fmt(pnl_total, 3) if pnl_total is not None else 'N/A'}"
     )
@@ -1292,7 +1295,7 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
         execs = await _bybit_fetch_executions(exchange_obj=exchange_obj, api_key=api_key, api_secret=api_secret, coin=p.coin, start_ms=t0_ms, end_ms=t1_ms)
         pnl_hist, buys_n, sells_n, avg_buy, avg_sell = _bybit_calc_pnl_usdt_from_execs(execs)
         logger.info(
-            f"📊 Итог (БОЕВОЙ, частично): монета={p.coin} | период_ms={t0_ms}-{t1_ms} | "
+            f"📊 Итог (БОЕВОЙ, частично): монета={p.coin} | "
             f"ср_цена_покупки={_fmt(avg_buy)} | ср_цена_продажи={_fmt(avg_sell)} | "
             f"покупок={buys_n} продаж={sells_n} | PnL_USDT_итого={_fmt(pnl_hist, 3) if pnl_hist is not None else 'N/A'}"
         )
@@ -1338,7 +1341,7 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
     execs = await _bybit_fetch_executions(exchange_obj=exchange_obj, api_key=api_key, api_secret=api_secret, coin=p.coin, start_ms=t0_ms, end_ms=t1_ms)
     pnl_hist, buys_n, sells_n, avg_buy, avg_sell = _bybit_calc_pnl_usdt_from_execs(execs)
     logger.info(
-        f"📊 Итог (БОЕВОЙ): монета={p.coin} | период_ms={t0_ms}-{t1_ms} | "
+        f"📊 Итог (БОЕВОЙ): монета={p.coin} | "
         f"ср_цена_покупки={_fmt(avg_buy)} | ср_цена_продажи={_fmt(avg_sell)} | "
         f"покупок={buys_n} продаж={sells_n} | PnL_USDT_итого={_fmt(pnl_hist, 3) if pnl_hist is not None else 'N/A'}"
     )
