@@ -748,27 +748,15 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
     offset_str = f"{_fmt(p.offset_pct*100, 3)}%"
     min_qty_str = _fmt(min_test_qty)
 
-    print()
-    print(cmd_str)
-    print()
     print(sep)
-    print()
     print(f"Анализ арбитража для {exchange_cap} ({coin_upper})")
-    print()
     print(sep)
-    print()
     print(f"Цена: {price_str} (количество монет: {_fmt(p.coin_qty)} {coin_upper} | ~{notional_str} USDT)")
-    print()
     print(f"Фандинг: {funding_str}")
-    print()
     print(f"Время следующей выплаты: {payout_time_str}")
-    print()
     print(f"Доп отступ вниз от справедливой цены: {offset_str}")
-    print()
     print(f"Мин количество монет для ордера: {min_qty_str}")
-    print()
     print(sep)
-    print()
 
     # Liquidity check output
     if long_liquidity:
@@ -790,10 +778,6 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
         logger.info(f"❌ Найдены новости о взломах/безопасности {coin_upper} ({exchange_cap}) за последние {NEWS_DAYS_BACK} дней ({len(security_news)} шт.)")
     else:
         logger.info(f"✅ Новостей о взломах/безопасности {coin_upper} ({exchange_cap}) за последние {NEWS_DAYS_BACK} дней не найдено")
-
-    print()
-    print(sep)
-    print()
 
     # Ask about test orders
     ans = input("Совершить тестовые открытия шорт и лонг ? (Да/Нет): ").strip()
