@@ -72,6 +72,7 @@ logging.getLogger("exchanges").setLevel(logging.CRITICAL)
 TEST_OB_LEVELS = int(os.getenv("FUN_TEST_OB_LEVELS", "15"))
 MAIN_OB_LEVELS = int(os.getenv("FUN_MAIN_OB_LEVELS", "15"))
 POLL_SEC = float(os.getenv("FUN_POLL_SEC", "0.2"))
+SHORT_OPEN_LEVELS = int(os.getenv("FUN_SHORT_OPEN_LEVELS", "10"))
 NEWS_DAYS_BACK = int(os.getenv("FUN_NEWS_DAYS_BACK", "60"))
 BALANCE_BUFFER_USDT = float(os.getenv("FUN_BALANCE_BUFFER_USDT", "0"))
 
@@ -537,6 +538,76 @@ async def _bybit_fetch_executions(
         return []
     items = ((data.get("result") or {}).get("list") or [])
     return items if isinstance(items, list) else []
+
+
+async def _bybit_fetch_recent_trades(*, exchange_obj: Any, coin: str, limit: int = 200) -> List[Dict[str, Any]]:
+    """
+    Best-effort: fetch recent public trades to get last trade price close to a specific timestamp.
+    Bybit v5: /v5/market/recent-trade
+    """
+    try:
+        symbol = exchange_obj._normalize_symbol(coin)
+        params: Dict[str, Any] = {"category": "linear", "symbol": symbol, "limit": int(max(1, min(1000, limit)))}
+        data = await exchange_obj._request_json("GET", "/v5/market/recent-trade", params=params)
+        if not (isinstance(data, dict) and data.get("retCode") == 0):
+            return []
+        items = ((data.get("result") or {}).get("list") or [])
+        return items if isinstance(items, list) else []
+    except Exception:
+        return []
+
+
+def _bybit_parse_trade_time_ms(it: Dict[str, Any]) -> Optional[int]:
+    for k in ("tradeTimeMs", "time", "execTime", "timestamp", "ts"):
+        v = it.get(k)
+        if v is None:
+            continue
+        try:
+            # most Bybit fields are ms as string
+            t = int(float(v))
+            # if looks like seconds, convert to ms
+            if t < 10_000_000_000:
+                t *= 1000
+            return t
+        except Exception:
+            continue
+    return None
+
+
+def _bybit_parse_trade_price(it: Dict[str, Any]) -> Optional[float]:
+    for k in ("price", "execPrice", "p"):
+        v = it.get(k)
+        if v is None:
+            continue
+        try:
+            px = float(v)
+            if px > 0:
+                return px
+        except Exception:
+            continue
+    return None
+
+
+async def _bybit_last_trade_price_before(*, exchange_obj: Any, coin: str, before_ms: int) -> Optional[float]:
+    """
+    Returns last trade price with trade time <= before_ms (best-effort).
+    """
+    trades = await _bybit_fetch_recent_trades(exchange_obj=exchange_obj, coin=coin, limit=200)
+    best_t: Optional[int] = None
+    best_px: Optional[float] = None
+    for it in trades:
+        if not isinstance(it, dict):
+            continue
+        t = _bybit_parse_trade_time_ms(it)
+        if t is None or t > before_ms:
+            continue
+        px = _bybit_parse_trade_price(it)
+        if px is None:
+            continue
+        if best_t is None or t > best_t:
+            best_t = t
+            best_px = px
+    return best_px
 
 
 def _bybit_calc_pnl_usdt_from_execs(execs: List[Dict[str, Any]]) -> Tuple[Optional[float], int, int, Optional[float], Optional[float]]:
@@ -1040,6 +1111,14 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
 
     t_fix = await exchange_obj.get_futures_ticker(p.coin)
     close_price = _ticker_last_price(t_fix)
+    # Best-effort: try to align with UI by using last trade price at/before fix timestamp (if available)
+    try:
+        fix_ms = int(fix_dt.timestamp() * 1000)
+        trade_px = await _bybit_last_trade_price_before(exchange_obj=exchange_obj, coin=p.coin, before_ms=fix_ms)
+        if trade_px is not None and trade_px > 0:
+            close_price = float(trade_px)
+    except Exception:
+        pass
     if close_price is None or close_price <= 0:
         logger.error("❌ Не удалось зафиксировать цену (last price) в 11:59:59")
         return 2
@@ -1090,69 +1169,85 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
     tick = float(tick_raw) if tick_raw else 0.0
     qty_str = po._format_by_step(p.coin_qty, qty_step_raw)
 
-    bids2 = ob2["bids"][:MAIN_OB_LEVELS]
-    px_short_level2, _ = po._price_level_for_target_size(bids2, p.coin_qty)
-    if px_short_level2 is None:
-        logger.error(f"❌ Недостаточно ликвидности в bids (1-{MAIN_OB_LEVELS}) для открытия Short qty={_fmt(p.coin_qty)}")
-        return 2
-
-    # Sell price: to allow match across levels, use that level price (rounded down to tick)
-    px_short = po._round_price_for_side(float(px_short_level2), tick, "sell")
-    px_short_str = po._format_by_step(px_short, tick_raw)
-
     # 12:00:00 — открытие: Short (FOK), Long (partial allowed, up to 15 attempts), StopLoss for Short
-    logger.info(f"📤 Открываем Short (Sell FOK) | qty={qty_str} | limit={px_short_str}")
-    try:
+    bids2 = ob2["bids"][:MAIN_OB_LEVELS]
+    max_lvls = max(1, min(int(SHORT_OPEN_LEVELS), 10, len(bids2)))
+    # Best-effort: multiple FOK attempts down the orderbook (lvl 1..10) without extra sleeps.
+    short_order_id: Optional[str] = None
+    st_s: Optional[str] = None
+    filled_s: float = 0.0
+    short_entry_avg: Optional[float] = None
+    tried_prices: set[str] = set()
+    for lvl_i in range(1, max_lvls + 1):
         try:
-            short_order_id = await _bybit_place_limit(
-                exchange_obj=exchange_obj,
-                api_key=api_key,
-                api_secret=api_secret,
-                coin=p.coin,
-                side="Sell",
-                qty_str=qty_str,
-                price_str=px_short_str,
-                tif="FOK",
-                reduce_only=None,
-                position_idx=2,
-            )
+            px_raw = float(bids2[lvl_i - 1][0])
         except Exception:
-            short_order_id = await _bybit_place_limit(
-                exchange_obj=exchange_obj,
-                api_key=api_key,
-                api_secret=api_secret,
-                coin=p.coin,
-                side="Sell",
-                qty_str=qty_str,
-                price_str=px_short_str,
-                tif="FOK",
-                reduce_only=None,
-                position_idx=None,
-            )
-    except Exception as e:
-        logger.error(f"❌ Не удалось создать Short ордер: {e}")
-        return 2
+            continue
+        px_short = po._round_price_for_side(px_raw, tick, "sell")
+        px_short_str = po._format_by_step(px_short, tick_raw)
+        if px_short_str in tried_prices:
+            continue
+        tried_prices.add(px_short_str)
 
-    st_s, filled_s, short_entry_avg = await _bybit_wait_done_get_filled_qty(
-        exchange_obj=exchange_obj,
-        api_key=api_key,
-        api_secret=api_secret,
-        coin=p.coin,
-        order_id=str(short_order_id),
-        timeout_sec=8.0,
-    )
+        logger.info(f"📤 Открываем Short (Sell FOK) | попытка {lvl_i}/{max_lvls} | qty={qty_str} | limit={px_short_str}")
+        try:
+            try:
+                short_order_id = await _bybit_place_limit(
+                    exchange_obj=exchange_obj,
+                    api_key=api_key,
+                    api_secret=api_secret,
+                    coin=p.coin,
+                    side="Sell",
+                    qty_str=qty_str,
+                    price_str=px_short_str,
+                    tif="FOK",
+                    reduce_only=None,
+                    position_idx=2,
+                )
+            except Exception:
+                short_order_id = await _bybit_place_limit(
+                    exchange_obj=exchange_obj,
+                    api_key=api_key,
+                    api_secret=api_secret,
+                    coin=p.coin,
+                    side="Sell",
+                    qty_str=qty_str,
+                    price_str=px_short_str,
+                    tif="FOK",
+                    reduce_only=None,
+                    position_idx=None,
+                )
+        except Exception as e:
+            logger.warning(f"⚠️ Не удалось создать Short ордер (попытка {lvl_i}/{max_lvls}): {e}")
+            continue
+
+        st_s, filled_s, short_entry_avg = await _bybit_wait_done_get_filled_qty(
+            exchange_obj=exchange_obj,
+            api_key=api_key,
+            api_secret=api_secret,
+            coin=p.coin,
+            order_id=str(short_order_id),
+            timeout_sec=1.6,
+        )
+        if filled_s and filled_s > 0:
+            if filled_s + 1e-12 < float(qty_str):
+                logger.warning(f"⚠️ Short исполнился частично (не ожидалось для FOK) | filled={_fmt(filled_s)} | req={qty_str}")
+            break
+        logger.warning(f"⚠️ Short не открылся (FOK) | попытка {lvl_i}/{max_lvls} | status={st_s} | filled={_fmt(filled_s)}")
+
     if not filled_s or filled_s <= 0:
-        logger.error(f"❌ Short не открылся (FOK) | status={st_s} | filled={_fmt(filled_s)}")
+        logger.error(f"❌ Short не открылся (FOK) за {max_lvls} попыток | last_status={st_s} | filled={_fmt(filled_s)}")
         return 2
-    if filled_s + 1e-12 < float(qty_str):
-        logger.warning(f"⚠️ Short исполнился частично (не ожидалось для FOK) | filled={_fmt(filled_s)} | req={qty_str}")
 
     qty_trade = float(filled_s)
     qty_trade_str = po._format_by_step(qty_trade, qty_step_raw)
-    logger.info(f"✅ Short открыт | qty={qty_trade_str} | entry~{px_short_str}")
+    logger.info(f"✅ Short открыт | qty={qty_trade_str}")
     # fallback to limit price if avg is missing (no extra requests)
     if short_entry_avg is None:
-        short_entry_avg = float(px_short) if px_short is not None else None
+        try:
+            short_entry_avg = float(px_short_str)
+        except Exception:
+            short_entry_avg = None
 
     # Stop loss for short at entry price (best bid used for short)
     sl_order_id: Optional[str] = None
