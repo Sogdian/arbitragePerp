@@ -651,7 +651,10 @@ async def _bybit_test_orders(bot: PerpArbitrageBot, coin: str, qty_test: float) 
         order_id=str(long_order_id),
     )
     if not ok_full_l:
-        logger.error(f"❌ Bybit test: Long не исполнился полностью | filled={_fmt(filled_l)}")
+        logger.warning(
+            f"⚠️ Bybit test: Long не исполнился (FOK) | filled={_fmt(filled_l)}. "
+            f"Закрываем открытые позиции best-effort и продолжаем."
+        )
         # close both best-effort
         await po._bybit_close_leg_partial_ioc(exchange_obj=exchange_obj, coin=coin, position_direction="short", coin_amount=qty_test)
         await po._bybit_close_leg_partial_ioc(exchange_obj=exchange_obj, coin=coin, position_direction="long", coin_amount=qty_test)
@@ -836,9 +839,9 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
         logger.info("🧪 Тестовые ордера: запуск")
         ok_test = await _bybit_test_orders(bot, p.coin, min_test_qty)
         if not ok_test:
-            logger.error("❌ Тестовые ордера не прошли — останавливаемся")
-            return 2
-        logger.info("✅ Тестовые ордера прошли успешно")
+            logger.warning("⚠️ Тестовые ордера не прошли (или прошли частично) — продолжаем без остановки")
+        else:
+            logger.info("✅ Тестовые ордера прошли успешно")
     else:
         logger.info("⏭️ Тестовые ордера пропущены")
 
