@@ -54,6 +54,7 @@ MAX_CONCURRENCY = int(os.getenv("SCAN_FUNDING_MAX_CONCURRENCY", "20"))  # ско
 COIN_BATCH_SIZE = int(os.getenv("SCAN_FUNDING_COIN_BATCH_SIZE", "50"))  # сколько монет обрабатывать за пачку
 REQ_TIMEOUT_SEC = float(os.getenv("SCAN_FUNDING_REQ_TIMEOUT_SEC", "12"))  # таймаут на запрос к бирже
 SCAN_FUNDING_MIN_TIME_TO_PAY = float(os.getenv("SCAN_FUNDING_MIN_TIME_TO_PAY", "0"))  # минимальное время до выплаты в минутах (если >= этого значения, не отправляем в Telegram)
+SCAN_COIN_INVEST = float(os.getenv("SCAN_COIN_INVEST", "50"))  # размер позиции (USDT) для расчета минимального количества монет
 EXCLUDE_EXCHANGES = {"lbank"}  # не использовать
 
 # Монеты для исключения из поиска фандингов (через запятую, например: EXCLUDE_COINS=FLOW,BTC)
@@ -168,6 +169,43 @@ async def fetch_funding_info(
         return None
 
 
+async def fetch_ticker_info(
+    bot: PerpArbitrageBot,
+    exchange_name: str,
+    coin: str,
+    sem: asyncio.Semaphore,
+) -> Optional[Dict[str, Any]]:
+    """
+    Запрос информации о тикере с ограничением параллелизма через семафор.
+    
+    Returns:
+        Словарь с данными:
+        {
+            "bid": float,  # Лучшая цена покупки
+            "ask": float,  # Лучшая цена продажи
+            "price": float,  # Текущая цена
+        }
+        или None если ошибка
+    """
+    exchange = bot.exchanges.get(exchange_name)
+    if not exchange:
+        return None
+
+    try:
+        async with sem:
+            ticker_info = await asyncio.wait_for(
+                exchange.get_futures_ticker(coin),
+                timeout=REQ_TIMEOUT_SEC
+            )
+        return ticker_info
+    except asyncio.TimeoutError:
+        logger.debug(f"Timeout: {exchange_name} {coin} ticker > {REQ_TIMEOUT_SEC:.1f}s")
+        return None
+    except Exception as e:
+        logger.debug(f"Fetch error: {exchange_name} {coin} ticker: {e}")
+        return None
+
+
 async def collect_coins_by_exchange(bot: PerpArbitrageBot, exchanges: List[str]) -> Dict[str, Set[str]]:
     """
     Собирает карту монет для каждой биржи.
@@ -244,11 +282,24 @@ async def process_coin(
     
     verdict = "✅ арбитражить" if ok else "❌ не арбитражить"
     
+    # Получаем цену монеты для расчета минимального количества монет для шорт ордера
+    ticker_info = await fetch_ticker_info(bot, exchange_name, coin, sem)
+    min_coins_short = None
+    if ticker_info and ticker_info.get("bid") is not None:
+        bid_price = ticker_info.get("bid")
+        if bid_price and bid_price > 0:
+            min_coins_short = SCAN_COIN_INVEST / bid_price
+    
+    # Формируем строку с минимальным количеством монет для шорт ордера
+    coins_info = ""
+    if ok and min_coins_short is not None:
+        coins_info = f" (min short: {min_coins_short:.3f} {coin})"
+    
     # Логируем найденную возможность
     minutes_str = f"{minutes_until} мин" if minutes_until is not None else "N/A"
     logger.info(
         f"💲 {coin} {exchange_name} | Фандинг: {funding_rate_pct:.3f}% | "
-        f"Время выплаты: {minutes_str} {verdict}"
+        f"Время выплаты: {minutes_str} {verdict}{coins_info}"
     )
     
     if ok:
