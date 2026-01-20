@@ -580,8 +580,8 @@ def _bybit_calc_pnl_usdt_from_execs(execs: List[Dict[str, Any]]) -> Tuple[Option
     avg_buy = (buy_notional / buy_qty) if buy_qty > 0 else None
     avg_sell = (sell_notional / sell_qty) if sell_qty > 0 else None
     pnl = sell_notional - buy_notional
-    # Вычитаем комиссии: 0.01 USDT за каждую сделку (execution)
-    commission_total = (buys + sells) * 0.01
+    # Вычитаем комиссии: 0.005 USDT за каждую сделку (execution)
+    commission_total = (buys + sells) * 0.005
     pnl = pnl - commission_total
     return pnl, buys, sells, avg_buy, avg_sell
 
