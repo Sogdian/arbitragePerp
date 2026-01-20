@@ -6,7 +6,7 @@ import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from bot import PerpArbitrageBot
 import position_opener as po
@@ -482,21 +482,24 @@ async def _bybit_preflight_and_min_qty(
     return float(q_min), f
 
 
-async def _check_news_one_exchange(bot: PerpArbitrageBot, exchange: str, coin: str) -> Tuple[bool, str]:
+async def _check_news_one_exchange(bot: PerpArbitrageBot, exchange: str, coin: str) -> Tuple[bool, str, List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """
+    Returns (ok, msg, delisting_news, security_news)
+    """
     try:
         now_utc = datetime.now(timezone.utc)
         lookback = now_utc - timedelta(days=NEWS_DAYS_BACK, hours=6)
         anns = await bot.news_monitor._fetch_exchange_announcements(limit=200, days_back=NEWS_DAYS_BACK, exchanges=[exchange])
         delisting = await bot.news_monitor.find_delisting_news(anns, coin_symbol=coin, lookback=lookback)
         if delisting:
-            return False, f"найдены новости о делистинге ({len(delisting)} шт.)"
+            return False, f"найдены новости о делистинге ({len(delisting)} шт.)", delisting, []
         security = await bot.announcements_monitor.find_security_news(anns, coin_symbol=coin, lookback=lookback)
         if security:
-            return False, f"найдены security-новости ({len(security)} шт.)"
-        return True, "ok"
+            return False, f"найдены security-новости ({len(security)} шт.)", delisting or [], security
+        return True, "ok", [], []
     except Exception as e:
         # conservative: treat failures as NOT ok
-        return False, f"ошибка проверки новостей: {type(e).__name__}: {e}"
+        return False, f"ошибка проверки новостей: {type(e).__name__}: {e}", [], []
 
 
 async def _bybit_test_orders(bot: PerpArbitrageBot, coin: str, qty_test: float) -> bool:
@@ -668,12 +671,6 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
     except Exception:
         pass
 
-    # News check
-    news_ok, news_msg = await _check_news_one_exchange(bot, "bybit", p.coin)
-    if not news_ok:
-        logger.error(f"❌ Новости/делистинг: {news_msg}")
-        return 2
-
     # Basic orderbook + filters + qty validation
     ticker = await exchange_obj.get_futures_ticker(p.coin)
     last_px = _ticker_last_price(ticker)
@@ -722,11 +719,81 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
         logger.error(f"❌ Недостаточно баланса USDT | доступно={_fmt(avail_usdt, 3)} | нужно~{_fmt(required_usdt, 3)} (isolated 1x, оценка по стакану)")
         return 2
 
-    logger.info(
-        f"✅ Подготовка OK | exchange=bybit | coin={p.coin} | qty={_fmt(p.coin_qty)} | "
-        f"funding={_fmt(p.funding_pct*100, 3)}% | offset={_fmt(p.offset_pct*100, 3)}% | "
-        f"min_test_qty~{_fmt(min_test_qty)} | usdt_avail={_fmt(avail_usdt, 3)} | usdt_need~{_fmt(required_usdt, 3)}"
+    # Check liquidity for Long (entry_long mode)
+    notional_usdt = float(p.coin_qty) * float(last_px)
+    long_liquidity = await exchange_obj.check_liquidity(
+        p.coin,
+        notional_usdt=notional_usdt,
+        ob_limit=50,
+        max_spread_bps=30.0,
+        max_impact_bps=50.0,
+        mode="entry_long",
     )
+
+    # News check
+    news_ok, news_msg, delisting_news, security_news = await _check_news_one_exchange(bot, "bybit", p.coin)
+    if not news_ok:
+        logger.error(f"❌ Новости/делистинг: {news_msg}")
+        return 2
+
+    # Format output
+    cmd_str = f'python fun.py "{p.coin} {p.exchange.capitalize()} {_fmt(p.coin_qty)} {_fmt(p.funding_pct*100, 3)}% {p.payout_hh:02d}:{p.payout_mm:02d} {_fmt(p.offset_pct*100, 3)}%"'
+    sep = "=" * 60
+    coin_upper = p.coin.upper()
+    exchange_cap = p.exchange.capitalize()
+    price_str = _fmt(last_px, 3)
+    notional_str = _fmt(notional_usdt, 3)
+    funding_str = f"{_fmt(p.funding_pct*100, 3)}%"
+    payout_time_str = f"{p.payout_hh:02d}:{p.payout_mm:02d}"
+    offset_str = f"{_fmt(p.offset_pct*100, 3)}%"
+    min_qty_str = _fmt(min_test_qty)
+
+    print()
+    print(cmd_str)
+    print()
+    print(sep)
+    print()
+    print(f"Анализ арбитража для {exchange_cap} ({coin_upper})")
+    print()
+    print(sep)
+    print()
+    print(f"Цена: {price_str} (количество монет: {_fmt(p.coin_qty)} {coin_upper} | ~{notional_str} USDT)")
+    print()
+    print(f"Фандинг: {funding_str}")
+    print()
+    print(f"Время следующей выплаты: {payout_time_str}")
+    print()
+    print(f"Доп отступ вниз от справедливой цены: {offset_str}")
+    print()
+    print(f"Мин количество монет для ордера: {min_qty_str}")
+    print()
+    print(sep)
+    print()
+
+    # Liquidity check output
+    if long_liquidity:
+        status = "✅" if long_liquidity["ok"] else "❌"
+        spread_bps = long_liquidity.get("spread_bps", 0.0)
+        buy_impact = long_liquidity.get("buy_impact_bps")
+        buy_impact_str = f"{buy_impact:.1f}bps" if buy_impact is not None else "0.0bps"
+        logger.info(f"{status} Ликвидность {exchange_cap} Long ({coin_upper}): {notional_str} USDT | spread={spread_bps:.1f}bps, buy_impact={buy_impact_str}")
+    else:
+        logger.warning(f"Не удалось проверить ликвидность {exchange_cap} Long ({coin_upper}) для {notional_str} USDT")
+
+    # News output
+    if delisting_news:
+        logger.info(f"❌ Найдены новости о делистинге {coin_upper} ({exchange_cap}) за последние {NEWS_DAYS_BACK} дней ({len(delisting_news)} шт.)")
+    else:
+        logger.info(f"✅ Новостей о делистинге {coin_upper} ({exchange_cap}) за последние {NEWS_DAYS_BACK} дней не найдено")
+
+    if security_news:
+        logger.info(f"❌ Найдены новости о взломах/безопасности {coin_upper} ({exchange_cap}) за последние {NEWS_DAYS_BACK} дней ({len(security_news)} шт.)")
+    else:
+        logger.info(f"✅ Новостей о взломах/безопасности {coin_upper} ({exchange_cap}) за последние {NEWS_DAYS_BACK} дней не найдено")
+
+    print()
+    print(sep)
+    print()
 
     # Ask about test orders
     ans = input("Совершить тестовые открытия шорт и лонг ? (Да/Нет): ").strip()
