@@ -13,6 +13,9 @@ from typing import Any, Dict, Optional, List, Set
 from bot import PerpArbitrageBot
 from telegram_sender import TelegramSender
 import config
+import position_opener as po
+# Импортируем функцию для вычисления минимального количества монет из fun.py
+from fun import _bybit_preflight_and_min_qty
 
 
 # ----------------------------
@@ -131,6 +134,56 @@ def calculate_minutes_until_funding(next_funding_time: Optional[int], exchange: 
         return minutes_until
     except Exception:
         return None
+
+
+async def calculate_min_qty_for_exchange(
+    bot: PerpArbitrageBot,
+    exchange_name: str,
+    coin: str,
+    price_hint: float,
+    notional_usdt: float,
+) -> Optional[float]:
+    """
+    Вычисляет минимальное количество монет для ордера с учетом ограничений биржи
+    (minOrderQty, minOrderAmt, qtyStep).
+    Переиспользует функцию _bybit_preflight_and_min_qty из fun.py.
+    
+    Args:
+        bot: Экземпляр бота
+        exchange_name: Название биржи (bybit, binance, gate)
+        coin: Название монеты
+        price_hint: Цена монеты (для расчета minOrderAmt)
+        notional_usdt: Размер позиции в USDT (не используется для bybit, но нужен для других бирж)
+        
+    Returns:
+        Минимальное количество монет или None если не удалось вычислить
+    """
+    if exchange_name.lower() != "bybit":
+        # Для других бирж пока используем простой расчет
+        # TODO: добавить поддержку для binance и gate
+        return notional_usdt / price_hint if price_hint > 0 else None
+    
+    try:
+        exchange_obj = bot.exchanges.get(exchange_name)
+        if not exchange_obj:
+            return None
+        
+        # Используем функцию из fun.py для вычисления минимального количества
+        # Передаем qty_desired как большое значение, чтобы валидация прошла
+        # Нам нужен только первый элемент возвращаемого кортежа (min_qty)
+        qty_desired = max(notional_usdt / price_hint if price_hint > 0 else 1000, 1000)
+        min_qty, _ = await _bybit_preflight_and_min_qty(
+            exchange_obj=exchange_obj,
+            coin=coin,
+            qty_desired=qty_desired,
+            price_hint=price_hint,
+        )
+        
+        return float(min_qty) if min_qty > 0 else None
+    except Exception as e:
+        logger.debug(f"Ошибка вычисления min_qty для {exchange_name} {coin}: {e}")
+        # Fallback: простой расчет
+        return notional_usdt / price_hint if price_hint > 0 else None
 
 
 async def fetch_funding_info(
@@ -288,7 +341,10 @@ async def process_coin(
     if ticker_info and ticker_info.get("bid") is not None:
         bid_price = ticker_info.get("bid")
         if bid_price and bid_price > 0:
-            min_coins_short = SCAN_COIN_INVEST / bid_price
+            # Вычисляем минимальное количество монет с учетом ограничений биржи (minOrderQty, minOrderAmt, qtyStep)
+            min_coins_short = await calculate_min_qty_for_exchange(
+                bot, exchange_name, coin, bid_price, SCAN_COIN_INVEST
+            )
     
     # Формируем строку с минимальным количеством монет для шорт ордера
     coins_info = ""
