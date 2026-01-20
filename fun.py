@@ -128,35 +128,31 @@ class FunParams:
     coin: str
     exchange: str
     coin_qty: float
-    funding_pct: float  # decimal, e.g. -0.02
-    payout_hh: int
-    payout_mm: int
     offset_pct: float  # decimal, e.g. -0.003
+    # Эти поля будут заполнены из API запросов:
+    funding_pct: Optional[float] = None  # decimal, e.g. -0.02 (получается из API)
+    payout_hh: Optional[int] = None  # получается из API
+    payout_mm: Optional[int] = None  # получается из API
 
 
 def parse_cmd(cmd: str) -> FunParams:
     parts = (cmd or "").strip().split()
-    if len(parts) != 6:
+    if len(parts) != 4:
         raise ValueError(
-            "bad command format. Expected: COIN EXCHANGE QTY FUNDING% HH:MM OFFSET% "
-            'e.g. "STO Bybit 30 -2% 12:00 -0.3%"'
+            "bad command format. Expected: COIN EXCHANGE QTY OFFSET% "
+            'e.g. "STO Bybit 30 -0.3%"'
         )
     coin = parts[0].strip().upper()
     exchange = parts[1].strip().lower()
     coin_qty = float(parts[2])
     if coin_qty <= 0:
         raise ValueError(f"coin qty must be > 0, got: {coin_qty}")
-    funding_pct = _parse_pct(parts[3])
-    offset_pct = _parse_pct(parts[5])
-    hh, mm = _parse_time_hhmm(parts[4])
+    offset_pct = _parse_pct(parts[3])
     # по ТЗ проценты отрицательные (но валидируем мягко)
     return FunParams(
         coin=coin,
         exchange=exchange,
         coin_qty=float(coin_qty),
-        funding_pct=float(funding_pct),
-        payout_hh=hh,
-        payout_mm=mm,
         offset_pct=float(offset_pct),
     )
 
@@ -164,6 +160,39 @@ def parse_cmd(cmd: str) -> FunParams:
 def _local_dt_today(hh: int, mm: int) -> datetime:
     now = datetime.now()
     return now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+
+
+def _next_funding_time_to_local_hhmm(next_funding_time: Optional[int], exchange: str) -> Optional[Tuple[int, int]]:
+    """
+    Преобразует timestamp следующей выплаты фандинга в локальное время (HH, MM).
+    
+    Args:
+        next_funding_time: Timestamp следующей выплаты (в миллисекундах для Bybit/Binance, в секундах для Gate)
+        exchange: Название биржи
+        
+    Returns:
+        Кортеж (HH, MM) или None если невозможно вычислить
+    """
+    if next_funding_time is None:
+        return None
+    
+    try:
+        # Bybit и Binance возвращают timestamp в миллисекундах
+        # Gate возвращает в секундах
+        if exchange.lower() == "gate":
+            # Gate: timestamp в секундах
+            funding_timestamp = next_funding_time
+        else:
+            # Bybit, Binance: timestamp в миллисекундах
+            funding_timestamp = next_funding_time / 1000
+        
+        # Преобразуем в локальное время
+        funding_dt = datetime.fromtimestamp(funding_timestamp, tz=timezone.utc)
+        local_dt = funding_dt.astimezone()  # конвертируем в локальный timezone
+        
+        return local_dt.hour, local_dt.minute
+    except Exception:
+        return None
 
 
 async def _sleep_until(dt_local: datetime) -> None:
@@ -671,6 +700,28 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
     except Exception:
         pass
 
+    # Получаем информацию о фандинге из API
+    funding_info = await exchange_obj.get_funding_info(p.coin)
+    if not funding_info:
+        logger.error(f"❌ Не удалось получить информацию о фандинге для {p.coin}")
+        return 2
+    
+    funding_rate = funding_info.get("funding_rate")
+    next_funding_time = funding_info.get("next_funding_time")
+    
+    if funding_rate is None:
+        logger.error(f"❌ Не удалось получить funding_rate для {p.coin}")
+        return 2
+    
+    # Заполняем параметры из API
+    p.funding_pct = float(funding_rate)
+    payout_hhmm = _next_funding_time_to_local_hhmm(next_funding_time, "bybit")
+    if payout_hhmm:
+        p.payout_hh, p.payout_mm = payout_hhmm
+    else:
+        logger.error(f"❌ Не удалось получить время следующей выплаты для {p.coin}")
+        return 2
+
     # Basic orderbook + filters + qty validation
     ticker = await exchange_obj.get_futures_ticker(p.coin)
     last_px = _ticker_last_price(ticker)
@@ -737,14 +788,14 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
         return 2
 
     # Format output
-    cmd_str = f'python fun.py "{p.coin} {p.exchange.capitalize()} {_fmt(p.coin_qty)} {_fmt(p.funding_pct*100, 3)}% {p.payout_hh:02d}:{p.payout_mm:02d} {_fmt(p.offset_pct*100, 3)}%"'
+    cmd_str = f'python fun.py "{p.coin} {p.exchange.capitalize()} {_fmt(p.coin_qty)} {_fmt(p.offset_pct*100, 3)}%"'
     sep = "=" * 60
     coin_upper = p.coin.upper()
     exchange_cap = p.exchange.capitalize()
     price_str = _fmt(last_px, 3)
     notional_str = _fmt(notional_usdt, 3)
-    funding_str = f"{_fmt(p.funding_pct*100, 3)}%"
-    payout_time_str = f"{p.payout_hh:02d}:{p.payout_mm:02d}"
+    funding_str = f"{_fmt(p.funding_pct*100, 3)}%" if p.funding_pct is not None else "N/A"
+    payout_time_str = f"{p.payout_hh:02d}:{p.payout_mm:02d}" if p.payout_hh is not None and p.payout_mm is not None else "N/A"
     offset_str = f"{_fmt(p.offset_pct*100, 3)}%"
     min_qty_str = _fmt(min_test_qty)
 
@@ -796,6 +847,11 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
     if not _is_yes(ans2):
         logger.info("Отклонено пользователем. Завершаем.")
         return 0
+
+    # Проверяем, что funding_pct и payout_hh/payout_mm заполнены из API
+    if p.funding_pct is None or p.payout_hh is None or p.payout_mm is None:
+        logger.error("❌ Не удалось получить данные о фандинге из API")
+        return 2
 
     payout_dt = _local_dt_today(p.payout_hh, p.payout_mm)
     now = datetime.now()
@@ -1066,7 +1122,7 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
 
 async def main() -> int:
     if len(sys.argv) < 2:
-        logger.error('Usage: python fun.py "STO Bybit 30 -2% 12:00 -0.3%"')
+        logger.error('Usage: python fun.py "COIN EXCHANGE QTY OFFSET%" e.g. "STO Bybit 30 -0.3%"')
         return 2
 
     cmd = " ".join(sys.argv[1:]).strip()
