@@ -648,8 +648,10 @@ async def _bybit_test_orders(bot: PerpArbitrageBot, coin: str, qty_test: float) 
         if short_entry_avg is not None and avg_exit_short is not None:
             pnl_short = (short_entry_avg - avg_exit_short) * qty_test
         logger.info(
-            f"📊 Итог (TEST): qty={_fmt(qty_test)} {coin} | "
-            f"short_entry={_fmt(short_entry_avg)} short_exit={_fmt(avg_exit_short)} | pnl_usdt={_fmt(pnl_short, 3) if pnl_short is not None else 'N/A'}"
+            f"📊 Итог (ТЕСТ): монета={coin} | кол-во={_fmt(qty_test)} | "
+            f"шорт_вход={_fmt(short_entry_avg)} | шорт_выход={_fmt(avg_exit_short)} | "
+            f"PnL_USDT_шорт={_fmt(pnl_short, 3) if pnl_short is not None else 'N/A'} | "
+            f"лонг_вход=N/A | лонг_выход=N/A | PnL_USDT_итого={_fmt(pnl_short, 3) if pnl_short is not None else 'N/A'}"
         )
         return False
     px_a = po._round_price_for_side(float(px_level_a), tick, "buy")
@@ -696,8 +698,10 @@ async def _bybit_test_orders(bot: PerpArbitrageBot, coin: str, qty_test: float) 
         if short_entry_avg is not None and avg_exit_short is not None:
             pnl_short = (short_entry_avg - avg_exit_short) * qty_test
         logger.info(
-            f"📊 Итог (TEST): qty={_fmt(qty_test)} {coin} | "
-            f"short_entry={_fmt(short_entry_avg)} short_exit={_fmt(avg_exit_short)} | pnl_usdt={_fmt(pnl_short, 3) if pnl_short is not None else 'N/A'}"
+            f"📊 Итог (ТЕСТ): монета={coin} | кол-во={_fmt(qty_test)} | "
+            f"шорт_вход={_fmt(short_entry_avg)} | шорт_выход={_fmt(avg_exit_short)} | "
+            f"PnL_USDT_шорт={_fmt(pnl_short, 3) if pnl_short is not None else 'N/A'} | "
+            f"лонг_вход=N/A | лонг_выход=N/A | PnL_USDT_итого={_fmt(pnl_short, 3) if pnl_short is not None else 'N/A'}"
         )
         return False
 
@@ -722,9 +726,11 @@ async def _bybit_test_orders(bot: PerpArbitrageBot, coin: str, qty_test: float) 
         if short_entry_avg is not None and avg_exit_short is not None:
             pnl_short = (short_entry_avg - avg_exit_short) * qty_test
         logger.info(
-            f"📊 Итог (TEST): qty={_fmt(qty_test)} {coin} | "
-            f"short_entry={_fmt(short_entry_avg)} short_exit={_fmt(avg_exit_short)} | "
-            f"long_entry=N/A long_exit={_fmt(avg_exit_long)} | pnl_usdt={_fmt(pnl_short, 3) if pnl_short is not None else 'N/A'}"
+            f"📊 Итог (ТЕСТ): монета={coin} | кол-во={_fmt(qty_test)} | "
+            f"шорт_вход={_fmt(short_entry_avg)} | шорт_выход={_fmt(avg_exit_short)} | "
+            f"PnL_USDT_шорт={_fmt(pnl_short, 3) if pnl_short is not None else 'N/A'} | "
+            f"лонг_вход=N/A | лонг_выход={_fmt(avg_exit_long)} | PnL_USDT_лонг=N/A | "
+            f"PnL_USDT_итого={_fmt(pnl_short, 3) if pnl_short is not None else 'N/A'}"
         )
         return False
     logger.info(f"✅ Тест: Long открыт | filled={_fmt(filled_l)} {coin}")
@@ -751,14 +757,16 @@ async def _bybit_test_orders(bot: PerpArbitrageBot, coin: str, qty_test: float) 
         logger.error(f"❌ Bybit test: не удалось закрыть обе позиции | short_ok={ok_s} long_ok={ok_l}")
         return False
     logger.info(f"✅ Тест: позиции закрыты | avg_close_short_buy={_fmt(avg_s)} | avg_close_long_sell={_fmt(avg_l)}")
+    pnl_short = (short_entry_avg - avg_s) * qty_test if (short_entry_avg is not None and avg_s is not None) else None
+    pnl_long = (avg_l - long_entry_avg) * qty_test if (long_entry_avg is not None and avg_l is not None) else None
     pnl_total = None
-    if short_entry_avg is not None and avg_s is not None and long_entry_avg is not None and avg_l is not None:
-        pnl_total = (short_entry_avg - avg_s) * qty_test + (avg_l - long_entry_avg) * qty_test
+    if pnl_short is not None or pnl_long is not None:
+        pnl_total = (pnl_short or 0.0) + (pnl_long or 0.0)
     logger.info(
-        f"📊 Итог (TEST): qty={_fmt(qty_test)} {coin} | "
-        f"short_entry={_fmt(short_entry_avg)} short_exit={_fmt(avg_s)} | "
-        f"long_entry={_fmt(long_entry_avg)} long_exit={_fmt(avg_l)} | "
-        f"pnl_usdt={_fmt(pnl_total, 3) if pnl_total is not None else 'N/A'}"
+        f"📊 Итог (ТЕСТ): монета={coin} | кол-во={_fmt(qty_test)} | "
+        f"шорт_вход={_fmt(short_entry_avg)} | шорт_выход={_fmt(avg_s)} | PnL_USDT_шорт={_fmt(pnl_short, 3) if pnl_short is not None else 'N/A'} | "
+        f"лонг_вход={_fmt(long_entry_avg)} | лонг_выход={_fmt(avg_l)} | PnL_USDT_лонг={_fmt(pnl_long, 3) if pnl_long is not None else 'N/A'} | "
+        f"PnL_USDT_итого={_fmt(pnl_total, 3) if pnl_total is not None else 'N/A'}"
     )
     return True
 
@@ -1197,10 +1205,10 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
         pnl_long = (avg_exit_long - long_entry_vwap) * filled_long_total if (avg_exit_long is not None and long_entry_vwap is not None and filled_long_total > 0) else 0.0
         pnl_total = (pnl_short + pnl_long) if pnl_short is not None else None
         logger.info(
-            f"📊 Итог (LIVE, partial): qty_short={_fmt(qty_trade)} qty_long={_fmt(filled_long_total)} {p.coin} | "
-            f"short_entry={_fmt(short_entry_avg)} short_exit={_fmt(avg_exit_short)} | "
-            f"long_entry={_fmt(long_entry_vwap)} long_exit={_fmt(avg_exit_long)} | "
-            f"pnl_usdt={_fmt(pnl_total, 3) if pnl_total is not None else 'N/A'}"
+            f"📊 Итог (БОЕВОЙ, частично): монета={p.coin} | кол-во_шорт={_fmt(qty_trade)} | кол-во_лонг={_fmt(filled_long_total)} | "
+            f"шорт_вход={_fmt(short_entry_avg)} | шорт_выход={_fmt(avg_exit_short)} | "
+            f"лонг_вход={_fmt(long_entry_vwap)} | лонг_выход={_fmt(avg_exit_long)} | "
+            f"PnL_USDT_итого={_fmt(pnl_total, 3) if pnl_total is not None else 'N/A'}"
         )
         return 0
 
@@ -1241,10 +1249,10 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
     pnl_long = (avg_l - long_entry_vwap) * qty_trade if (avg_l is not None and long_entry_vwap is not None) else None
     pnl_total = (pnl_short + pnl_long) if (pnl_short is not None and pnl_long is not None) else None
     logger.info(
-        f"📊 Итог (LIVE): qty={qty_trade_str} {p.coin} | "
-        f"short_entry={_fmt(short_entry_avg)} short_exit={_fmt(avg_s)} | "
-        f"long_entry={_fmt(long_entry_vwap)} long_exit={_fmt(avg_l)} | "
-        f"pnl_usdt={_fmt(pnl_total, 3) if pnl_total is not None else 'N/A'}"
+        f"📊 Итог (БОЕВОЙ): монета={p.coin} | кол-во={qty_trade_str} | "
+        f"шорт_вход={_fmt(short_entry_avg)} | шорт_выход={_fmt(avg_s)} | "
+        f"лонг_вход={_fmt(long_entry_vwap)} | лонг_выход={_fmt(avg_l)} | "
+        f"PnL_USDT_итого={_fmt(pnl_total, 3) if pnl_total is not None else 'N/A'}"
     )
     return 0
 
