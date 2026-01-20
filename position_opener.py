@@ -1164,6 +1164,12 @@ async def _prepare_exchange_for_trading(*, exchange_name: str, exchange_obj: Any
         symbol = exchange_obj._normalize_symbol(coin)
         ok, msg = await _bybit_switch_isolated_and_leverage_1(exchange_obj=exchange_obj, symbol=symbol)
         if not ok:
+            # IMPORTANT: do not block trading if Bybit Unified forbids this endpoint.
+            # retCode=100028: 'unified account is forbidden'
+            m = str(msg)
+            if "retCode': 100028" in m or "retCode\": 100028" in m or "unified account is forbidden" in m.lower():
+                logger.warning(f"⚠️ Bybit: пропускаем настройку isolated/leverage=1 для {symbol} (unified account запретил endpoint)")
+                return True
             logger.error(f"❌ Bybit: не удалось выставить isolated/leverage=1 для {symbol}: {msg}")
             return False
         return True
