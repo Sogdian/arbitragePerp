@@ -73,6 +73,7 @@ TEST_OB_LEVELS = int(os.getenv("FUN_TEST_OB_LEVELS", "15"))
 MAIN_OB_LEVELS = int(os.getenv("FUN_MAIN_OB_LEVELS", "15"))
 POLL_SEC = float(os.getenv("FUN_POLL_SEC", "0.2"))
 SHORT_OPEN_LEVELS = int(os.getenv("FUN_SHORT_OPEN_LEVELS", "10"))
+LONG_OPEN_MAX_SEC = float(os.getenv("FUN_LONG_OPEN_MAX_SEC", "3.0"))
 NEWS_DAYS_BACK = int(os.getenv("FUN_NEWS_DAYS_BACK", "60"))
 BALANCE_BUFFER_USDT = float(os.getenv("FUN_BALANCE_BUFFER_USDT", "0"))
 
@@ -1292,8 +1293,12 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
     filled_long_total = 0.0
     long_fills: List[Tuple[float, Optional[float]]] = []  # (filled_qty, avg_px)
     long_attempts = max(1, MAIN_OB_LEVELS)
+    long_start = time.time()
 
     for attempt in range(1, long_attempts + 1):
+        if time.time() - long_start > max(0.1, float(LONG_OPEN_MAX_SEC)):
+            logger.warning(f"⚠️ Long: превышено время ожидания открытия ({_fmt(LONG_OPEN_MAX_SEC)}s) — прекращаем попытки")
+            break
         if remaining <= max(1e-10, qty_trade * 1e-8):
             break
 
@@ -1302,13 +1307,10 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
             logger.error("❌ Bybit: orderbook недоступен для Long попытки")
             break
         best_ask = float(ob_l["asks"][0][0])
-        if best_ask > long_px + 1e-12:
-            logger.info(f"Long попытка {attempt}/{long_attempts}: лучшая ask={_fmt(best_ask)} выше long_price={long_px_str} -> ждём")
-            await asyncio.sleep(POLL_SEC)
-            continue
+        # ВАЖНО: не "ждём" как раньше. Делаем реальную IOC-попытку (как в тесте) — это быстрее и безопаснее.
 
         qty_rem_str = po._format_by_step(remaining, qty_step_raw)
-        logger.info(f"📥 Long попытка {attempt}/{long_attempts} (Buy IOC) | qty={qty_rem_str} | limit={long_px_str}")
+        logger.info(f"📥 Long попытка {attempt}/{long_attempts} (Buy IOC) | qty={qty_rem_str} | limit={long_px_str} | лучшая_ask={_fmt(best_ask)}")
         try:
             try:
                 long_order_id = await _bybit_place_limit(
@@ -1346,7 +1348,7 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
             api_secret=api_secret,
             coin=p.coin,
             order_id=str(long_order_id),
-            timeout_sec=8.0,
+            timeout_sec=1.6,
         )
         if filled_l and filled_l > 0:
             long_fills.append((float(filled_l), avg_px_l))
