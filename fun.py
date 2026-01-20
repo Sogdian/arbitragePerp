@@ -599,7 +599,7 @@ async def _bybit_test_orders(bot: PerpArbitrageBot, coin: str, qty_test: float) 
     if not ok_full:
         logger.error(f"❌ Bybit test: Short не исполнился полностью | filled={_fmt(filled)}")
         return False
-    logger.info(f"✅ Тест: Short открыт | order={short_order_id} | filled={_fmt(filled)} {coin}")
+    logger.info(f"✅ Тест: Short открыт | filled={_fmt(filled)} {coin}")
 
     # 2) Open test Long (Buy) after short is opened, at best ask (FOK) for the same qty
     asks = ob["asks"][:TEST_OB_LEVELS]
@@ -656,7 +656,7 @@ async def _bybit_test_orders(bot: PerpArbitrageBot, coin: str, qty_test: float) 
         await po._bybit_close_leg_partial_ioc(exchange_obj=exchange_obj, coin=coin, position_direction="short", coin_amount=qty_test)
         await po._bybit_close_leg_partial_ioc(exchange_obj=exchange_obj, coin=coin, position_direction="long", coin_amount=qty_test)
         return False
-    logger.info(f"✅ Тест: Long открыт | order={long_order_id} | filled={_fmt(filled_l)} {coin}")
+    logger.info(f"✅ Тест: Long открыт | filled={_fmt(filled_l)} {coin}")
 
     # 3) Close both test positions at best prices from orderbook (IOC reduceOnly, partial allowed)
     logger.info("🧪 Тест: закрываем обе позиции (Short+Long) по стакану")
@@ -968,7 +968,7 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
 
     qty_trade = float(filled_s)
     qty_trade_str = po._format_by_step(qty_trade, qty_step_raw)
-    logger.info(f"✅ Short открыт | order={short_order_id} | qty={qty_trade_str} | entry~{px_short_str}")
+    logger.info(f"✅ Short открыт | qty={qty_trade_str} | entry~{px_short_str}")
 
     # Stop loss for short at entry price (best bid used for short)
     sl_order_id: Optional[str] = None

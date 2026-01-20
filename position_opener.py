@@ -240,7 +240,7 @@ async def open_long_short_positions(
             f"Биржа шорт: {short_exchange}, Цена входа Short: {_format_number(short_px)}, "
             f"Количество монет: {_format_number(coin_amount)}, Спред открытия: {spread_str}"
         )
-        logger.info(f"✅ Позиции открыты: {coin} | Long {long_exchange} (order={long_res.order_id}) | Short {short_exchange} (order={short_res.order_id})")
+        logger.info(f"✅ Позиции открыты: {coin} | Long {long_exchange} | Short {short_exchange}")
     else:
         if (long_res.ok and long_filled_ok) and not (short_res.ok and short_filled_ok):
             logger.error(f"⚠️ Открыта только Long позиция: {coin} | Long ok=True | Short ok=False")
@@ -367,6 +367,8 @@ async def _bybit_close_leg_partial_ioc(
     tick = float(tick_raw) if tick_raw else 0.0
 
     side_close = "Sell" if pos_dir == "long" else "Buy"
+    # Bybit accounts can be in hedge-mode (requires positionIdx) or one-way mode (positionIdx must be omitted).
+    use_position_idx: Optional[int] = position_idx
     remaining = float(coin_amount)
     eps = max(1e-10, remaining * 1e-8)
 
@@ -420,12 +422,36 @@ async def _bybit_close_leg_partial_ioc(
                 # Важно: не открывать новую позицию, а уменьшать существующую.
                 "reduceOnly": True,
             }
-            if position_idx is not None:
-                body["positionIdx"] = int(position_idx)
-            data = await _bybit_private_post(exchange_obj=exchange_obj, api_key=api_key, api_secret=api_secret, path="/v5/order/create", body=body)
+            if use_position_idx is not None:
+                body["positionIdx"] = int(use_position_idx)
+
+            data = await _bybit_private_post(
+                exchange_obj=exchange_obj,
+                api_key=api_key,
+                api_secret=api_secret,
+                path="/v5/order/create",
+                body=body,
+            )
             if not isinstance(data, dict) or data.get("retCode") != 0:
-                logger.error(f"❌ Bybit close: api error: {data}")
-                return False, None
+                # If account is in one-way mode, Bybit returns retCode=10001 for requests with positionIdx.
+                if isinstance(data, dict) and data.get("retCode") in (10001, 110017) and use_position_idx is not None:
+                    use_position_idx = None
+                    body.pop("positionIdx", None)
+                    data = await _bybit_private_post(
+                        exchange_obj=exchange_obj,
+                        api_key=api_key,
+                        api_secret=api_secret,
+                        path="/v5/order/create",
+                        body=body,
+                    )
+
+                if not isinstance(data, dict) or data.get("retCode") != 0:
+                    # retCode=110017: "current position is zero" — already flat, treat as success for best-effort close.
+                    if isinstance(data, dict) and data.get("retCode") == 110017:
+                        avg_price = total_notional / total_filled if total_filled > 0 else None
+                        return True, avg_price
+                    logger.error(f"❌ Bybit close: api error: {data}")
+                    return False, None
 
             order_id = (data.get("result") or {}).get("orderId") if isinstance(data.get("result"), dict) else None
             if not order_id:
@@ -1291,14 +1317,14 @@ async def _bybit_wait_full_fill(*, planned: Dict[str, Any], order_id: str) -> Tu
             except Exception:
                 filled = 0.0
             if status.lower() in ("filled", "cancelled", "canceled", "rejected", "partiallyfilled", "partially_filled"):
-                logger.info(f"Bybit: статус ордера {order_id}: {status} | исполнено={_format_number(filled)} | требовалось={_format_number(qty_req)}")
+                logger.info(f"Bybit: статус ордера: {status} | исполнено={_format_number(filled)} | требовалось={_format_number(qty_req)}")
                 return (filled + eps >= qty_req), filled
 
         await asyncio.sleep(0.2)
 
     # если ничего не нашли — это скорее проблема доступа/подписи/ответа API
     tail = f" | last_error={last_err}" if last_err else ""
-    logger.error(f"Bybit fill check: не удалось получить статус ордера {order_id} (symbol={symbol}){tail}")
+    logger.error(f"Bybit fill check: не удалось получить статус ордера (symbol={symbol}){tail}")
     return False, 0.0
 
 
