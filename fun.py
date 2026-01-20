@@ -74,6 +74,8 @@ MAIN_OB_LEVELS = int(os.getenv("FUN_MAIN_OB_LEVELS", "15"))
 POLL_SEC = float(os.getenv("FUN_POLL_SEC", "0.2"))
 SHORT_OPEN_LEVELS = int(os.getenv("FUN_SHORT_OPEN_LEVELS", "10"))
 LONG_OPEN_MAX_SEC = float(os.getenv("FUN_LONG_OPEN_MAX_SEC", "3.0"))
+OPEN_LEAD_MS = int(os.getenv("FUN_OPEN_LEAD_MS", "150"))
+FIX_KLINE_INTERVAL = str(os.getenv("FUN_FIX_KLINE_INTERVAL", "1") or "1").strip()
 NEWS_DAYS_BACK = int(os.getenv("FUN_NEWS_DAYS_BACK", "60"))
 BALANCE_BUFFER_USDT = float(os.getenv("FUN_BALANCE_BUFFER_USDT", "0"))
 
@@ -203,7 +205,17 @@ async def _sleep_until(dt_local: datetime) -> None:
         sec = (dt_local - now).total_seconds()
         if sec <= 0:
             return
-        await asyncio.sleep(min(0.2, sec))
+        # Более точное ожидание (особенно на Windows), чтобы не просыпаться на +200ms.
+        if sec > 1.0:
+            await asyncio.sleep(0.2)
+        elif sec > 0.2:
+            await asyncio.sleep(0.05)
+        elif sec > 0.05:
+            await asyncio.sleep(0.01)
+        elif sec > 0.01:
+            await asyncio.sleep(0.002)
+        else:
+            await asyncio.sleep(min(0.001, sec))
 
 
 def _ticker_last_price(t: Optional[Dict[str, Any]]) -> Optional[float]:
@@ -610,6 +622,78 @@ async def _bybit_last_trade_price_before(*, exchange_obj: Any, coin: str, before
             best_px = px
     return best_px
 
+
+async def _bybit_fetch_kline(
+    *,
+    exchange_obj: Any,
+    coin: str,
+    interval: str,
+    start_ms: int,
+    end_ms: int,
+    limit: int = 200,
+) -> List[List[Any]]:
+    """
+    Bybit v5: /v5/market/kline
+    Returns list of arrays: [startTime, open, high, low, close, volume, turnover]
+    """
+    try:
+        symbol = exchange_obj._normalize_symbol(coin)
+        params: Dict[str, Any] = {
+            "category": "linear",
+            "symbol": symbol,
+            "interval": str(interval),
+            "start": int(max(0, start_ms)),
+            "end": int(max(0, end_ms)),
+            "limit": int(max(1, min(1000, limit))),
+        }
+        data = await exchange_obj._request_json("GET", "/v5/market/kline", params=params)
+        if not (isinstance(data, dict) and data.get("retCode") == 0):
+            return []
+        items = ((data.get("result") or {}).get("list") or [])
+        return items if isinstance(items, list) else []
+    except Exception:
+        return []
+
+
+async def _bybit_kline_close_for_minute_ending_at(
+    *,
+    exchange_obj: Any,
+    coin: str,
+    end_ms_inclusive: int,
+) -> Optional[float]:
+    """
+    Best-effort: returns 1m candle close for the minute that ends at end_ms_inclusive (e.g. 19:59:59.xxx).
+    """
+    # Determine minute start
+    minute_start_ms = int(end_ms_inclusive - (end_ms_inclusive % 60_000))
+    items = await _bybit_fetch_kline(
+        exchange_obj=exchange_obj,
+        coin=coin,
+        interval=FIX_KLINE_INTERVAL,
+        start_ms=minute_start_ms,
+        end_ms=minute_start_ms + 60_000,
+        limit=10,
+    )
+    best_close: Optional[float] = None
+    best_start: Optional[int] = None
+    for it in items:
+        if not isinstance(it, list) or len(it) < 5:
+            continue
+        try:
+            st = int(float(it[0]))
+        except Exception:
+            continue
+        if st != minute_start_ms:
+            continue
+        try:
+            close_px = float(it[4])
+        except Exception:
+            continue
+        if close_px > 0:
+            best_start = st
+            best_close = close_px
+            break
+    return best_close
 
 def _bybit_calc_pnl_usdt_from_execs(execs: List[Dict[str, Any]]) -> Tuple[Optional[float], int, int, Optional[float], Optional[float]]:
     """
@@ -1112,11 +1196,14 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
 
     t_fix = await exchange_obj.get_futures_ticker(p.coin)
     close_price = _ticker_last_price(t_fix)
-    # Best-effort: try to align with UI by using last trade price at/before fix timestamp (if available)
+    # Best-effort: align with UI by using candle close (minute 19:59) and/or last trade at/before fix timestamp.
     try:
         fix_ms = int(fix_dt.timestamp() * 1000)
+        kline_close = await _bybit_kline_close_for_minute_ending_at(exchange_obj=exchange_obj, coin=p.coin, end_ms_inclusive=fix_ms)
+        if kline_close is not None and kline_close > 0:
+            close_price = float(kline_close)
         trade_px = await _bybit_last_trade_price_before(exchange_obj=exchange_obj, coin=p.coin, before_ms=fix_ms)
-        if trade_px is not None and trade_px > 0:
+        if (kline_close is None or kline_close <= 0) and trade_px is not None and trade_px > 0:
             close_price = float(trade_px)
     except Exception:
         pass
@@ -1137,32 +1224,35 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
         f"(funding={_fmt(p.funding_pct*100,3)}%, offset={_fmt(p.offset_pct*100,3)}%)"
     )
 
-    logger.info(f"⏳ Ждём времени выплаты: {payout_dt.strftime('%H:%M:%S')} (локальное время)")
-    await _sleep_until(payout_dt)
+    # Подготовка к открытию чуть заранее (чтобы не терять 0.5-1.5s на API после 20:00:00)
+    pre_open_dt = payout_dt - timedelta(milliseconds=max(0, int(OPEN_LEAD_MS)))
+    logger.info(f"⏳ Ждём подготовки к открытию: {pre_open_dt.strftime('%H:%M:%S')} (локальное время)")
+    await _sleep_until(pre_open_dt)
 
-    # At payout: check last price is still above target (per TЗ)
+    # Check last price near payout (best-effort) to avoid opening if already below target.
     t_now = await exchange_obj.get_futures_ticker(p.coin)
     last_now = _ticker_last_price(t_now)
     if last_now is None or last_now <= 0:
-        logger.error("❌ Не удалось получить Last price в момент открытия")
+        logger.error("❌ Не удалось получить Last price перед открытием")
         return 2
     if last_now <= long_target_price:
-        logger.warning(
-            f"⚠️ Last price уже ниже/равен уровню long_target — не открываем сделку | last={_fmt(last_now)} <= target={_fmt(long_target_price)}"
-        )
+        logger.warning(f"⚠️ Last price уже ниже/равен уровню long_target — не открываем сделку | last={_fmt(last_now)} <= target={_fmt(long_target_price)}")
         return 0
 
-    # Prepare trading settings (isolated + leverage 1)
+    # Prepare trading settings (isolated + leverage 1) BEFORE payout time
     ok_prep = await po._prepare_exchange_for_trading(exchange_name="bybit", exchange_obj=exchange_obj, coin=p.coin)
     if not ok_prep:
         logger.error("❌ Не удалось подготовить торговые параметры (isolated/leverage=1)")
         return 2
 
-    # Refresh orderbook and compute short limit price for full fill (within first 15 levels)
+    # Snapshot orderbook BEFORE payout, so we can send the order at 20:00:00 with minimal delay.
     ob2 = await exchange_obj.get_orderbook(p.coin, limit=MAIN_OB_LEVELS)
     if not ob2 or not ob2.get("bids") or not ob2.get("asks"):
         logger.error("❌ Bybit: orderbook недоступен для открытия")
         return 2
+
+    logger.info(f"⏳ Ждём времени выплаты: {payout_dt.strftime('%H:%M:%S')} (локальное время)")
+    await _sleep_until(payout_dt)
 
     f = await _bybit_get_filters(exchange_obj, p.coin)
     tick_raw = f.get("tickSize")
