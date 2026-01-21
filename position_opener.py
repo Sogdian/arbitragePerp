@@ -111,9 +111,12 @@ def _round_price_for_side(price: float, tick: float, side: str) -> float:
     - Buy: округляем ВВЕРХ к tick (не ниже ask)
     - Sell: округляем ВНИЗ к tick (не выше bid)
     """
+    price = float(price)
+    tick = float(tick)
     if tick <= 0:
         return price
-    if side.lower() in ("buy", "long"):
+    s = (side or "").lower().strip()
+    if s in ("buy", "long"):
         return _ceil_to_step(price, tick)
     return _floor_to_step(price, tick)
 
@@ -346,7 +349,16 @@ async def _bybit_close_leg_partial_ioc(
 ) -> Tuple[bool, Optional[float]]:
     """
     Закрытие позиции на Bybit частями: limit + IOC + reduceOnly.
-    position_direction: "long" (закрываем Sell) или "short" (закрываем Buy).
+
+    ИСПРАВЛЕНО под твою стратегию:
+    - не делаем "remaining" по каждому уровню;
+    - выбираем ОДНУ цену: минимальный уровень, где cum_volume >= remaining,
+      и отправляем 1 IOC reduceOnly на остаток;
+    - если частично исполнилось — повторяем с новым стаканом.
+
+    position_direction:
+      "long"  -> закрываем Sell (reduceOnly)
+      "short" -> закрываем Buy  (reduceOnly)
     """
     api_key = _get_env("BYBIT_API_KEY")
     api_secret = _get_env("BYBIT_API_SECRET")
@@ -359,27 +371,36 @@ async def _bybit_close_leg_partial_ioc(
         logger.error(f"❌ Bybit: некорректное направление позиции: {position_direction!r}")
         return False, None
 
+    remaining = float(coin_amount)
+    if remaining <= 0:
+        return True, None
+
     symbol = exchange_obj._normalize_symbol(coin)
     f = await _bybit_fetch_instrument_filters(exchange_obj=exchange_obj, symbol=symbol)
+
     qty_step_raw = f.get("qtyStep")
     tick_raw = f.get("tickSize")
+
     qty_step = float(qty_step_raw) if qty_step_raw else 0.0
     tick = float(tick_raw) if tick_raw else 0.0
 
     side_close = "Sell" if pos_dir == "long" else "Buy"
-    # Bybit accounts can be in hedge-mode (requires positionIdx) or one-way mode (positionIdx must be omitted).
+    price_side = "sell" if side_close == "Sell" else "buy"
+
+    # Hedge-mode может требовать positionIdx, one-way — запрещает его
     use_position_idx: Optional[int] = position_idx
-    remaining = float(coin_amount)
+
     eps = max(1e-10, remaining * 1e-8)
 
-    # Отслеживаем среднюю цену исполнения (VWAP)
+    # Best-effort VWAP (точнее считать по execPrice из executions, но пока достаточно)
     total_notional = 0.0
     total_filled = 0.0
 
     max_orders_total = max(10, MAX_ORDERBOOK_LEVELS * 3)
+
     for order_n in range(1, max_orders_total + 1):
         if remaining <= eps:
-            avg_price = total_notional / total_filled if total_filled > 0 else None
+            avg_price = (total_notional / total_filled) if total_filled > 0 else None
             return True, avg_price
 
         ob = await exchange_obj.get_orderbook(coin, limit=MAX_ORDERBOOK_LEVELS)
@@ -388,97 +409,108 @@ async def _bybit_close_leg_partial_ioc(
             return False, None
 
         levels = ob["bids"] if side_close == "Sell" else ob["asks"]
-        filled_any = 0.0
+        if not isinstance(levels, list) or not levels:
+            logger.error(f"❌ Bybit: пустой стакан для закрытия {coin}")
+            return False, None
 
-        for lvl_i, lvl in enumerate(levels[:MAX_ORDERBOOK_LEVELS], start=1):
+        # 1) Подбираем цену уровня, где cum >= remaining
+        px_level, cum = _price_level_for_target_size(levels[:MAX_ORDERBOOK_LEVELS], remaining)
+        if px_level is None:
+            # Недостаточно ликвидности в окне — берём последний доступный уровень (самый "плохой" для нас)
             try:
-                px_raw = float(lvl[0])
+                px_level = float(levels[min(len(levels), MAX_ORDERBOOK_LEVELS) - 1][0])
             except Exception:
-                continue
-            if px_raw <= 0:
-                continue
-
-            qty_to_send = remaining
-            if qty_step > 0:
-                # не подгоняем в большую сторону — только форматируем по шагу
-                qty_str = _format_by_step(qty_to_send, qty_step_raw)
-            else:
-                qty_str = str(qty_to_send)
-
-            px = _round_price_for_side(px_raw, tick, "sell" if side_close == "Sell" else "buy")
-            px_str = _format_by_step(px, tick_raw)
-
-            logger.info(f"Bybit close: ордер {order_n}/{max_orders_total} | lvl {lvl_i}/{MAX_ORDERBOOK_LEVELS} | side={side_close} qty={qty_str} | лимит={px_str}")
-
-            body = {
-                "category": "linear",
-                "symbol": symbol,
-                "side": side_close,
-                "orderType": "Limit",
-                "qty": qty_str,
-                "price": px_str,
-                # Частичное исполнение допускается — используем IOC.
-                "timeInForce": "IOC",
-                # Важно: не открывать новую позицию, а уменьшать существующую.
-                "reduceOnly": True,
-            }
-            if use_position_idx is not None:
-                body["positionIdx"] = int(use_position_idx)
-
-            data = await _bybit_private_post(
-                exchange_obj=exchange_obj,
-                api_key=api_key,
-                api_secret=api_secret,
-                path="/v5/order/create",
-                body=body,
-            )
-            if not isinstance(data, dict) or data.get("retCode") != 0:
-                # If account is in one-way mode, Bybit returns retCode=10001 for requests with positionIdx.
-                if isinstance(data, dict) and data.get("retCode") in (10001, 110017) and use_position_idx is not None:
-                    use_position_idx = None
-                    body.pop("positionIdx", None)
-                    data = await _bybit_private_post(
-                        exchange_obj=exchange_obj,
-                        api_key=api_key,
-                        api_secret=api_secret,
-                        path="/v5/order/create",
-                        body=body,
-                    )
-
-                if not isinstance(data, dict) or data.get("retCode") != 0:
-                    # retCode=110017: "current position is zero" — already flat, treat as success for best-effort close.
-                    if isinstance(data, dict) and data.get("retCode") == 110017:
-                        avg_price = total_notional / total_filled if total_filled > 0 else None
-                        return True, avg_price
-                    logger.error(f"❌ Bybit close: api error: {data}")
-                    return False, None
-
-            order_id = (data.get("result") or {}).get("orderId") if isinstance(data.get("result"), dict) else None
-            if not order_id:
-                logger.error(f"❌ Bybit close: no orderId in response: {data}")
+                logger.error(f"❌ Bybit: не удалось взять последний уровень стакана для закрытия {coin}")
                 return False, None
 
-            ok_full, filled = await _bybit_wait_full_fill(
-                planned={"exchange_obj": exchange_obj, "api_key": api_key, "api_secret": api_secret, "symbol": symbol, "qty": qty_str},
-                order_id=str(order_id),
+        # 2) Кол-во: НИКОГДА не округлять вверх (иначе reduceOnly может упасть / частично открыть обратную сторону)
+        qty_send = remaining
+        if qty_step > 0:
+            qty_send = _floor_to_step(qty_send, qty_step)
+            if qty_send <= 0:
+                # остаток меньше шага — считаем позицию закрытой best-effort
+                avg_price = (total_notional / total_filled) if total_filled > 0 else None
+                return True, avg_price
+
+        qty_str = _format_by_step(qty_send, qty_step_raw) if qty_step > 0 else str(qty_send)
+
+        # 3) Цена: агрессивно округляем по tick
+        px = _round_price_for_side(float(px_level), tick, price_side)
+        px_str = _format_by_step(px, tick_raw) if tick > 0 else str(px)
+
+        logger.info(
+            f"Bybit close: ордер {order_n}/{max_orders_total} | side={side_close} qty={qty_str} | "
+            f"лимит={px_str} | remaining={_format_number(remaining)} | cum={_format_number(cum)}"
+        )
+
+        body = {
+            "category": "linear",
+            "symbol": symbol,
+            "side": side_close,
+            "orderType": "Limit",
+            "qty": qty_str,
+            "price": px_str,
+            "timeInForce": "IOC",
+            "reduceOnly": True,
+        }
+        if use_position_idx is not None:
+            body["positionIdx"] = int(use_position_idx)
+
+        data = await _bybit_private_post(
+            exchange_obj=exchange_obj,
+            api_key=api_key,
+            api_secret=api_secret,
+            path="/v5/order/create",
+            body=body,
+        )
+
+        if not isinstance(data, dict) or data.get("retCode") != 0:
+            # one-way: positionIdx нельзя, пробуем без него
+            if isinstance(data, dict) and data.get("retCode") in (10001, 110017) and use_position_idx is not None:
+                use_position_idx = None
+                body.pop("positionIdx", None)
+                data = await _bybit_private_post(
+                    exchange_obj=exchange_obj,
+                    api_key=api_key,
+                    api_secret=api_secret,
+                    path="/v5/order/create",
+                    body=body,
+                )
+
+            if not isinstance(data, dict) or data.get("retCode") != 0:
+                # retCode=110017: position is zero — уже закрыто
+                if isinstance(data, dict) and data.get("retCode") == 110017:
+                    avg_price = (total_notional / total_filled) if total_filled > 0 else None
+                    return True, avg_price
+                logger.error(f"❌ Bybit close: api error: {data}")
+                return False, None
+
+        order_id = (data.get("result") or {}).get("orderId") if isinstance(data.get("result"), dict) else None
+        if not order_id:
+            logger.error(f"❌ Bybit close: no orderId in response: {data}")
+            return False, None
+
+        ok_full, filled = await _bybit_wait_full_fill(
+            planned={"exchange_obj": exchange_obj, "api_key": api_key, "api_secret": api_secret, "symbol": symbol, "qty": qty_str},
+            order_id=str(order_id),
+        )
+
+        if filled and float(filled) > 0:
+            filled_q = float(filled)
+            total_notional += filled_q * float(px)   # best-effort
+            total_filled += filled_q
+            remaining = max(0.0, remaining - filled_q)
+
+            logger.info(
+                f"Bybit close: исполнено={_format_number(filled_q)} {coin} | осталось={_format_number(remaining)} {coin} | full={ok_full}"
             )
-
-            if filled and filled > 0:
-                filled_any = float(filled)
-                # Обновляем VWAP: добавляем notional и filled для этого ордера
-                total_notional += filled_any * px
-                total_filled += filled_any
-                remaining = max(0.0, remaining - filled_any)
-                logger.info(f"Bybit close: исполнено={_format_number(filled_any)} {coin} | осталось={_format_number(remaining)} {coin} | full={ok_full}")
-                break  # обновим стакан и продолжим закрывать остаток
-
-        if filled_any <= 0:
-            logger.warning(f"Bybit close: 0 исполнено по уровням 1-{MAX_ORDERBOOK_LEVELS} | осталось={_format_number(remaining)} {coin}")
-            # не крутимся бесконечно — попробуем еще раз на новом стакане
             continue
 
+        logger.warning(f"Bybit close: 0 исполнено (IOC) | осталось={_format_number(remaining)} {coin}")
+        continue
+
     logger.error(f"❌ Bybit close: не удалось закрыть позицию полностью | осталось={_format_number(remaining)} {coin}")
-    avg_price = total_notional / total_filled if total_filled > 0 else None
+    avg_price = (total_notional / total_filled) if total_filled > 0 else None
     return False, avg_price
 
 
