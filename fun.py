@@ -83,7 +83,7 @@ FAST_PREP_LEAD_SEC = float(os.getenv("FUN_FAST_PREP_LEAD_SEC", "2.0"))  # do pre
 FAST_CLOSE_DELAY_SEC = float(os.getenv("FUN_FAST_CLOSE_DELAY_SEC", "1.0"))  # start closing at payout+1s
 FAST_CLOSE_MAX_ATTEMPTS = int(os.getenv("FUN_FAST_CLOSE_MAX_ATTEMPTS", "15"))
 FAST_SILENT_TRADING = int(os.getenv("FUN_FAST_SILENT_TRADING", "1"))  # 1 => disable logging during open/close window
-FAST_OPEN_LEAD_MS = int(os.getenv("FUN_FAST_OPEN_LEAD_MS", "150"))  # send open slightly BEFORE payout to avoid lag
+FAST_OPEN_LEAD_MS = int(os.getenv("FUN_FAST_OPEN_LEAD_MS", "300"))  # send open slightly BEFORE payout to avoid lag
 FIX_PRICE_MODE = str(os.getenv("FUN_FIX_PRICE_MODE", "last") or "last").strip().lower()
 # Default OFF: user asked to avoid market for opening in live mode.
 SHORT_OPEN_FALLBACK_MARKET = int(os.getenv("FUN_SHORT_OPEN_FALLBACK_MARKET", "0"))
@@ -1274,17 +1274,17 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
         logger.error(f"❌ Недостаточно ликвидности в asks (1-{MAIN_OB_LEVELS}) | need={_fmt(p.coin_qty)} {p.coin} | available={_fmt(cum_asks)}")
         return 2
 
-    # Balance check (best-effort): estimate required USDT for isolated 1x opening both legs.
-    # We use worst prices from the current 15-level window.
+    # Balance check (best-effort): estimate required USDT for isolated 1x opening Short only (live mode).
+    # We use worst price from the current 15-level window for Short entry.
     bid_entry_est = float(px_short_level)
-    ask_worst_est = float(asks[min(len(asks), MAIN_OB_LEVELS) - 1][0]) if asks else float(px_long_level)
-    required_usdt = float(p.coin_qty) * (max(0.0, bid_entry_est) + max(0.0, ask_worst_est)) + max(0.0, BALANCE_BUFFER_USDT)
+    # Live mode: only Short is opened, so we need balance for Short only (not Long+Short).
+    required_usdt = float(p.coin_qty) * max(0.0, bid_entry_est) + max(0.0, BALANCE_BUFFER_USDT)
     avail_usdt = await _bybit_get_usdt_available(exchange_obj=exchange_obj, api_key=api_key, api_secret=api_secret)
     if avail_usdt is None:
         logger.error("❌ Не удалось получить баланс USDT на Bybit (wallet-balance). Останавливаемся для безопасности.")
         return 2
     if avail_usdt + 1e-6 < required_usdt:
-        logger.error(f"❌ Недостаточно баланса USDT | доступно={_fmt(avail_usdt, 3)} | нужно~{_fmt(required_usdt, 3)} (isolated 1x, оценка по стакану)")
+        logger.error(f"❌ Недостаточно баланса USDT | доступно={_fmt(avail_usdt, 3)} | нужно~{_fmt(required_usdt, 3)} (isolated 1x, только Short, оценка по стакану)")
         return 2
 
     # Check liquidity for Long (entry_long mode)
