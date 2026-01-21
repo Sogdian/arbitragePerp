@@ -85,6 +85,12 @@ FAST_CLOSE_MAX_ATTEMPTS = int(os.getenv("FUN_FAST_CLOSE_MAX_ATTEMPTS", "15"))
 FAST_SILENT_TRADING = int(os.getenv("FUN_FAST_SILENT_TRADING", "1"))  # 1 => disable logging during open/close window
 FAST_OPEN_LEAD_MS = int(os.getenv("FUN_FAST_OPEN_LEAD_MS", "300"))  # send open slightly BEFORE payout to avoid lag (deprecated, use OPEN_AFTER_MS)
 OPEN_AFTER_MS = int(os.getenv("FUN_OPEN_AFTER_MS", "10"))  # открыть ПОСЛЕ payout (в мс)
+# Safety for open Sell IOC without querying orderbook at send time
+OPEN_SAFETY_BPS = float(os.getenv("FUN_OPEN_SAFETY_BPS", "10"))  # 10 bps = 0.10%
+OPEN_SAFETY_MIN_TICKS = int(os.getenv("FUN_OPEN_SAFETY_MIN_TICKS", "3"))  # min ticks below best_bid_fix
+# Late-start tolerance for server-time scheduling (avoid false aborts on Windows/jitter)
+LATE_TOL_MS = int(os.getenv("FUN_LATE_TOL_MS", "400"))  # 300-500ms recommended
+BALANCE_FEE_SAFETY_BPS = float(os.getenv("FUN_BALANCE_FEE_SAFETY_BPS", "20"))  # 20 bps = 0.20% safety
 FIX_PRICE_MODE = str(os.getenv("FUN_FIX_PRICE_MODE", "last") or "last").strip().lower()
 # Default OFF: user asked to avoid market for opening in live mode.
 SHORT_OPEN_FALLBACK_MARKET = int(os.getenv("FUN_SHORT_OPEN_FALLBACK_MARKET", "0"))
@@ -176,70 +182,39 @@ def _local_dt_today(hh: int, mm: int) -> datetime:
     now = datetime.now()
     return now.replace(hour=hh, minute=mm, second=0, microsecond=0)
 
-
-def _next_funding_time_to_local_hhmm(next_funding_time: Optional[int], exchange: str) -> Optional[Tuple[int, int]]:
+def _normalize_epoch_ms(x: Any) -> Optional[int]:
     """
-    Преобразует timestamp следующей выплаты фандинга в локальное время (HH, MM).
-    
-    Args:
-        next_funding_time: Timestamp следующей выплаты (в миллисекундах для Bybit/Binance, в секундах для Gate)
-        exchange: Название биржи
-        
-    Returns:
-        Кортеж (HH, MM) или None если невозможно вычислить
+    Универсальный нормализатор epoch времени:
+    - ns -> ms
+    - ms -> ms
+    - seconds -> ms
     """
-    if next_funding_time is None:
+    if x is None:
         return None
-    
     try:
-        # Bybit и Binance возвращают timestamp в миллисекундах
-        # Gate возвращает в секундах
-        if exchange.lower() == "gate":
-            # Gate: timestamp в секундах
-            funding_timestamp = next_funding_time
-        else:
-            # Bybit, Binance: timestamp в миллисекундах
-            funding_timestamp = next_funding_time / 1000
-        
-        # Преобразуем в локальное время
-        funding_dt = datetime.fromtimestamp(funding_timestamp, tz=timezone.utc)
-        local_dt = funding_dt.astimezone()  # конвертируем в локальный timezone
-        
-        return local_dt.hour, local_dt.minute
+        v = int(float(x))
     except Exception:
         return None
+    # ns -> ms
+    if v >= 10**17:
+        return int(v // 1_000_000)
+    # ms
+    if v >= 10**12:
+        return int(v)
+    # seconds -> ms
+    if v >= 10**9:
+        return int(v * 1000)
+    return None
 
 
-async def _sleep_until(dt_local: datetime) -> None:
-    """
-    Best-effort precise sleep for local (naive) datetime.
-    On Windows `asyncio.sleep()` can overshoot; we use dynamic sleeps and a short busy-wait tail.
-    """
-    # Coarse sleep with a safety margin, then a short busy-wait for the last ~20ms.
-    while True:
-        now = datetime.now()
-        sec = (dt_local - now).total_seconds()
-        if sec <= 0:
-            return
-        if sec > 1.0:
-            await asyncio.sleep(min(0.5, max(0.05, sec - 0.6)))
-            continue
-        if sec > 0.2:
-            await asyncio.sleep(max(0.02, sec - 0.12))
-            continue
-        if sec > 0.05:
-            await asyncio.sleep(max(0.005, sec - 0.03))
-            continue
-        if sec > 0.02:
-            await asyncio.sleep(max(0.001, sec / 2))
-            continue
-
-        # Busy-wait tail (keep short to avoid burning CPU).
-        deadline = time.perf_counter() + max(0.0, sec)
-        while time.perf_counter() < deadline:
-            # 1ms granularity works reasonably on Windows when timer resolution is coarse.
-            time.sleep(0.001)
-        return
+def _epoch_ms_to_local_hhmm(ms: Optional[int]) -> Optional[Tuple[int, int]]:
+    if ms is None:
+        return None
+    try:
+        dt = datetime.fromtimestamp(float(ms) / 1000.0, tz=timezone.utc).astimezone()
+        return dt.hour, dt.minute
+    except Exception:
+        return None
 
 
 async def _sleep_until_epoch_ms(target_epoch_ms: int) -> None:
@@ -1361,22 +1336,12 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
     
     # Заполняем параметры из API
     p.funding_pct = float(funding_rate)
-    try:
-        raw_time = int(next_funding_time) if next_funding_time is not None else None
-        if raw_time is not None:
-            # Sanity-check: если число слишком маленькое (< 10^13), похоже на seconds, а не ms
-            if raw_time < 10_000_000_000_000:
-                raw_time = raw_time * 1000
-            p.next_funding_time_ms = raw_time
-        else:
-            p.next_funding_time_ms = None
-    except Exception:
-        p.next_funding_time_ms = None
-    payout_hhmm = _next_funding_time_to_local_hhmm(p.next_funding_time_ms, "bybit")
+    p.next_funding_time_ms = _normalize_epoch_ms(next_funding_time)
+    payout_hhmm = _epoch_ms_to_local_hhmm(p.next_funding_time_ms)
     if payout_hhmm:
         p.payout_hh, p.payout_mm = payout_hhmm
     else:
-        logger.error(f"❌ Не удалось получить время следующей выплаты для {p.coin}")
+        logger.error(f"❌ Не удалось получить время следующей выплаты для {p.coin} | next_funding_time_raw={next_funding_time!r}")
         return 2
 
     # Basic orderbook + filters + qty validation
@@ -1410,7 +1375,7 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
     p.coin_qty = float(qty_norm)
 
     ob = await exchange_obj.get_orderbook(p.coin, limit=MAIN_OB_LEVELS)
-    if not ob or not ob.get("bids") or not ob.get("asks"):
+    if not ob or not ob.get("bids"):
         logger.error("❌ Bybit: не удалось получить orderbook для preflight")
         return 2
 
@@ -1419,36 +1384,24 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
     if px_short_level is None:
         logger.error(f"❌ Недостаточно ликвидности в bids (1-{MAIN_OB_LEVELS}) | need={_fmt(p.coin_qty)} {p.coin} | available={_fmt(cum_bids)}")
         return 2
+    # short-only live mode: asks liquidity is not required here (tests may still attempt long, but it's best-effort)
 
-    asks = ob["asks"][:MAIN_OB_LEVELS]
-    px_long_level, cum_asks = po._price_level_for_target_size(asks, p.coin_qty)
-    if px_long_level is None:
-        logger.error(f"❌ Недостаточно ликвидности в asks (1-{MAIN_OB_LEVELS}) | need={_fmt(p.coin_qty)} {p.coin} | available={_fmt(cum_asks)}")
-        return 2
-
-    # Balance check (best-effort): estimate required USDT for isolated 1x opening Short only (live mode).
-    # We use worst price from the current 15-level window for Short entry.
+    # Balance check (best-effort, НЕ блокирующий): оценка маржи для деривативов зависит от режима/плеча.
+    # В этом режиме мы пытаемся выставить isolated+1x, поэтому прикидка: notional/leverage + buffer + fee_safety.
     bid_entry_est = float(px_short_level)
-    # Live mode: only Short is opened, so we need balance for Short only (not Long+Short).
-    required_usdt = float(p.coin_qty) * max(0.0, bid_entry_est) + max(0.0, BALANCE_BUFFER_USDT)
+    notional_usdt = float(p.coin_qty) * float(last_px)
+    notional_est = float(p.coin_qty) * max(0.0, float(last_px), float(bid_entry_est))
+    leverage_assumed = 1.0
+    fee_safety = notional_est * max(0.0, float(BALANCE_FEE_SAFETY_BPS)) / 10_000.0
+    required_usdt_est = (notional_est / leverage_assumed) + max(0.0, float(BALANCE_BUFFER_USDT)) + fee_safety
     avail_usdt = await _bybit_get_usdt_available(exchange_obj=exchange_obj, api_key=api_key, api_secret=api_secret)
     if avail_usdt is None:
-        logger.error("❌ Не удалось получить баланс USDT на Bybit (wallet-balance). Останавливаемся для безопасности.")
-        return 2
-    if avail_usdt + 1e-6 < required_usdt:
-        logger.error(f"❌ Недостаточно баланса USDT | доступно={_fmt(avail_usdt, 3)} | нужно~{_fmt(required_usdt, 3)} (isolated 1x, только Short, оценка по стакану)")
-        return 2
-
-    # Check liquidity for Long (entry_long mode)
-    notional_usdt = float(p.coin_qty) * float(last_px)
-    long_liquidity = await exchange_obj.check_liquidity(
-        p.coin,
-        notional_usdt=notional_usdt,
-        ob_limit=50,
-        max_spread_bps=30.0,
-        max_impact_bps=50.0,
-        mode="entry_long",
-    )
+        logger.warning("⚠️ Не удалось получить баланс USDT на Bybit (wallet-balance). Продолжаем (best-effort).")
+    elif avail_usdt + 1e-6 < required_usdt_est:
+        logger.warning(
+            f"⚠️ Возможна нехватка USDT (оценка) | доступно={_fmt(avail_usdt, 3)} | нужно~{_fmt(required_usdt_est, 3)} "
+            f"(оценка: notional/leverage + buffer + fee_safety={BALANCE_FEE_SAFETY_BPS}bps)"
+        )
 
     # News check
     news_ok, news_msg, delisting_news, security_news = await _check_news_one_exchange(bot, "bybit", p.coin)
@@ -1479,16 +1432,6 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
     print(f"Кол-во монет (нормализовано по шагу): {_fmt(p.coin_qty)}")
     print(sep)
 
-    # Liquidity check output
-    if long_liquidity:
-        status = "✅" if long_liquidity["ok"] else "❌"
-        spread_bps = long_liquidity.get("spread_bps", 0.0)
-        buy_impact = long_liquidity.get("buy_impact_bps")
-        buy_impact_str = f"{buy_impact:.1f}bps" if buy_impact is not None else "0.0bps"
-        logger.info(f"{status} Ликвидность {exchange_cap} Long ({coin_upper}): {notional_str} USDT | spread={spread_bps:.1f}bps, buy_impact={buy_impact_str}")
-    else:
-        logger.warning(f"Не удалось проверить ликвидность {exchange_cap} Long ({coin_upper}) для {notional_str} USDT")
-
     # News output
     if delisting_news:
         logger.info(f"❌ Найдены новости о делистинге {coin_upper} ({exchange_cap}) за последние {NEWS_DAYS_BACK} дней ({len(delisting_news)} шт.)")
@@ -1513,7 +1456,12 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
         logger.info("⏭️ Тестовые ордера пропущены")
 
     # Ask about real positions
-    ans2 = input("Открывать позиции лонг и шорт? (Да/Нет): ").strip()
+    # Этот режим рассчитан на отрицательный funding (short-only после payout)
+    if p.funding_pct is None or float(p.funding_pct) >= 0:
+        logger.error(f"❌ Funding не отрицательный ({_fmt(p.funding_pct*100,3)}%). Этот режим рассчитан на отрицательный funding.")
+        return 2
+
+    ans2 = input("Открывать БОЕВОЙ short после payout? (Да/Нет): ").strip()
     if not _is_yes(ans2):
         logger.info("Отклонено пользователем. Завершаем.")
         return 0
@@ -1530,10 +1478,10 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
         logger.error("❌ Не удалось получить Bybit server time для синхронизации (market/time)")
         return 2
     # local_target_ms = server_target_ms - offset_ms
-    payout_local_ms = int(payout_server_ms - offset_ms)
     now_local_ms = int(time.time() * 1000)
-    if now_local_ms > payout_local_ms + 50:
-        logger.error("❌ Скрипт запущен после времени выплаты (по server time Bybit)")
+    now_server_est_ms = int(now_local_ms + int(offset_ms))
+    if now_server_est_ms > payout_server_ms + int(max(0, int(LATE_TOL_MS))):
+        logger.error("❌ Скрипт запущен слишком поздно относительно времени выплаты (по server time Bybit)")
         return 2
 
     # --- FAST mode (server-time synced): plan by Bybit server timestamp ---
@@ -1723,11 +1671,15 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
     open_local_ms = int(open_server_ms - offset_ms)
 
     # ВАЖНО: Sell IOC исполнится сразу, если лимит <= текущего bid.
-    # Чтобы гарантировать fill без запроса стакана в критическую миллисекунду, ставим лимит чуть ниже best_bid_fix.
-    # Используем best_bid_fix - N*tick (обычно 3-5 тиков достаточно), чтобы избежать price band rejection.
-    # Это не ухудшает цену: исполнение пойдет по лучшим бид-уровням (>= нашего лимита).
-    if best_bid_fix and tick > 0:
-        open_limit_raw = best_bid_fix - (3 * tick)  # 3 тика обычно достаточно для гарантированного fill
+    # Чтобы НЕ делать лишних запросов в критическую миллисекунду, используем best_bid_fix (HH:MM:59) и делаем запас:
+    # open_limit = best_bid_fix - max(min_ticks*tick, best_bid_fix*safety_bps)
+    if best_bid_fix and float(best_bid_fix) > 0 and tick and float(tick) > 0:
+        min_ticks = max(0, int(OPEN_SAFETY_MIN_TICKS))
+        safety_bps = max(0.0, float(OPEN_SAFETY_BPS))
+        ded_ticks = float(min_ticks) * float(tick)
+        ded_bps = float(best_bid_fix) * (safety_bps / 10_000.0)
+        ded = max(ded_ticks, ded_bps)
+        open_limit_raw = float(best_bid_fix) - float(ded)
     else:
         open_limit_raw = float(close_price) if close_price is not None else 0.0
     # Для Sell IOC надёжнее явно флоорить по тику, чтобы лимит точно был <= текущего bid
@@ -1738,7 +1690,7 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
     close_local_str = datetime.fromtimestamp(close_local_ms / 1000.0).strftime("%H:%M:%S")
     post_logs.append(
         f"🧠 План (БОЕВОЙ, server-time): открыть Short в {open_local_str} (Sell IOC, лимит, ПОСЛЕ payout+{OPEN_AFTER_MS}ms) | qty={qty_str} | "
-        f"limit_open={px_open_str} (best_bid_fix={_fmt(best_bid_fix)}, close_price={_fmt(close_price)}, safety=-3tick) | "
+        f"limit_open={px_open_str} (best_bid_fix={_fmt(best_bid_fix)}, close_price={_fmt(close_price)}, safety={OPEN_SAFETY_BPS}bps|min_ticks={OPEN_SAFETY_MIN_TICKS}) | "
         f"затем закрывать Short c {close_local_str} (Buy reduceOnly IOC, с эскалацией)"
     )
 
@@ -1892,9 +1844,9 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
     else:
         logger.info(f"✅ Short закрыт | qty={_fmt(qty_pos)} | avg_exit_buy={_fmt(avg_exit_short)}")
 
-    # IMPORTANT: execution window must be around the actual trade, not from script start (script waits minutes before payout).
-    t_start_ms = int((t_send_open - timedelta(seconds=5)).timestamp() * 1000)
-    t_end_ms = int((t_close_done + timedelta(seconds=5)).timestamp() * 1000)
+    # IMPORTANT: execution window should be anchored to server-time schedule to avoid local jitter/slow network skew.
+    t_start_ms = int(open_server_ms - 5_000)
+    t_end_ms = int(close_server_ms + 10_000)
     execs = await _bybit_fetch_executions(
             exchange_obj=exchange_obj,
             api_key=api_key,
