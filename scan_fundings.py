@@ -1,5 +1,5 @@
 """
-Скрипт для поиска фандингов на монеты в рамках одной биржи (bybit, binance, gate).
+Скрипт для поиска фандингов на монеты на бирже Bybit.
 Ищет фандинги >= MIN_FUNDING_SPREAD и отправляет уведомления в Telegram.
 """
 import asyncio
@@ -65,7 +65,7 @@ EXCLUDE_COINS_STR = os.getenv("EXCLUDE_COINS", "").strip()
 EXCLUDE_COINS = {coin.strip().upper() for coin in EXCLUDE_COINS_STR.split(",") if coin.strip()} if EXCLUDE_COINS_STR else set()
 
 # Биржи для сканирования фандингов
-FUNDING_EXCHANGES = ["bybit", "binance", "gate"]
+FUNDING_EXCHANGES = ["bybit"]
 
 
 # ----------------------------
@@ -104,8 +104,8 @@ def calculate_minutes_until_funding(next_funding_time: Optional[int], exchange: 
     Использует только данные из API, без хардкода расписания.
     
     Args:
-        next_funding_time: Timestamp следующей выплаты (в миллисекундах для Bybit/Binance, в секундах для Gate)
-        exchange: Название биржи
+        next_funding_time: Timestamp следующей выплаты (в миллисекундах для Bybit)
+        exchange: Название биржи (только bybit)
         
     Returns:
         Количество минут до выплаты или None если невозможно вычислить
@@ -114,14 +114,8 @@ def calculate_minutes_until_funding(next_funding_time: Optional[int], exchange: 
         return None
     
     try:
-        # Bybit и Binance возвращают timestamp в миллисекундах
-        # Gate возвращает в секундах
-        if exchange.lower() == "gate":
-            # Gate: timestamp в секундах
-            funding_timestamp = next_funding_time
-        else:
-            # Bybit, Binance: timestamp в миллисекундах
-            funding_timestamp = next_funding_time / 1000
+        # Bybit возвращает timestamp в миллисекундах
+        funding_timestamp = next_funding_time / 1000
         
         now_timestamp = time.time()
         seconds_until = funding_timestamp - now_timestamp
@@ -150,18 +144,17 @@ async def calculate_min_qty_for_exchange(
     
     Args:
         bot: Экземпляр бота
-        exchange_name: Название биржи (bybit, binance, gate)
+        exchange_name: Название биржи (только bybit)
         coin: Название монеты
         price_hint: Цена монеты (для расчета minOrderAmt)
-        notional_usdt: Размер позиции в USDT (не используется для bybit, но нужен для других бирж)
+        notional_usdt: Размер позиции в USDT (не используется)
         
     Returns:
         Минимальное количество монет или None если не удалось вычислить
     """
     if exchange_name.lower() != "bybit":
-        # Для других бирж пока используем простой расчет
-        # TODO: добавить поддержку для binance и gate
-        return notional_usdt / price_hint if price_hint > 0 else None
+        # Поддерживается только Bybit
+        return None
     
     try:
         exchange_obj = bot.exchanges.get(exchange_name)
