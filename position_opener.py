@@ -339,6 +339,73 @@ async def close_long_short_positions(
     return ok_all
 
 
+async def _bybit_get_position_size_one_leg(
+    *,
+    exchange_obj: Any,
+    api_key: str,
+    api_secret: str,
+    coin: str,
+    position_direction: str,  # "short" or "long"
+    position_idx: Optional[int] = None,  # optional hint for hedge mode
+) -> float:
+    """
+    Возвращает текущий size позиции (abs) по направлению (short/long) для одного инструмента.
+    Best-effort: работает и в one-way, и в hedge-mode.
+
+    - В hedge-mode удобнее фильтровать по positionIdx (если передан),
+      но также делаем fallback по side.
+    - Возвращает 0.0 если позиции нет или ошибка.
+    """
+    pos_dir = (position_direction or "").lower().strip()
+    if pos_dir not in ("short", "long"):
+        return 0.0
+
+    symbol = exchange_obj._normalize_symbol(coin)
+    data = await _bybit_private_request(
+        exchange_obj=exchange_obj,
+        api_key=api_key,
+        api_secret=api_secret,
+        method="GET",
+        path="/v5/position/list",
+        params={"category": "linear", "symbol": symbol},
+    )
+    if not (isinstance(data, dict) and data.get("retCode") == 0):
+        return 0.0
+
+    items = ((data.get("result") or {}).get("list") or [])
+    if not isinstance(items, list):
+        return 0.0
+
+    want_side = "sell" if pos_dir == "short" else "buy"
+
+    best = 0.0
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+
+        # 1) Если передан position_idx, пытаемся матчить его (hedge-mode)
+        if position_idx is not None:
+            try:
+                pidx = int(it.get("positionIdx")) if it.get("positionIdx") is not None else None
+            except Exception:
+                pidx = None
+            if pidx is not None and pidx != int(position_idx):
+                continue
+
+        side = str(it.get("side") or "").lower().strip()  # "Buy"/"Sell"
+        if side and side != want_side:
+            continue
+
+        try:
+            sz = float(it.get("size") or 0.0)
+        except Exception:
+            sz = 0.0
+        if sz > best:
+            best = sz
+
+    return float(abs(best))
+
+
 async def _bybit_close_leg_partial_ioc(
     *,
     exchange_obj: Any,
@@ -398,12 +465,71 @@ async def _bybit_close_leg_partial_ioc(
 
     max_orders_total = max(10, MAX_ORDERBOOK_LEVELS * 3)
 
+    # Эскалация цены для закрытия (если цена уходит вверх)
+    no_fill_streak = 0
+    escalate_ticks = 0
+
+    # Настройки через env
+    CLOSE_OB_LEVELS = max(10, int(os.getenv("FUN_CLOSE_OB_LEVELS", "25") or "25"))
+    ESCALATE_EVERY = max(1, int(os.getenv("FUN_CLOSE_ESCALATE_EVERY", "3") or "3"))  # каждые N попыток без fill
+    ESCALATE_TICKS_STEP = max(0, int(os.getenv("FUN_CLOSE_ESCALATE_TICKS_STEP", "2") or "2"))
+    ESCALATE_TICKS_MAX = max(0, int(os.getenv("FUN_CLOSE_ESCALATE_TICKS_MAX", "50") or "50"))
+    CLOSE_FALLBACK_MARKET = int(os.getenv("FUN_CLOSE_FALLBACK_MARKET", "0") or "0")
+
+    # ===== NEW: параметры контроля "первые секунды" и ресинк позиции =====
+    CLOSE_FIRST_SEC = float(os.getenv("FUN_CLOSE_FIRST_SEC", "2.0") or "2.0")
+    RESYNC_EVERY_N = int(os.getenv("FUN_CLOSE_RESYNC_EVERY", "5") or "5")
+    RESYNC_ON_NOFILL = int(os.getenv("FUN_CLOSE_RESYNC_ON_NOFILL", "1") or "1")  # 1 => ресинк при streak>0
+    MAX_TOTAL_SEC = float(os.getenv("FUN_CLOSE_MAX_TOTAL_SEC", "30.0") or "30.0")  # safety, увеличен до 30с для стратегии "закрыть любой ценой"
+    RESYNC_MIN_INTERVAL_SEC = float(os.getenv("FUN_CLOSE_RESYNC_MIN_INTERVAL", "0.5") or "0.5")  # минимальный интервал между ресинками (защита от rate limit)
+    # ================================================================
+
+    start_ts = time.time()  # NEW: для тайм-режима и общего лимита
+    last_resync_ts = 0.0  # NEW: для ограничения частоты ресинка
+
     for order_n in range(1, max_orders_total + 1):
+        # NEW: safety по времени (чтобы не зависать бесконечно)
+        if time.time() - start_ts > MAX_TOTAL_SEC:
+            logger.error(f"❌ Bybit close: timeout {MAX_TOTAL_SEC}s exceeded | remaining={_format_number(remaining)} {coin}")
+            avg_price = (total_notional / total_filled) if total_filled > 0 else None
+            return False, avg_price
+
+        # NEW: периодический ресинк remaining по реальной позиции (с ограничением частоты для защиты от rate limit)
+        now_ts = time.time()
+        should_resync = False
+        if order_n % RESYNC_EVERY_N == 0:
+            should_resync = True
+        elif RESYNC_ON_NOFILL == 1 and no_fill_streak > 0:
+            # ресинк при no_fill_streak, но не чаще чем раз в RESYNC_MIN_INTERVAL_SEC
+            if now_ts - last_resync_ts >= RESYNC_MIN_INTERVAL_SEC:
+                should_resync = True
+
+        if should_resync:
+            try:
+                pos_sz = await _bybit_get_position_size_one_leg(
+                    exchange_obj=exchange_obj,
+                    api_key=api_key,
+                    api_secret=api_secret,
+                    coin=coin,
+                    position_direction=pos_dir,
+                    position_idx=use_position_idx,  # если hedge-mode — поможет
+                )
+                last_resync_ts = now_ts
+                # Если биржа говорит "0" — считаем закрытым
+                if pos_sz <= eps:
+                    avg_price = (total_notional / total_filled) if total_filled > 0 else None
+                    logger.info(f"✅ Bybit close: позиция уже 0 по /position/list | closed")
+                    return True, avg_price
+                # Подстраховка: не увеличиваем remaining сверх исходного coin_amount (на случай лагов)
+                remaining = min(remaining, float(pos_sz))
+            except Exception:
+                pass
+
         if remaining <= eps:
             avg_price = (total_notional / total_filled) if total_filled > 0 else None
             return True, avg_price
 
-        ob = await exchange_obj.get_orderbook(coin, limit=MAX_ORDERBOOK_LEVELS)
+        ob = await exchange_obj.get_orderbook(coin, limit=CLOSE_OB_LEVELS)
         if not ob or not ob.get("bids") or not ob.get("asks"):
             logger.error(f"❌ Bybit: orderbook недоступен для закрытия {coin}")
             return False, None
@@ -414,11 +540,11 @@ async def _bybit_close_leg_partial_ioc(
             return False, None
 
         # 1) Подбираем цену уровня, где cum >= remaining
-        px_level, cum = _price_level_for_target_size(levels[:MAX_ORDERBOOK_LEVELS], remaining)
+        px_level, cum = _price_level_for_target_size(levels[:CLOSE_OB_LEVELS], remaining)
         if px_level is None:
-            # Недостаточно ликвидности в окне — берём последний доступный уровень (самый "плохой" для нас)
+            # если даже в CLOSE_OB_LEVELS не нашли cum>=remaining — берём последний доступный
             try:
-                px_level = float(levels[min(len(levels), MAX_ORDERBOOK_LEVELS) - 1][0])
+                px_level = float(levels[min(len(levels), CLOSE_OB_LEVELS) - 1][0])
             except Exception:
                 logger.error(f"❌ Bybit: не удалось взять последний уровень стакана для закрытия {coin}")
                 return False, None
@@ -436,11 +562,30 @@ async def _bybit_close_leg_partial_ioc(
 
         # 3) Цена: агрессивно округляем по tick
         px = _round_price_for_side(float(px_level), tick, price_side)
+
+        # ===== NEW: тайм-режим "первые секунды" vs "после" =====
+        elapsed = time.time() - start_ts
+        if side_close == "Buy" and tick > 0:
+            if elapsed <= CLOSE_FIRST_SEC:
+                # первые секунды: эскалацию можно держать мягче (или вообще 0)
+                # (оставляем как есть: px + escalate_ticks*tick, но escalation растёт медленнее ниже)
+                if escalate_ticks > 0:
+                    px = px + float(escalate_ticks) * tick
+                    px = _round_price_for_side(px, tick, "buy")
+            else:
+                # после окна: делаем агрессивнее, даже если escalation маленький
+                # минимальный "пинок" + уже накопленные тики
+                bump = max(1, escalate_ticks)
+                px = px + float(bump) * tick
+                px = _round_price_for_side(px, tick, "buy")
+        # =====================================================
+
         px_str = _format_by_step(px, tick_raw) if tick > 0 else str(px)
 
         logger.info(
             f"Bybit close: ордер {order_n}/{max_orders_total} | side={side_close} qty={qty_str} | "
-            f"лимит={px_str} | remaining={_format_number(remaining)} | cum={_format_number(cum)}"
+            f"лимит={px_str} | remaining={_format_number(remaining)} | cum={_format_number(cum)} | "
+            f"no_fill_streak={no_fill_streak} | escalate_ticks={escalate_ticks} | elapsed={elapsed:.2f}s"
         )
 
         body = {
@@ -465,8 +610,13 @@ async def _bybit_close_leg_partial_ioc(
         )
 
         if not isinstance(data, dict) or data.get("retCode") != 0:
-            # one-way: positionIdx нельзя, пробуем без него
-            if isinstance(data, dict) and data.get("retCode") in (10001, 110017) and use_position_idx is not None:
+            # retCode=110017: position is zero — уже закрыто (не ретраим, сразу успех)
+            if isinstance(data, dict) and data.get("retCode") == 110017:
+                avg_price = (total_notional / total_filled) if total_filled > 0 else None
+                return True, avg_price
+
+            # retCode=10001: one-way mode, positionIdx нельзя, пробуем без него
+            if isinstance(data, dict) and data.get("retCode") == 10001 and use_position_idx is not None:
                 use_position_idx = None
                 body.pop("positionIdx", None)
                 data = await _bybit_private_post(
@@ -478,7 +628,7 @@ async def _bybit_close_leg_partial_ioc(
                 )
 
             if not isinstance(data, dict) or data.get("retCode") != 0:
-                # retCode=110017: position is zero — уже закрыто
+                # еще раз проверим 110017 после ретрая
                 if isinstance(data, dict) and data.get("retCode") == 110017:
                     avg_price = (total_notional / total_filled) if total_filled > 0 else None
                     return True, avg_price
@@ -500,13 +650,97 @@ async def _bybit_close_leg_partial_ioc(
             total_notional += filled_q * float(px)   # best-effort
             total_filled += filled_q
             remaining = max(0.0, remaining - filled_q)
+            no_fill_streak = 0  # NEW: сбрасываем streak
 
             logger.info(
                 f"Bybit close: исполнено={_format_number(filled_q)} {coin} | осталось={_format_number(remaining)} {coin} | full={ok_full}"
             )
             continue
 
+        # ===== NEW: логика no-fill, эскалация быстрее после окна =====
+        no_fill_streak += 1
+        elapsed = time.time() - start_ts
+
+        if elapsed <= CLOSE_FIRST_SEC:
+            # первые секунды: эскалируем как раньше (мягко)
+            if no_fill_streak % ESCALATE_EVERY == 0 and ESCALATE_TICKS_STEP > 0:
+                escalate_ticks = min(ESCALATE_TICKS_MAX, escalate_ticks + ESCALATE_TICKS_STEP)
+                logger.info(f"Bybit close: эскалация цены | escalate_ticks={escalate_ticks} (после {no_fill_streak} попыток без fill)")
+        else:
+            # после окна: эскалируем агрессивнее (в 2 раза чаще и/или больше шаг)
+            if ESCALATE_TICKS_STEP > 0:
+                step2 = max(ESCALATE_TICKS_STEP, ESCALATE_TICKS_STEP * 2)
+                every2 = max(1, ESCALATE_EVERY // 2)
+                if no_fill_streak % every2 == 0:
+                    escalate_ticks = min(ESCALATE_TICKS_MAX, escalate_ticks + step2)
+                    logger.info(f"Bybit close: агрессивная эскалация | escalate_ticks={escalate_ticks} (после {no_fill_streak} попыток, elapsed={elapsed:.2f}s)")
+
         logger.warning(f"Bybit close: 0 исполнено (IOC) | осталось={_format_number(remaining)} {coin}")
+
+        # NEW: market fallback можно включать раньше после окна (если нужно)
+        if CLOSE_FALLBACK_MARKET == 1:
+            # первые секунды — не трогаем market, после окна — можно
+            if elapsed > CLOSE_FIRST_SEC and no_fill_streak >= max(3, ESCALATE_EVERY * 2):
+                logger.warning(f"Bybit close: fallback на Market ордер (после {no_fill_streak} попыток, elapsed={elapsed:.2f}s)")
+                body_m = {
+                    "category": "linear",
+                    "symbol": symbol,
+                    "side": side_close,
+                    "orderType": "Market",
+                    "qty": qty_str,
+                    "timeInForce": "IOC",
+                    "reduceOnly": True,
+                }
+                if use_position_idx is not None:
+                    body_m["positionIdx"] = int(use_position_idx)
+
+                data_m = await _bybit_private_post(
+                    exchange_obj=exchange_obj,
+                    api_key=api_key,
+                    api_secret=api_secret,
+                    path="/v5/order/create",
+                    body=body_m,
+                )
+
+                # retCode=110017: position is zero — уже закрыто (не ретраим)
+                if isinstance(data_m, dict) and data_m.get("retCode") == 110017:
+                    avg_price = (total_notional / total_filled) if total_filled > 0 else None
+                    return True, avg_price
+
+                # retCode=10001: one-way mode, positionIdx нельзя, пробуем без него
+                if isinstance(data_m, dict) and data_m.get("retCode") == 10001 and use_position_idx is not None:
+                    use_position_idx = None
+                    body_m.pop("positionIdx", None)
+                    data_m = await _bybit_private_post(
+                        exchange_obj=exchange_obj,
+                        api_key=api_key,
+                        api_secret=api_secret,
+                        path="/v5/order/create",
+                        body=body_m,
+                    )
+
+                if not (isinstance(data_m, dict) and data_m.get("retCode") == 0):
+                    # еще раз проверим 110017 после ретрая
+                    if isinstance(data_m, dict) and data_m.get("retCode") == 110017:
+                        avg_price = (total_notional / total_filled) if total_filled > 0 else None
+                        return True, avg_price
+                    logger.error(f"❌ Bybit close market fallback error: {data_m}")
+                else:
+                    oid_m = (data_m.get("result") or {}).get("orderId") if isinstance(data_m.get("result"), dict) else None
+                    if oid_m:
+                        ok_m, filled_m = await _bybit_wait_full_fill(
+                            planned={"exchange_obj": exchange_obj, "api_key": api_key, "api_secret": api_secret, "symbol": symbol, "qty": qty_str},
+                            order_id=str(oid_m),
+                        )
+                        if filled_m and float(filled_m) > 0:
+                            fq = float(filled_m)
+                            # цену market тут не знаем точно — VWAP лучше считать по executions позже
+                            remaining = max(0.0, remaining - fq)
+                            no_fill_streak = 0
+                            logger.warning(f"⚠️ Market fallback filled={_format_number(fq)} | remaining={_format_number(remaining)}")
+                            continue
+        # ==========================================================
+
         continue
 
     logger.error(f"❌ Bybit close: не удалось закрыть позицию полностью | осталось={_format_number(remaining)} {coin}")

@@ -83,7 +83,8 @@ FAST_PREP_LEAD_SEC = float(os.getenv("FUN_FAST_PREP_LEAD_SEC", "2.0"))  # do pre
 FAST_CLOSE_DELAY_SEC = float(os.getenv("FUN_FAST_CLOSE_DELAY_SEC", "1.0"))  # start closing at payout+1s
 FAST_CLOSE_MAX_ATTEMPTS = int(os.getenv("FUN_FAST_CLOSE_MAX_ATTEMPTS", "15"))
 FAST_SILENT_TRADING = int(os.getenv("FUN_FAST_SILENT_TRADING", "1"))  # 1 => disable logging during open/close window
-FAST_OPEN_LEAD_MS = int(os.getenv("FUN_FAST_OPEN_LEAD_MS", "300"))  # send open slightly BEFORE payout to avoid lag
+FAST_OPEN_LEAD_MS = int(os.getenv("FUN_FAST_OPEN_LEAD_MS", "300"))  # send open slightly BEFORE payout to avoid lag (deprecated, use OPEN_AFTER_MS)
+OPEN_AFTER_MS = int(os.getenv("FUN_OPEN_AFTER_MS", "10"))  # открыть ПОСЛЕ payout (в мс)
 FIX_PRICE_MODE = str(os.getenv("FUN_FIX_PRICE_MODE", "last") or "last").strip().lower()
 # Default OFF: user asked to avoid market for opening in live mode.
 SHORT_OPEN_FALLBACK_MARKET = int(os.getenv("FUN_SHORT_OPEN_FALLBACK_MARKET", "0"))
@@ -300,7 +301,7 @@ async def _bybit_get_filters(exchange_obj: Any, coin: str) -> Dict[str, Optional
 def _ceil_to_step(x: float, step: float) -> float:
     if step <= 0:
         return x
-    return float(int((x + step - 1e-18) // step) * step) if step >= 1 else po._ceil_to_step(x, step)
+    return po._ceil_to_step(x, step)  # используем правильную реализацию из position_opener
 
 
 def _floor_to_step(x: float, step: float) -> float:
@@ -1025,10 +1026,34 @@ def _bybit_calc_pnl_usdt_from_execs(execs: List[Dict[str, Any]]) -> Tuple[Option
 
     avg_buy = (buy_notional / buy_qty) if buy_qty > 0 else None
     avg_sell = (sell_notional / sell_qty) if sell_qty > 0 else None
-    pnl = sell_notional - buy_notional
-    # Вычитаем комиссии: 0.005 USDT за каждую сделку (execution)
-    commission_total = (buys + sells) * 0.005
-    pnl = pnl - commission_total
+    
+    # Вычитаем реальные комиссии из executions (execFee или execFeeRate)
+    fee_total = 0.0
+    for it in execs:
+        if not isinstance(it, dict):
+            continue
+        # Bybit может возвращать execFee (абсолютная сумма) или execFeeRate (процент)
+        raw_fee = it.get("execFee")
+        if raw_fee is not None:
+            try:
+                fee_total += abs(float(raw_fee))
+            except Exception:
+                pass
+        # Если execFee нет, но есть execFeeRate и execPrice/execQty - можно вычислить
+        elif it.get("execFeeRate") is not None:
+            try:
+                fee_rate = float(it.get("execFeeRate", 0))
+                # sanity: если прилетело в процентах (например 0.06 => 0.06%), приводим к долям
+                if abs(fee_rate) > 0.01:
+                    fee_rate = fee_rate / 100.0
+                px = float(it.get("execPrice") or 0.0)
+                q = float(it.get("execQty") or 0.0)
+                if px > 0 and q > 0:
+                    fee_total += abs(px * q * fee_rate)
+            except Exception:
+                pass
+    
+    pnl = sell_notional - buy_notional - fee_total
     return pnl, buys, sells, avg_buy, avg_sell
 
 
@@ -1055,15 +1080,15 @@ async def _bybit_preflight_and_min_qty(
     if qty_step > 0:
         q_min = po._ceil_to_step(q_min, qty_step)
 
-    # validate desired qty
-    if qty_step > 0 and (not po._is_multiple_of_step(qty_desired, qty_step)):
-        raise ValueError(f"qty {qty_desired} not multiple of qtyStep {qty_step_raw}")
-    if min_qty > 0 and qty_desired < min_qty:
-        raise ValueError(f"qty {qty_desired} < minOrderQty {min_qty_raw}")
-    if min_amt > 0 and (qty_desired * price_hint) < min_amt:
-        raise ValueError(f"order notional too small: {qty_desired}*{price_hint} < minOrderAmt {min_amt_raw}")
+    # validate desired qty: сначала нормализуем по qtyStep, чтобы избежать ложных ошибок из-за float
+    qty_norm = po._floor_to_step(float(qty_desired), qty_step) if qty_step > 0 else float(qty_desired)
+    if min_qty > 0 and qty_norm < min_qty:
+        raise ValueError(f"qty {qty_desired} (normalized={qty_norm}) < minOrderQty {min_qty_raw}")
+    if min_amt > 0 and (qty_norm * float(price_hint)) < min_amt:
+        raise ValueError(f"order notional too small: {qty_norm}*{price_hint} < minOrderAmt {min_amt_raw}")
 
     _ = tick_raw  # keep for caller
+    # Возвращаем минимально допустимое количество (q_min) + filters. Нормализованное qty применим снаружи (в fun.py).
     return float(q_min), f
 
 
@@ -1337,10 +1362,17 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
     # Заполняем параметры из API
     p.funding_pct = float(funding_rate)
     try:
-        p.next_funding_time_ms = int(next_funding_time) if next_funding_time is not None else None
+        raw_time = int(next_funding_time) if next_funding_time is not None else None
+        if raw_time is not None:
+            # Sanity-check: если число слишком маленькое (< 10^13), похоже на seconds, а не ms
+            if raw_time < 10_000_000_000_000:
+                raw_time = raw_time * 1000
+            p.next_funding_time_ms = raw_time
+        else:
+            p.next_funding_time_ms = None
     except Exception:
         p.next_funding_time_ms = None
-    payout_hhmm = _next_funding_time_to_local_hhmm(next_funding_time, "bybit")
+    payout_hhmm = _next_funding_time_to_local_hhmm(p.next_funding_time_ms, "bybit")
     if payout_hhmm:
         p.payout_hh, p.payout_mm = payout_hhmm
     else:
@@ -1355,7 +1387,7 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
         return 2
 
     try:
-        min_test_qty, _filters = await _bybit_preflight_and_min_qty(
+        min_qty_allowed, _filters = await _bybit_preflight_and_min_qty(
             exchange_obj=exchange_obj,
             coin=p.coin,
             qty_desired=p.coin_qty,
@@ -1364,6 +1396,18 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
     except Exception as e:
         logger.error(f"❌ Preflight qty error: {e}")
         return 2
+
+    # Нормализуем qty по шагу и используем дальше везде (чтобы не печатать/использовать "грязное" значение)
+    qty_step_raw = _filters.get("qtyStep")
+    qty_step = float(qty_step_raw) if qty_step_raw else 0.0
+    qty_norm = po._floor_to_step(float(p.coin_qty), qty_step) if qty_step > 0 else float(p.coin_qty)
+    if qty_norm <= 0:
+        logger.error("❌ qty после нормализации <= 0")
+        return 2
+    if qty_norm < float(min_qty_allowed):
+        logger.error(f"❌ qty слишком маленький после нормализации | qty_norm={_fmt(qty_norm)} < min_qty={_fmt(min_qty_allowed)}")
+        return 2
+    p.coin_qty = float(qty_norm)
 
     ob = await exchange_obj.get_orderbook(p.coin, limit=MAIN_OB_LEVELS)
     if not ob or not ob.get("bids") or not ob.get("asks"):
@@ -1422,7 +1466,7 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
     funding_str = f"{_fmt(p.funding_pct*100, 3)}%" if p.funding_pct is not None else "N/A"
     payout_time_str = f"{p.payout_hh:02d}:{p.payout_mm:02d}" if p.payout_hh is not None and p.payout_mm is not None else "N/A"
     offset_str = f"{_fmt(p.offset_pct*100, 3)}%"
-    min_qty_str = _fmt(min_test_qty)
+    min_qty_str = _fmt(min_qty_allowed)
 
     print(sep)
     print(f"Анализ арбитража для {exchange_cap} ({coin_upper})")
@@ -1432,6 +1476,7 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
     print(f"Время следующей выплаты: {payout_time_str}")
     print(f"Доп отступ вниз от справедливой цены: {offset_str}")
     print(f"Мин количество монет для ордера: {min_qty_str}")
+    print(f"Кол-во монет (нормализовано по шагу): {_fmt(p.coin_qty)}")
     print(sep)
 
     # Liquidity check output
@@ -1459,7 +1504,7 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
     ans = input("Совершить тестовые открытия шорт и лонг ? (Да/Нет): ").strip()
     if _is_yes(ans):
         logger.info("🧪 Тестовые ордера: запуск")
-        ok_test = await _bybit_test_orders(bot, p.coin, min_test_qty)
+        ok_test = await _bybit_test_orders(bot, p.coin, float(min_qty_allowed))
         if not ok_test:
             logger.warning("⚠️ Тестовые ордера не прошли (или прошли частично) — продолжаем без остановки")
         else:
@@ -1662,17 +1707,10 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
         logger.error("❌ Bybit: orderbook недоступен для открытия (HH:MM:59)")
         return 2
 
-    # IMPORTANT (per requirement): open Short exactly by close_price (as fixed at HH:MM:59)
     if close_price is None or close_price <= 0:
         logger.error("❌ close_price некорректен для открытия Short")
         return 2
-    px_open = po._round_price_for_side(float(close_price), tick, "sell")
-    px_open_str = po._format_by_step(px_open, tick_raw)
 
-    # We want a HIGH open price, but still fillable fast.
-    # To avoid stale bids, take one more lightweight snapshot shortly before sending the order.
-    open_server_ms = int(payout_server_ms - max(0, int(FAST_OPEN_LEAD_MS)))
-    open_local_ms = int(open_server_ms - offset_ms)
     # Calculate close time (for logging) before critical window
     close_server_ms = int(payout_server_ms + int(max(0.0, float(FAST_CLOSE_DELAY_SEC)) * 1000))
     close_local_ms = int(close_server_ms - offset_ms)
@@ -1680,20 +1718,28 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
     bid_open = best_bid_fix
     ask_open = best_ask_fix
 
-    # Choose a fillable open limit for Sell:
-    # For Sell IOC to fill immediately, limit must be <= current best bid. We cap by bid_open.
-    open_limit_raw = float(close_price) if close_price is not None else 0.0
-    if bid_open is not None and bid_open > 0:
-        open_limit_raw = min(open_limit_raw, float(bid_open))
-    px_open = po._round_price_for_side(float(open_limit_raw), tick, "sell")
+    # Открываем ПОСЛЕ payout (чтобы не платить funding)
+    open_server_ms = int(payout_server_ms + max(0, int(OPEN_AFTER_MS)))
+    open_local_ms = int(open_server_ms - offset_ms)
+
+    # ВАЖНО: Sell IOC исполнится сразу, если лимит <= текущего bid.
+    # Чтобы гарантировать fill без запроса стакана в критическую миллисекунду, ставим лимит чуть ниже best_bid_fix.
+    # Используем best_bid_fix - N*tick (обычно 3-5 тиков достаточно), чтобы избежать price band rejection.
+    # Это не ухудшает цену: исполнение пойдет по лучшим бид-уровням (>= нашего лимита).
+    if best_bid_fix and tick > 0:
+        open_limit_raw = best_bid_fix - (3 * tick)  # 3 тика обычно достаточно для гарантированного fill
+    else:
+        open_limit_raw = float(close_price) if close_price is not None else 0.0
+    # Для Sell IOC надёжнее явно флоорить по тику, чтобы лимит точно был <= текущего bid
+    px_open = po._floor_to_step(float(open_limit_raw), float(tick)) if tick and float(tick) > 0 else float(open_limit_raw)
     px_open_str = po._format_by_step(px_open, tick_raw)
 
-    payout_local_str = datetime.fromtimestamp(payout_local_ms / 1000.0).strftime("%H:%M:%S")
+    open_local_str = datetime.fromtimestamp(open_local_ms / 1000.0).strftime("%H:%M:%S")
     close_local_str = datetime.fromtimestamp(close_local_ms / 1000.0).strftime("%H:%M:%S")
     post_logs.append(
-        f"🧠 План (БОЕВОЙ, server-time): открыть Short в {payout_local_str} (Sell IOC, лимит) | qty={qty_str} | "
-        f"limit_open={px_open_str} (close_price={_fmt(close_price)}, bid_open={_fmt(bid_open)}, ask_open={_fmt(ask_open)}) | "
-        f"затем закрывать Short c {close_local_str} (Buy reduceOnly IOC, ∞ до закрытия или Ctrl+C)"
+        f"🧠 План (БОЕВОЙ, server-time): открыть Short в {open_local_str} (Sell IOC, лимит, ПОСЛЕ payout+{OPEN_AFTER_MS}ms) | qty={qty_str} | "
+        f"limit_open={px_open_str} (best_bid_fix={_fmt(best_bid_fix)}, close_price={_fmt(close_price)}, safety=-3tick) | "
+        f"затем закрывать Short c {close_local_str} (Buy reduceOnly IOC, с эскалацией)"
     )
 
     await _sleep_until_epoch_ms(open_local_ms)
@@ -1722,22 +1768,30 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
                 reduce_only=None,
                 position_idx=2,
             )
-        except Exception:
-            short_order_id = await _bybit_place_limit(
-                exchange_obj=exchange_obj,
-                api_key=api_key,
-                api_secret=api_secret,
-                coin=p.coin,
-                side="Sell",
-                qty_str=qty_str,
-                price_str=px_open_str,
-                tif="IOC",
-                reduce_only=None,
-                position_idx=None,
-            )
-    except Exception:
+            t_send_open = datetime.now()
+        except Exception as e1:
+            # Сохраняем детали первой ошибки для логирования
+            err1_str = str(e1)
+            try:
+                short_order_id = await _bybit_place_limit(
+                    exchange_obj=exchange_obj,
+                    api_key=api_key,
+                    api_secret=api_secret,
+                    coin=p.coin,
+                    side="Sell",
+                    qty_str=qty_str,
+                    price_str=px_open_str,
+                    tif="IOC",
+                    reduce_only=None,
+                    position_idx=None,
+                )
+                t_send_open = datetime.now()
+            except Exception as e2:
+                short_order_id = None
+                short_place_err = f"create_failed: hedge={err1_str}, one-way={str(e2)}"
+    except Exception as e:
         short_order_id = None
-        short_place_err = "create_failed"
+        short_place_err = f"create_failed: {str(e)}"
 
     # If IOC didn't fill (Cancelled) we may want an optional immediate fallback to Market to ensure opening.
     # Default is OFF (FUN_SHORT_OPEN_FALLBACK_MARKET=0) because user prefers limit only.
@@ -1794,6 +1848,7 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
     logger.info(f"⏱️ Тайминги: отправка_short={t_send_open.strftime('%H:%M:%S.%f')[:-3]} | старт_закрытия={t_close_start.strftime('%H:%M:%S.%f')[:-3]}")
     if short_place_err:
         logger.warning(f"⚠️ Short: ошибка создания ордера в критический момент: {short_place_err}")
+    filled_open: Optional[float] = None
     if short_order_id:
         try:
             st_open, filled_open, avg_open = await _bybit_get_order_status(
@@ -1807,110 +1862,44 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
     if qty_pos <= 0:
         logger.warning("⚠️ Похоже, Short не открылся (позиция=0) — завершаем без закрытия")
         return 0
+    
+    # Логируем расхождение между filled_open и qty_pos для диагностики частичного fill
+    if filled_open is not None and abs(float(filled_open) - float(qty_pos)) > 1e-6:
+        logger.info(f"📊 Short: filled_open={_fmt(filled_open)} vs qty_pos={_fmt(qty_pos)} (расхождение может быть из-за частичного fill или других ордеров)")
 
-    # Close Short with aggressive Buy reduceOnly IOC; INFINITE attempts until closed (Ctrl+C to stop).
-    remaining = float(qty_pos)
-    eps = max(1e-10, remaining * 1e-8)
-    total_notional_close = 0.0
-    total_filled_close = 0.0
-
-    attempt_n = 0
-    last_progress_t = time.time()
-    while True:
-        attempt_n += 1
-        if remaining <= eps:
-            break
-        ob_c = await exchange_obj.get_orderbook(p.coin, limit=max(5, min(MAIN_OB_LEVELS, 25)))
-        if not ob_c or not ob_c.get("asks"):
-            await asyncio.sleep(0.05)
-            continue
-        asks = ob_c["asks"][: max(1, min(int(SHORT_OPEN_LEVELS), 10, len(ob_c["asks"])))]
-        px_level_close, _cum_close = po._price_level_for_target_size(asks, remaining)
-        if px_level_close is None:
-            try:
-                px_level_close = float(asks[-1][0])
-            except Exception:
-                await asyncio.sleep(0.02)
-                continue
-        px_close = po._round_price_for_side(float(px_level_close), tick, "buy")
-        px_close_str = po._format_by_step(px_close, tick_raw)
-        qty_rem_str = po._format_by_step(remaining, qty_step_raw)
-
-        try:
-            try:
-                oid = await _bybit_place_limit(
+    # Закрываем short через универсальную функцию с эскалацией/market fallback (env-настройки)
+    ok_close, avg_exit_short = await po._bybit_close_leg_partial_ioc(
                     exchange_obj=exchange_obj,
-                    api_key=api_key,
-                    api_secret=api_secret,
                     coin=p.coin,
-                    side="Buy",
-                    qty_str=qty_rem_str,
-                    price_str=px_close_str,
-                    tif="IOC",
-                    reduce_only=True,
-                    position_idx=2,
-                )
-            except Exception:
-                oid = await _bybit_place_limit(
+        position_direction="short",
+        coin_amount=float(qty_pos),
+        position_idx=2,  # попробуем hedge-mode
+    )
+    if not ok_close:
+        # попробуем one-way (без positionIdx)
+        ok_close, avg_exit_short = await po._bybit_close_leg_partial_ioc(
                     exchange_obj=exchange_obj,
-                    api_key=api_key,
-                    api_secret=api_secret,
                     coin=p.coin,
-                    side="Buy",
-                    qty_str=qty_rem_str,
-                    price_str=px_close_str,
-                    tif="IOC",
-                    reduce_only=True,
+            position_direction="short",
+            coin_amount=float(qty_pos),
                     position_idx=None,
                 )
-        except Exception:
-            await asyncio.sleep(0.02)
-            continue
-
-        st_c, filled_c, avg_c = await _bybit_wait_done_get_filled_qty(
-            exchange_obj=exchange_obj,
-            api_key=api_key,
-            api_secret=api_secret,
-            coin=p.coin,
-            order_id=str(oid),
-            timeout_sec=0.6,
-            poll_sleep_sec=0.03,
-        )
-        if filled_c and filled_c > 0:
-            qf = float(filled_c)
-            total_filled_close += qf
-            px_use = float(avg_c) if (avg_c is not None and avg_c > 0) else float(px_close)
-            total_notional_close += qf * px_use
-            remaining = max(0.0, remaining - qf)
-            last_progress_t = time.time()
-        else:
-            # If no progress for a while, slow down a bit to avoid rate limits.
-            if time.time() - last_progress_t > 2.0:
-                await asyncio.sleep(0.08)
-            else:
-                await asyncio.sleep(0.02)
-
-        # Periodic resync with actual position size (one-way/hedge-safe).
-        if attempt_n % 5 == 0:
-            qty_now = await _bybit_get_short_position_qty(exchange_obj=exchange_obj, api_key=api_key, api_secret=api_secret, coin=p.coin)
-            if qty_now <= eps:
-                remaining = 0.0
-                break
-            # keep remaining in sync (in case of fills not captured by our last order status)
-            remaining = min(remaining, float(qty_now))
 
     t_close_done = datetime.now()
-    avg_exit_short = (total_notional_close / total_filled_close) if total_filled_close > 0 else None
-    logger.info(f"✅ Short закрыт | qty={_fmt(qty_pos)} | avg_exit_buy={_fmt(avg_exit_short)}")
+    if not ok_close:
+        logger.error(f"❌ Short НЕ закрыт полностью (best-effort) | qty={_fmt(qty_pos)} | avg_exit_buy={_fmt(avg_exit_short)}")
+        # продолжаем к post-trade, чтобы хотя бы увидеть executions/статус
+    else:
+        logger.info(f"✅ Short закрыт | qty={_fmt(qty_pos)} | avg_exit_buy={_fmt(avg_exit_short)}")
 
     # IMPORTANT: execution window must be around the actual trade, not from script start (script waits minutes before payout).
     t_start_ms = int((t_send_open - timedelta(seconds=5)).timestamp() * 1000)
     t_end_ms = int((t_close_done + timedelta(seconds=5)).timestamp() * 1000)
     execs = await _bybit_fetch_executions(
-        exchange_obj=exchange_obj,
-        api_key=api_key,
-        api_secret=api_secret,
-        coin=p.coin,
+            exchange_obj=exchange_obj,
+            api_key=api_key,
+            api_secret=api_secret,
+            coin=p.coin,
         start_ms=t_start_ms,
         end_ms=t_end_ms,
     )
