@@ -1673,6 +1673,9 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
     # To avoid stale bids, take one more lightweight snapshot shortly before sending the order.
     open_server_ms = int(payout_server_ms - max(0, int(FAST_OPEN_LEAD_MS)))
     open_local_ms = int(open_server_ms - offset_ms)
+    # Calculate close time (for logging) before critical window
+    close_server_ms = int(payout_server_ms + int(max(0.0, float(FAST_CLOSE_DELAY_SEC)) * 1000))
+    close_local_ms = int(close_server_ms - offset_ms)
     # No extra API calls between fix and open; use the snapshot from fix time.
     bid_open = best_bid_fix
     ask_open = best_ask_fix
@@ -1776,8 +1779,7 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
             pass
 
     # 10:00:01 — start closing short (important to close even if open was partial)
-    close_server_ms = int(payout_server_ms + int(max(0.0, float(FAST_CLOSE_DELAY_SEC)) * 1000))
-    close_local_ms = int(close_server_ms - offset_ms)
+    # close_local_ms already calculated above (before critical window) for logging
     await _sleep_until_epoch_ms(close_local_ms)
     t_close_start = datetime.now()
 
