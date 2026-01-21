@@ -85,7 +85,8 @@ FAST_CLOSE_MAX_ATTEMPTS = int(os.getenv("FUN_FAST_CLOSE_MAX_ATTEMPTS", "15"))
 FAST_SILENT_TRADING = int(os.getenv("FUN_FAST_SILENT_TRADING", "1"))  # 1 => disable logging during open/close window
 FAST_OPEN_LEAD_MS = int(os.getenv("FUN_FAST_OPEN_LEAD_MS", "150"))  # send open slightly BEFORE payout to avoid lag
 FIX_PRICE_MODE = str(os.getenv("FUN_FIX_PRICE_MODE", "last") or "last").strip().lower()
-SHORT_OPEN_FALLBACK_MARKET = int(os.getenv("FUN_SHORT_OPEN_FALLBACK_MARKET", "1"))
+# Default OFF: user asked to avoid market for opening in live mode.
+SHORT_OPEN_FALLBACK_MARKET = int(os.getenv("FUN_SHORT_OPEN_FALLBACK_MARKET", "0"))
 
 
 YES_WORDS = {"да", "y", "yes", "д"}
@@ -1553,23 +1554,43 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
     px_open = po._round_price_for_side(float(close_price), tick, "sell")
     px_open_str = po._format_by_step(px_open, tick_raw)
 
+    # We want a HIGH open price, but still fillable fast.
+    # To avoid stale bids, take one more lightweight snapshot shortly before sending the order.
+    open_dt = payout_dt - timedelta(milliseconds=max(0, int(FAST_OPEN_LEAD_MS)))
+    if open_dt < datetime.now():
+        open_dt = payout_dt
+
+    # Snapshot bid/ask shortly before open_dt (still BEFORE payout, so it doesn't slow HH:MM:00).
+    bid_open = best_bid_fix
+    ask_open = best_ask_fix
+    snap_dt = open_dt - timedelta(milliseconds=120)
+    if snap_dt > datetime.now():
+        await _sleep_until(snap_dt)
+        ti2 = await _bybit_fetch_tickers_item(exchange_obj=exchange_obj, coin=p.coin)
+        if isinstance(ti2, dict):
+            try:
+                bid_open = float(ti2.get("bid1Price")) if ti2.get("bid1Price") is not None else bid_open
+            except Exception:
+                pass
+            try:
+                ask_open = float(ti2.get("ask1Price")) if ti2.get("ask1Price") is not None else ask_open
+            except Exception:
+                pass
+
     # Choose a fillable open limit for Sell:
-    # If close_price is above current best bid, a Sell limit at close_price won't fill and IOC cancels.
-    open_limit_raw = float(close_price)
-    if best_bid_fix is not None and best_bid_fix > 0:
-        open_limit_raw = min(open_limit_raw, float(best_bid_fix))
+    # For Sell IOC to fill immediately, limit must be <= current best bid. We cap by bid_open.
+    open_limit_raw = float(close_price) if close_price is not None else 0.0
+    if bid_open is not None and bid_open > 0:
+        open_limit_raw = min(open_limit_raw, float(bid_open))
     px_open = po._round_price_for_side(float(open_limit_raw), tick, "sell")
     px_open_str = po._format_by_step(px_open, tick_raw)
 
     post_logs.append(
-        f"🧠 План (БОЕВОЙ): открыть Short в {payout_dt.strftime('%H:%M:%S')} (Sell IOC) | qty={qty_str} | "
-        f"limit_open={px_open_str} (close_price={_fmt(close_price)}, best_bid_fix={_fmt(best_bid_fix)}) | "
+        f"🧠 План (БОЕВОЙ): открыть Short в {payout_dt.strftime('%H:%M:%S')} (Sell IOC, лимит) | qty={qty_str} | "
+        f"limit_open={px_open_str} (close_price={_fmt(close_price)}, bid_open={_fmt(bid_open)}, ask_open={_fmt(ask_open)}) | "
         f"затем закрывать Short c { (payout_dt + timedelta(seconds=max(0.0, float(FAST_CLOSE_DELAY_SEC)))).strftime('%H:%M:%S') } (Buy reduceOnly IOC, ∞ до закрытия или Ctrl+C)"
     )
 
-    open_dt = payout_dt - timedelta(milliseconds=max(0, int(FAST_OPEN_LEAD_MS)))
-    if open_dt < datetime.now():
-        open_dt = payout_dt
     await _sleep_until(open_dt)
 
     # --- CRITICAL WINDOW: no logs & minimal overhead ---
@@ -1613,8 +1634,8 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
         short_order_id = None
         short_place_err = "create_failed"
 
-    # If IOC didn't fill (Cancelled) we may want an immediate fallback to Market to ensure opening.
-    # Keep it best-effort and silent (no logs in critical window).
+    # If IOC didn't fill (Cancelled) we may want an optional immediate fallback to Market to ensure opening.
+    # Default is OFF (FUN_SHORT_OPEN_FALLBACK_MARKET=0) because user prefers limit only.
     if short_order_id and int(SHORT_OPEN_FALLBACK_MARKET) == 1:
         try:
             st0, filled0, _avg0 = await _bybit_wait_done_get_filled_qty(
@@ -1773,11 +1794,21 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
             # keep remaining in sync (in case of fills not captured by our last order status)
             remaining = min(remaining, float(qty_now))
 
+    t_close_done = datetime.now()
     avg_exit_short = (total_notional_close / total_filled_close) if total_filled_close > 0 else None
     logger.info(f"✅ Short закрыт | qty={_fmt(qty_pos)} | avg_exit_buy={_fmt(avg_exit_short)}")
 
-    t1_ms = int(time.time() * 1000) + 10_000
-    execs = await _bybit_fetch_executions(exchange_obj=exchange_obj, api_key=api_key, api_secret=api_secret, coin=p.coin, start_ms=t0_ms, end_ms=t1_ms)
+    # IMPORTANT: execution window must be around the actual trade, not from script start (script waits minutes before payout).
+    t_start_ms = int((t_send_open - timedelta(seconds=5)).timestamp() * 1000)
+    t_end_ms = int((t_close_done + timedelta(seconds=5)).timestamp() * 1000)
+    execs = await _bybit_fetch_executions(
+        exchange_obj=exchange_obj,
+        api_key=api_key,
+        api_secret=api_secret,
+        coin=p.coin,
+        start_ms=t_start_ms,
+        end_ms=t_end_ms,
+    )
     pnl_hist, buys_n, sells_n, avg_buy, avg_sell = _bybit_calc_pnl_usdt_from_execs(execs)
     logger.info(
         f"📊 Итог (БОЕВОЙ): монета={p.coin} | "
