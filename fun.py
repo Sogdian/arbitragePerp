@@ -84,6 +84,8 @@ FAST_CLOSE_DELAY_SEC = float(os.getenv("FUN_FAST_CLOSE_DELAY_SEC", "1.0"))  # st
 FAST_CLOSE_MAX_ATTEMPTS = int(os.getenv("FUN_FAST_CLOSE_MAX_ATTEMPTS", "15"))
 FAST_SILENT_TRADING = int(os.getenv("FUN_FAST_SILENT_TRADING", "1"))  # 1 => disable logging during open/close window
 FAST_OPEN_LEAD_MS = int(os.getenv("FUN_FAST_OPEN_LEAD_MS", "150"))  # send open slightly BEFORE payout to avoid lag
+FIX_PRICE_MODE = str(os.getenv("FUN_FIX_PRICE_MODE", "last") or "last").strip().lower()
+SHORT_OPEN_FALLBACK_MARKET = int(os.getenv("FUN_SHORT_OPEN_FALLBACK_MARKET", "1"))
 
 
 YES_WORDS = {"да", "y", "yes", "д"}
@@ -314,6 +316,45 @@ async def _bybit_place_limit(
     order_id = (data.get("result") or {}).get("orderId") if isinstance(data.get("result"), dict) else None
     if not order_id:
         raise RuntimeError(f"Bybit create order: no orderId: {data}")
+    return str(order_id)
+
+
+async def _bybit_place_market(
+    *,
+    exchange_obj: Any,
+    api_key: str,
+    api_secret: str,
+    coin: str,
+    side: str,  # "Buy" | "Sell"
+    qty_str: str,
+    reduce_only: Optional[bool] = None,
+    position_idx: Optional[int] = None,
+) -> str:
+    symbol = exchange_obj._normalize_symbol(coin)
+    body: Dict[str, Any] = {
+        "category": "linear",
+        "symbol": symbol,
+        "side": side,
+        "orderType": "Market",
+        "qty": qty_str,
+        "timeInForce": "IOC",
+    }
+    if reduce_only is not None:
+        body["reduceOnly"] = bool(reduce_only)
+    if position_idx is not None:
+        body["positionIdx"] = int(position_idx)
+    data = await po._bybit_private_post(
+        exchange_obj=exchange_obj,
+        api_key=api_key,
+        api_secret=api_secret,
+        path="/v5/order/create",
+        body=body,
+    )
+    if not isinstance(data, dict) or data.get("retCode") != 0:
+        raise RuntimeError(f"Bybit create market order failed: {data}")
+    order_id = (data.get("result") or {}).get("orderId") if isinstance(data.get("result"), dict) else None
+    if not order_id:
+        raise RuntimeError(f"Bybit create market order: no orderId: {data}")
     return str(order_id)
 
 
@@ -1454,15 +1495,28 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
     # OHLC wick (high/low) for the bucket that contains HH:MM:59
     _o, k_high, _l, k_close = ohlc if isinstance(ohlc, tuple) and len(ohlc) == 4 else (None, None, None, None)
 
-    # close_price for calculations: include wick (high) if it happened in this bucket.
-    close_candidates: List[float] = []
-    for v in (trade_px, last_px, ask1, best_ask_fix, bid1, best_bid_fix, k_high, k_close):
-        try:
-            if v is not None and float(v) > 0:
-                close_candidates.append(float(v))
-        except Exception:
-            continue
-    close_price = max(close_candidates) if close_candidates else None
+    # Price at HH:MM:59 (used for fair/target). Wick high is logged separately.
+    def _pick_fix_price() -> Optional[float]:
+        base_last = trade_px if (trade_px is not None and trade_px > 0) else (last_px if (last_px is not None and last_px > 0) else None)
+        if FIX_PRICE_MODE in ("last", "trade_last", "trade_or_last"):
+            return base_last
+        if FIX_PRICE_MODE in ("kclose", "kline_close"):
+            return k_close if (k_close is not None and k_close > 0) else base_last
+        if FIX_PRICE_MODE in ("wick", "high", "khigh", "kline_high"):
+            return k_high if (k_high is not None and k_high > 0) else base_last
+        if FIX_PRICE_MODE in ("max", "max_all"):
+            candidates: List[float] = []
+            for v in (trade_px, last_px, ask1, best_ask_fix, bid1, best_bid_fix, k_high, k_close):
+                try:
+                    if v is not None and float(v) > 0:
+                        candidates.append(float(v))
+                except Exception:
+                    continue
+            return max(candidates) if candidates else base_last
+        # default
+        return base_last
+
+    close_price = _pick_fix_price()
     if close_price is None or close_price <= 0:
         logger.error("❌ Не удалось зафиксировать цену close_price в HH:MM:59")
         return 2
@@ -1484,7 +1538,8 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
     post_logs.append(
         f"📌 Диагностика: last={_fmt(last_px)} trade={_fmt(trade_px)} ask1={_fmt(ask1)} bid1={_fmt(bid1)} "
         f"| ob_best_bid={_fmt(best_bid_fix)} ob_best_ask={_fmt(best_ask_fix)} | k_high={_fmt(k_high)} k_close={_fmt(k_close)} "
-        f"| fundingRate={_fmt(fr*100,3) if fr is not None else 'N/A'} predicted={_fmt(pred_fr*100,3) if pred_fr is not None else 'N/A'}"
+        f"| fundingRate={_fmt(fr*100,3) if fr is not None else 'N/A'} predicted={_fmt(pred_fr*100,3) if pred_fr is not None else 'N/A'} "
+        f"| fix_price_mode={FIX_PRICE_MODE}"
     )
 
     if not ob2 or not ob2.get("bids") or not ob2.get("asks"):
@@ -1557,6 +1612,45 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
     except Exception:
         short_order_id = None
         short_place_err = "create_failed"
+
+    # If IOC didn't fill (Cancelled) we may want an immediate fallback to Market to ensure opening.
+    # Keep it best-effort and silent (no logs in critical window).
+    if short_order_id and int(SHORT_OPEN_FALLBACK_MARKET) == 1:
+        try:
+            st0, filled0, _avg0 = await _bybit_wait_done_get_filled_qty(
+                exchange_obj=exchange_obj,
+                api_key=api_key,
+                api_secret=api_secret,
+                coin=p.coin,
+                order_id=str(short_order_id),
+                timeout_sec=0.25,
+                poll_sleep_sec=0.02,
+            )
+            if (not filled0 or float(filled0) <= 0) and (st0 or "").lower() in ("cancelled", "canceled", "rejected", "expired"):
+                try:
+                    short_order_id = await _bybit_place_market(
+                        exchange_obj=exchange_obj,
+                        api_key=api_key,
+                        api_secret=api_secret,
+                        coin=p.coin,
+                        side="Sell",
+                        qty_str=qty_str,
+                        reduce_only=None,
+                        position_idx=2,
+                    )
+                except Exception:
+                    short_order_id = await _bybit_place_market(
+                        exchange_obj=exchange_obj,
+                        api_key=api_key,
+                        api_secret=api_secret,
+                        coin=p.coin,
+                        side="Sell",
+                        qty_str=qty_str,
+                        reduce_only=None,
+                        position_idx=None,
+                    )
+        except Exception:
+            pass
 
     # 10:00:01 — start closing short (important to close even if open was partial)
     close_dt = payout_dt + timedelta(seconds=max(0.0, float(FAST_CLOSE_DELAY_SEC)))

@@ -22,6 +22,8 @@ FUN_FAST_CLOSE_DELAY_SEC=1.0
 FUN_FAST_CLOSE_MAX_ATTEMPTS=15
 FUN_FAST_SILENT_TRADING=1
 FUN_FAST_OPEN_LEAD_MS=150
+FUN_FIX_PRICE_MODE=last
+FUN_SHORT_OPEN_FALLBACK_MARKET=1
 # Для фиксации close_price в HH:MM:59 по умолчанию достаточно 1m (close последней 1m-свечи).
 # Важно: большие интервалы (например 60) могут вернуть "предыдущую закрытую свечу", что не равно цене в HH:MM:59.
 FUN_FIX_KLINE_INTERVAL=1
