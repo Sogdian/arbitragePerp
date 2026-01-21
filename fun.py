@@ -205,22 +205,35 @@ def _next_funding_time_to_local_hhmm(next_funding_time: Optional[int], exchange:
 
 
 async def _sleep_until(dt_local: datetime) -> None:
+    """
+    Best-effort precise sleep for local (naive) datetime.
+    On Windows `asyncio.sleep()` can overshoot; we use dynamic sleeps and a short busy-wait tail.
+    """
+    # Coarse sleep with a safety margin, then a short busy-wait for the last ~20ms.
     while True:
         now = datetime.now()
         sec = (dt_local - now).total_seconds()
         if sec <= 0:
             return
-        # Более точное ожидание (особенно на Windows), чтобы не просыпаться на +200ms.
         if sec > 1.0:
-            await asyncio.sleep(0.2)
-        elif sec > 0.2:
-            await asyncio.sleep(0.05)
-        elif sec > 0.05:
-            await asyncio.sleep(0.01)
-        elif sec > 0.01:
-            await asyncio.sleep(0.002)
-        else:
-            await asyncio.sleep(min(0.001, sec))
+            await asyncio.sleep(min(0.5, max(0.05, sec - 0.6)))
+            continue
+        if sec > 0.2:
+            await asyncio.sleep(max(0.02, sec - 0.12))
+            continue
+        if sec > 0.05:
+            await asyncio.sleep(max(0.005, sec - 0.03))
+            continue
+        if sec > 0.02:
+            await asyncio.sleep(max(0.001, sec / 2))
+            continue
+
+        # Busy-wait tail (keep short to avoid burning CPU).
+        deadline = time.perf_counter() + max(0.0, sec)
+        while time.perf_counter() < deadline:
+            # 1ms granularity works reasonably on Windows when timer resolution is coarse.
+            time.sleep(0.001)
+        return
 
 
 def _ticker_last_price(t: Optional[Dict[str, Any]]) -> Optional[float]:
@@ -1268,17 +1281,23 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
     logger.info(f"⏳ Ждём фиксации цены/стакана: {fix_dt.strftime('%H:%M:%S')} (локальное время)")
     await _sleep_until(fix_dt)
 
-    # Fix close_price at 09:59:59 using kline close for configured interval (can be 60m via FUN_FIX_KLINE_INTERVAL=60)
+    # Fix close_price at HH:MM:59.
+    # IMPORTANT for speed/realism: for trading we prefer actual last price/trade at that moment.
     t_fix = await exchange_obj.get_futures_ticker(p.coin)
-    close_price = _ticker_last_price(t_fix)
+    ticker_px = _ticker_last_price(t_fix)
+    close_price = ticker_px
+    kline_close: Optional[float] = None
+    trade_px: Optional[float] = None
     try:
         fix_ms = int(fix_dt.timestamp() * 1000)
+        # Best-effort chart close (may be "previous completed candle" for larger intervals).
         kline_close = await _bybit_kline_close_for_minute_ending_at(exchange_obj=exchange_obj, coin=p.coin, end_ms_inclusive=fix_ms)
-        if kline_close is not None and kline_close > 0:
-            close_price = float(kline_close)
+        # Best-effort last public trade before fix timestamp.
         trade_px = await _bybit_last_trade_price_before(exchange_obj=exchange_obj, coin=p.coin, before_ms=fix_ms)
-        if (kline_close is None or kline_close <= 0) and trade_px is not None and trade_px > 0:
+        if trade_px is not None and trade_px > 0:
             close_price = float(trade_px)
+        elif close_price is None and kline_close is not None and kline_close > 0:
+            close_price = float(kline_close)
     except Exception:
         pass
     if close_price is None or close_price <= 0:
@@ -1297,33 +1316,33 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
         f"📌 Фиксация: close_price={_fmt(close_price)} | fair={_fmt(fair_price)} | long_target={_fmt(long_target_price)} "
         f"(funding={_fmt(p.funding_pct*100,3)}%, offset={_fmt(p.offset_pct*100,3)}%)"
     )
+    if kline_close is not None and kline_close > 0 and close_price is not None and close_price > 0:
+        try:
+            diff_pct = (float(kline_close) - float(close_price)) / float(close_price) * 100.0
+            logger.info(f"📌 Диагностика цены: ticker/trade={_fmt(close_price)} | kline({FIX_KLINE_INTERVAL}m)={_fmt(kline_close)} | diff={_fmt(diff_pct, 3)}%")
+        except Exception:
+            pass
 
-    # Snapshot orderbook at 09:59:59 (so that 10:00:00 has no orderbook calls).
+    # Snapshot orderbook at HH:MM:59 (so that HH:MM:00 has no orderbook calls).
     ob2 = await exchange_obj.get_orderbook(p.coin, limit=MAIN_OB_LEVELS)
     if not ob2 or not ob2.get("bids") or not ob2.get("asks"):
         logger.error("❌ Bybit: orderbook недоступен для открытия (09:59:59)")
         return 2
 
-    # Decide opening short limit (aggressive) from bids snapshot: price at which cum bids >= qty (within first N levels).
-    bids2 = (ob2.get("bids") or [])[: max(1, min(int(SHORT_OPEN_LEVELS), 10, MAIN_OB_LEVELS))]
-    px_level_open, cum_open = po._price_level_for_target_size(bids2, float(p.coin_qty))
-    if px_level_open is None:
-        # IOC allows partial; still try at best bid
-        try:
-            px_level_open = float(bids2[0][0])
-            cum_open = float(bids2[0][1]) if len(bids2[0]) > 1 else 0.0
-        except Exception:
-            logger.error("❌ Bybit: не удалось подобрать цену открытия Short по стакану")
-            return 2
-    px_open = po._round_price_for_side(float(px_level_open), tick, "sell")
+    # IMPORTANT (per requirement): open Short exactly by close_price (as fixed at HH:MM:59)
+    if close_price is None or close_price <= 0:
+        logger.error("❌ close_price некорректен для открытия Short")
+        return 2
+    px_open = po._round_price_for_side(float(close_price), tick, "sell")
     px_open_str = po._format_by_step(px_open, tick_raw)
 
-    logger.info(
-        f"🧠 План (БОЕВОЙ): открыть Short в {payout_dt.strftime('%H:%M:%S')} (Sell IOC) | qty={qty_str} | limit={px_open_str} | "
-        f"cum_bids~{_fmt(cum_open)} | затем закрывать Short c { (payout_dt + timedelta(seconds=max(0.0, float(FAST_CLOSE_DELAY_SEC)))).strftime('%H:%M:%S') } (Buy reduceOnly IOC, {FAST_CLOSE_MAX_ATTEMPTS} попыток)"
+    # Collect important logs, but print them ONLY after all orders are done (to not waste time at HH:MM:00).
+    post_logs: List[str] = []
+    post_logs.append(
+        f"🧠 План (БОЕВОЙ): открыть Short в {payout_dt.strftime('%H:%M:%S')} (Sell IOC) | qty={qty_str} | limit={px_open_str} (close_price={_fmt(close_price)}) | "
+        f"затем закрывать Short c { (payout_dt + timedelta(seconds=max(0.0, float(FAST_CLOSE_DELAY_SEC)))).strftime('%H:%M:%S') } (Buy reduceOnly IOC, {FAST_CLOSE_MAX_ATTEMPTS} попыток)"
     )
 
-    logger.info(f"⏳ Ждём времени выплаты: {payout_dt.strftime('%H:%M:%S')} (локальное время)")
     await _sleep_until(payout_dt)
 
     # --- CRITICAL WINDOW: no logs & minimal overhead ---
@@ -1334,6 +1353,8 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
 
     # 10:00:00.000 — place ONE Short (Sell IOC) with the precomputed limit, no orderbook/price calls here.
     short_order_id: Optional[str] = None
+    short_place_err: Optional[str] = None
+    t_send_open = datetime.now()
     try:
         try:
             short_order_id = await _bybit_place_limit(
@@ -1363,15 +1384,32 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
             )
     except Exception:
         short_order_id = None
+        short_place_err = "create_failed"
 
     # 10:00:01 — start closing short (important to close even if open was partial)
     close_dt = payout_dt + timedelta(seconds=max(0.0, float(FAST_CLOSE_DELAY_SEC)))
     await _sleep_until(close_dt)
+    t_close_start = datetime.now()
 
     # Re-enable logging after the strict window (but keep it minimal until fully closed)
     if old_disable_level is not None:
         logging.disable(old_disable_level)
         old_disable_level = None
+
+    # Print delayed plan/logs here (after critical window), but still before any heavy post-trade analysis.
+    for m in post_logs:
+        logger.info(m)
+    logger.info(f"⏱️ Тайминги: отправка_short={t_send_open.strftime('%H:%M:%S.%f')[:-3]} | старт_закрытия={t_close_start.strftime('%H:%M:%S.%f')[:-3]}")
+    if short_place_err:
+        logger.warning(f"⚠️ Short: ошибка создания ордера в критический момент: {short_place_err}")
+    if short_order_id:
+        try:
+            st_open, filled_open, avg_open = await _bybit_get_order_status(
+                exchange_obj=exchange_obj, api_key=api_key, api_secret=api_secret, coin=p.coin, order_id=str(short_order_id)
+            )
+            logger.info(f"📌 Short ордер: статус={st_open} | filled={_fmt(filled_open)} | avg_px={_fmt(avg_open)}")
+        except Exception:
+            pass
 
     qty_pos = await _bybit_get_short_position_qty(exchange_obj=exchange_obj, api_key=api_key, api_secret=api_secret, coin=p.coin)
     if qty_pos <= 0:
