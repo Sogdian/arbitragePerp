@@ -83,6 +83,7 @@ FAST_PREP_LEAD_SEC = float(os.getenv("FUN_FAST_PREP_LEAD_SEC", "2.0"))  # do pre
 FAST_CLOSE_DELAY_SEC = float(os.getenv("FUN_FAST_CLOSE_DELAY_SEC", "1.0"))  # start closing at payout+1s
 FAST_CLOSE_MAX_ATTEMPTS = int(os.getenv("FUN_FAST_CLOSE_MAX_ATTEMPTS", "15"))
 FAST_SILENT_TRADING = int(os.getenv("FUN_FAST_SILENT_TRADING", "1"))  # 1 => disable logging during open/close window
+FAST_OPEN_LEAD_MS = int(os.getenv("FUN_FAST_OPEN_LEAD_MS", "150"))  # send open slightly BEFORE payout to avoid lag
 
 
 YES_WORDS = {"да", "y", "yes", "д"}
@@ -630,6 +631,25 @@ async def _bybit_fetch_recent_trades(*, exchange_obj: Any, coin: str, limit: int
         return []
 
 
+async def _bybit_fetch_tickers_item(*, exchange_obj: Any, coin: str) -> Optional[Dict[str, Any]]:
+    """
+    Bybit v5: /v5/market/tickers (raw item for the symbol).
+    We use it to extract last/bid/ask and (predicted) funding right before payout.
+    """
+    try:
+        symbol = exchange_obj._normalize_symbol(coin)
+        params: Dict[str, Any] = {"category": "linear", "symbol": symbol}
+        data = await exchange_obj._request_json("GET", "/v5/market/tickers", params=params)
+        if not (isinstance(data, dict) and data.get("retCode") == 0):
+            return None
+        items = (data.get("result") or {}).get("list") or []
+        if not items or not isinstance(items, list) or not isinstance(items[0], dict):
+            return None
+        return items[0]
+    except Exception:
+        return None
+
+
 def _bybit_parse_trade_time_ms(it: Dict[str, Any]) -> Optional[int]:
     for k in ("tradeTimeMs", "time", "execTime", "timestamp", "ts"):
         v = it.get(k)
@@ -761,6 +781,63 @@ async def _bybit_kline_close_for_minute_ending_at(
             best_close = close_px
             break
     return best_close
+
+
+async def _bybit_kline_ohlc_for_bucket_ending_at(
+    *,
+    exchange_obj: Any,
+    coin: str,
+    end_ms_inclusive: int,
+) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
+    """
+    Returns (open, high, low, close) for the configured kline interval bucket that contains end_ms_inclusive.
+    Useful to capture wick (high/low) around HH:MM:59.
+    """
+    try:
+        try:
+            interval_min = int(str(FIX_KLINE_INTERVAL).strip())
+        except Exception:
+            interval_min = 1
+        interval_min = max(1, int(interval_min))
+        bucket_ms = int(interval_min) * 60_000
+        bucket_start_ms = int(end_ms_inclusive - (end_ms_inclusive % bucket_ms))
+        items = await _bybit_fetch_kline(
+            exchange_obj=exchange_obj,
+            coin=coin,
+            interval=FIX_KLINE_INTERVAL,
+            start_ms=bucket_start_ms,
+            end_ms=bucket_start_ms + bucket_ms,
+            limit=10,
+        )
+        for it in items:
+            if not isinstance(it, list) or len(it) < 5:
+                continue
+            try:
+                st = int(float(it[0]))
+            except Exception:
+                continue
+            if st != bucket_start_ms:
+                continue
+            try:
+                o = float(it[1])
+            except Exception:
+                o = None
+            try:
+                h = float(it[2])
+            except Exception:
+                h = None
+            try:
+                l = float(it[3])
+            except Exception:
+                l = None
+            try:
+                c = float(it[4])
+            except Exception:
+                c = None
+            return o, h, l, c
+    except Exception:
+        pass
+    return None, None, None, None
 
 def _bybit_calc_pnl_usdt_from_execs(execs: List[Dict[str, Any]]) -> Tuple[Optional[float], int, int, Optional[float], Optional[float]]:
     """
@@ -1281,38 +1358,113 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
     logger.info(f"⏳ Ждём фиксации цены/стакана: {fix_dt.strftime('%H:%M:%S')} (локальное время)")
     await _sleep_until(fix_dt)
 
-    # Refresh funding right before payout (UI can change close to the payout moment).
-    try:
-        funding_info_now = await exchange_obj.get_funding_info(p.coin)
-        if isinstance(funding_info_now, dict) and funding_info_now.get("funding_rate") is not None:
+    # Capture everything we need (funding/price/orderbook/wick) in parallel at HH:MM:59.
+    fix_ms = int(fix_dt.timestamp() * 1000)
+    tick_item_task = asyncio.create_task(_bybit_fetch_tickers_item(exchange_obj=exchange_obj, coin=p.coin))
+    ob2_task = asyncio.create_task(exchange_obj.get_orderbook(p.coin, limit=MAIN_OB_LEVELS))
+    trades_task = asyncio.create_task(_bybit_fetch_recent_trades(exchange_obj=exchange_obj, coin=p.coin, limit=200))
+    ohlc_task = asyncio.create_task(_bybit_kline_ohlc_for_bucket_ending_at(exchange_obj=exchange_obj, coin=p.coin, end_ms_inclusive=fix_ms))
+
+    done, pending = await asyncio.wait({tick_item_task, ob2_task, trades_task, ohlc_task}, timeout=0.9)
+    for t in pending:
+        t.cancel()
+
+    tick_item = tick_item_task.result() if tick_item_task in done else None
+    ob2 = ob2_task.result() if ob2_task in done else None
+    trades = trades_task.result() if trades_task in done else []
+    ohlc = ohlc_task.result() if ohlc_task in done else (None, None, None, None)
+
+    # Funding right before payout: prefer predictedFundingRate if present; fallback to fundingRate.
+    pred_fr = None
+    fr = None
+    if isinstance(tick_item, dict):
+        for k in ("predictedFundingRate", "predFundingRate", "predicted_funding_rate"):
+            v = tick_item.get(k)
+            if v is None:
+                continue
             try:
-                p.funding_pct = float(funding_info_now.get("funding_rate"))
+                pred_fr = float(v)
+                break
             except Exception:
                 pass
-    except Exception:
-        pass
+        v = tick_item.get("fundingRate")
+        if v is not None:
+            try:
+                fr = float(v)
+            except Exception:
+                pass
+    if pred_fr is not None:
+        p.funding_pct = float(pred_fr)
+    elif fr is not None:
+        p.funding_pct = float(fr)
 
-    # Fix close_price at HH:MM:59.
-    # IMPORTANT for speed/realism: for trading we prefer actual last price/trade at that moment.
-    t_fix = await exchange_obj.get_futures_ticker(p.coin)
-    ticker_px = _ticker_last_price(t_fix)
-    close_price = ticker_px
-    kline_close: Optional[float] = None
+    # Extract best bid/ask at HH:MM:59 (needed for a fillable Sell limit).
+    best_bid_fix: Optional[float] = None
+    best_ask_fix: Optional[float] = None
+    if isinstance(ob2, dict):
+        try:
+            if ob2.get("bids"):
+                best_bid_fix = float(ob2["bids"][0][0])
+            if ob2.get("asks"):
+                best_ask_fix = float(ob2["asks"][0][0])
+        except Exception:
+            best_bid_fix = None
+            best_ask_fix = None
+
+    # Extract last/bid/ask from tickers item (same endpoint as UI).
+    last_px: Optional[float] = None
+    bid1: Optional[float] = None
+    ask1: Optional[float] = None
+    if isinstance(tick_item, dict):
+        try:
+            last_px = float(tick_item.get("lastPrice")) if tick_item.get("lastPrice") is not None else None
+        except Exception:
+            last_px = None
+        try:
+            bid1 = float(tick_item.get("bid1Price")) if tick_item.get("bid1Price") is not None else None
+        except Exception:
+            bid1 = None
+        try:
+            ask1 = float(tick_item.get("ask1Price")) if tick_item.get("ask1Price") is not None else None
+        except Exception:
+            ask1 = None
+
+    # Last trade price <= fix timestamp
     trade_px: Optional[float] = None
     try:
-        fix_ms = int(fix_dt.timestamp() * 1000)
-        # Best-effort chart close (may be "previous completed candle" for larger intervals).
-        kline_close = await _bybit_kline_close_for_minute_ending_at(exchange_obj=exchange_obj, coin=p.coin, end_ms_inclusive=fix_ms)
-        # Best-effort last public trade before fix timestamp.
-        trade_px = await _bybit_last_trade_price_before(exchange_obj=exchange_obj, coin=p.coin, before_ms=fix_ms)
-        if trade_px is not None and trade_px > 0:
-            close_price = float(trade_px)
-        elif close_price is None and kline_close is not None and kline_close > 0:
-            close_price = float(kline_close)
+        best_t: Optional[int] = None
+        best_px: Optional[float] = None
+        for it in (trades or []):
+            if not isinstance(it, dict):
+                continue
+            tms = _bybit_parse_trade_time_ms(it)
+            if tms is None or tms > fix_ms:
+                continue
+            px = _bybit_parse_trade_price(it)
+            if px is None:
+                continue
+            if best_t is None or tms > best_t:
+                best_t = tms
+                best_px = float(px)
+        if best_px is not None and best_px > 0:
+            trade_px = float(best_px)
     except Exception:
-        pass
+        trade_px = None
+
+    # OHLC wick (high/low) for the bucket that contains HH:MM:59
+    _o, k_high, _l, k_close = ohlc if isinstance(ohlc, tuple) and len(ohlc) == 4 else (None, None, None, None)
+
+    # close_price for calculations: include wick (high) if it happened in this bucket.
+    close_candidates: List[float] = []
+    for v in (trade_px, last_px, ask1, best_ask_fix, bid1, best_bid_fix, k_high, k_close):
+        try:
+            if v is not None and float(v) > 0:
+                close_candidates.append(float(v))
+        except Exception:
+            continue
+    close_price = max(close_candidates) if close_candidates else None
     if close_price is None or close_price <= 0:
-        logger.error("❌ Не удалось зафиксировать цену close_price в 09:59:59")
+        logger.error("❌ Не удалось зафиксировать цену close_price в HH:MM:59")
         return 2
 
     # fair_price = close_price - (close_price × (|funding_pct| + |offset_pct|))
@@ -1323,21 +1475,20 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
     # 3. Вычитаем от close_price
     fair_price = close_price - deduction  # 0.10412 - 0.00118801 ≈ 0.10293199
     long_target_price = fair_price  # long_target = fair (одинаковая формула)
-    logger.info(
+    # Collect important logs, but print them ONLY after the critical window (to not waste time at HH:MM:00).
+    post_logs: List[str] = []
+    post_logs.append(
         f"📌 Фиксация: close_price={_fmt(close_price)} | fair={_fmt(fair_price)} | long_target={_fmt(long_target_price)} "
         f"(funding={_fmt(p.funding_pct*100,3)}%, offset={_fmt(p.offset_pct*100,3)}%)"
     )
-    if kline_close is not None and kline_close > 0 and close_price is not None and close_price > 0:
-        try:
-            diff_pct = (float(kline_close) - float(close_price)) / float(close_price) * 100.0
-            logger.info(f"📌 Диагностика цены: ticker/trade={_fmt(close_price)} | kline({FIX_KLINE_INTERVAL}m)={_fmt(kline_close)} | diff={_fmt(diff_pct, 3)}%")
-        except Exception:
-            pass
+    post_logs.append(
+        f"📌 Диагностика: last={_fmt(last_px)} trade={_fmt(trade_px)} ask1={_fmt(ask1)} bid1={_fmt(bid1)} "
+        f"| ob_best_bid={_fmt(best_bid_fix)} ob_best_ask={_fmt(best_ask_fix)} | k_high={_fmt(k_high)} k_close={_fmt(k_close)} "
+        f"| fundingRate={_fmt(fr*100,3) if fr is not None else 'N/A'} predicted={_fmt(pred_fr*100,3) if pred_fr is not None else 'N/A'}"
+    )
 
-    # Snapshot orderbook at HH:MM:59 (so that HH:MM:00 has no orderbook calls).
-    ob2 = await exchange_obj.get_orderbook(p.coin, limit=MAIN_OB_LEVELS)
     if not ob2 or not ob2.get("bids") or not ob2.get("asks"):
-        logger.error("❌ Bybit: orderbook недоступен для открытия (09:59:59)")
+        logger.error("❌ Bybit: orderbook недоступен для открытия (HH:MM:59)")
         return 2
 
     # IMPORTANT (per requirement): open Short exactly by close_price (as fixed at HH:MM:59)
@@ -1347,14 +1498,24 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
     px_open = po._round_price_for_side(float(close_price), tick, "sell")
     px_open_str = po._format_by_step(px_open, tick_raw)
 
-    # Collect important logs, but print them ONLY after all orders are done (to not waste time at HH:MM:00).
-    post_logs: List[str] = []
+    # Choose a fillable open limit for Sell:
+    # If close_price is above current best bid, a Sell limit at close_price won't fill and IOC cancels.
+    open_limit_raw = float(close_price)
+    if best_bid_fix is not None and best_bid_fix > 0:
+        open_limit_raw = min(open_limit_raw, float(best_bid_fix))
+    px_open = po._round_price_for_side(float(open_limit_raw), tick, "sell")
+    px_open_str = po._format_by_step(px_open, tick_raw)
+
     post_logs.append(
-        f"🧠 План (БОЕВОЙ): открыть Short в {payout_dt.strftime('%H:%M:%S')} (Sell IOC) | qty={qty_str} | limit={px_open_str} (close_price={_fmt(close_price)}) | "
-        f"затем закрывать Short c { (payout_dt + timedelta(seconds=max(0.0, float(FAST_CLOSE_DELAY_SEC)))).strftime('%H:%M:%S') } (Buy reduceOnly IOC, ∞ попыток до закрытия или Ctrl+C)"
+        f"🧠 План (БОЕВОЙ): открыть Short в {payout_dt.strftime('%H:%M:%S')} (Sell IOC) | qty={qty_str} | "
+        f"limit_open={px_open_str} (close_price={_fmt(close_price)}, best_bid_fix={_fmt(best_bid_fix)}) | "
+        f"затем закрывать Short c { (payout_dt + timedelta(seconds=max(0.0, float(FAST_CLOSE_DELAY_SEC)))).strftime('%H:%M:%S') } (Buy reduceOnly IOC, ∞ до закрытия или Ctrl+C)"
     )
 
-    await _sleep_until(payout_dt)
+    open_dt = payout_dt - timedelta(milliseconds=max(0, int(FAST_OPEN_LEAD_MS)))
+    if open_dt < datetime.now():
+        open_dt = payout_dt
+    await _sleep_until(open_dt)
 
     # --- CRITICAL WINDOW: no logs & minimal overhead ---
     old_disable_level = None
