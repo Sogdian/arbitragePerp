@@ -17,6 +17,12 @@ pip install -r requirements.txt
 ```
 LOG_FILE=arbitrage_perp_bot.log
 LOG_LEVEL=INFO
+FUN_FAST_PREP_LEAD_SEC=2.0
+FUN_FAST_CLOSE_DELAY_SEC=1.0
+FUN_FAST_CLOSE_MAX_ATTEMPTS=15
+FUN_FAST_SILENT_TRADING=1
+# Чтобы close_price было ближе к "часовой свече" из UI (best-effort):
+FUN_FIX_KLINE_INTERVAL=60
 ```
 
 ## ⚠️ Важно: Работа с терминалом
@@ -33,7 +39,7 @@ python scan_spreads.py (тут SCAN_COIN_INVEST)
 python one_coin_bot.py CLO (тут SCAN_COIN_INVEST)
 python bot.py "STO Long (mexc), Short (bybit) 30" --no-monitor (30 = количество монет CVC)
 python scan_fundings.py
-python fun.py "STO Bybit 30 -0.3%"
+python fun.py "RIVER Bybit 30 -0.3%"
 ```
 
 **macOS:**
