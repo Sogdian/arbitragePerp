@@ -146,6 +146,7 @@ class FunParams:
     funding_pct: Optional[float] = None  # decimal, e.g. -0.02 (получается из API)
     payout_hh: Optional[int] = None  # получается из API
     payout_mm: Optional[int] = None  # получается из API
+    next_funding_time_ms: Optional[int] = None  # server epoch ms from Bybit tickers.nextFundingTime
 
 
 def parse_cmd(cmd: str) -> FunParams:
@@ -236,6 +237,36 @@ async def _sleep_until(dt_local: datetime) -> None:
         deadline = time.perf_counter() + max(0.0, sec)
         while time.perf_counter() < deadline:
             # 1ms granularity works reasonably on Windows when timer resolution is coarse.
+            time.sleep(0.001)
+        return
+
+
+async def _sleep_until_epoch_ms(target_epoch_ms: int) -> None:
+    """
+    Best-effort precise sleep until local epoch ms (time.time()*1000).
+    Uses dynamic sleeps + short busy-wait tail (Windows-friendly).
+    """
+    target = int(target_epoch_ms)
+    while True:
+        now_ms = int(time.time() * 1000)
+        delta = target - now_ms
+        if delta <= 0:
+            return
+        if delta > 1500:
+            await asyncio.sleep(max(0.05, (delta - 800) / 1000.0))
+            continue
+        if delta > 300:
+            await asyncio.sleep(max(0.02, (delta - 160) / 1000.0))
+            continue
+        if delta > 80:
+            await asyncio.sleep(max(0.005, (delta - 40) / 1000.0))
+            continue
+        if delta > 25:
+            await asyncio.sleep(max(0.001, delta / 2000.0))
+            continue
+        # Busy-wait tail (<=25ms)
+        deadline = time.perf_counter() + (delta / 1000.0)
+        while time.perf_counter() < deadline:
             time.sleep(0.001)
         return
 
@@ -690,6 +721,79 @@ async def _bybit_fetch_tickers_item(*, exchange_obj: Any, coin: str) -> Optional
         return items[0]
     except Exception:
         return None
+
+
+async def _bybit_get_server_time_ms(*, exchange_obj: Any) -> Optional[int]:
+    """
+    Bybit v5: /v5/market/time
+    Returns server epoch ms (best-effort).
+    """
+    try:
+        data = await exchange_obj._request_json("GET", "/v5/market/time", params={})
+        if not (isinstance(data, dict) and data.get("retCode") == 0):
+            return None
+        r = data.get("result") or {}
+        if not isinstance(r, dict):
+            return None
+        # Prefer ns if present
+        tn = r.get("timeNano")
+        if tn is not None:
+            try:
+                ns = int(str(tn))
+                if ns > 0:
+                    return int(ns // 1_000_000)
+            except Exception:
+                pass
+        ts = r.get("timeSecond")
+        if ts is not None:
+            try:
+                sec = int(str(ts))
+                if sec > 0:
+                    return int(sec * 1000)
+            except Exception:
+                pass
+        # Fallback keys
+        for k in ("time", "serverTime", "server_time"):
+            v = r.get(k)
+            if v is None:
+                continue
+            try:
+                x = int(float(v))
+                if x > 10_000_000_000:  # ms
+                    return x
+                if x > 0:  # sec
+                    return x * 1000
+            except Exception:
+                continue
+        return None
+    except Exception:
+        return None
+
+
+async def _bybit_estimate_time_offset_ms(*, exchange_obj: Any, samples: int = 5) -> Optional[int]:
+    """
+    Estimate offset_ms = server_ms - local_ms (local_ms is time.time()*1000).
+    Uses multiple samples and returns median to reduce jitter.
+    """
+    try:
+        n = max(1, min(int(samples), 9))
+    except Exception:
+        n = 5
+    offsets: List[int] = []
+    for i in range(n):
+        t0 = int(time.time() * 1000)
+        srv = await _bybit_get_server_time_ms(exchange_obj=exchange_obj)
+        t1 = int(time.time() * 1000)
+        if srv is None:
+            continue
+        mid = (t0 + t1) // 2
+        offsets.append(int(srv - mid))
+        # tiny pause to decorrelate samples
+        await asyncio.sleep(0.02)
+    if not offsets:
+        return None
+    offsets.sort()
+    return int(offsets[len(offsets) // 2])
 
 
 def _bybit_parse_trade_time_ms(it: Dict[str, Any]) -> Optional[int]:
@@ -1232,6 +1336,10 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
     
     # Заполняем параметры из API
     p.funding_pct = float(funding_rate)
+    try:
+        p.next_funding_time_ms = int(next_funding_time) if next_funding_time is not None else None
+    except Exception:
+        p.next_funding_time_ms = None
     payout_hhmm = _next_funding_time_to_local_hhmm(next_funding_time, "bybit")
     if payout_hhmm:
         p.payout_hh, p.payout_mm = payout_hhmm
@@ -1365,23 +1473,29 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
         logger.info("Отклонено пользователем. Завершаем.")
         return 0
 
-    # Проверяем, что funding_pct и payout_hh/payout_mm заполнены из API
-    if p.funding_pct is None or p.payout_hh is None or p.payout_mm is None:
-        logger.error("❌ Не удалось получить данные о фандинге из API")
+    # Проверяем, что funding_pct и next_funding_time_ms заполнены из API
+    if p.funding_pct is None or p.next_funding_time_ms is None:
+        logger.error("❌ Не удалось получить данные о фандинге/времени выплаты из API")
         return 2
 
-    payout_dt = _local_dt_today(p.payout_hh, p.payout_mm)
-    now = datetime.now()
-    if now > payout_dt:
-        logger.error(f"❌ Скрипт запущен после времени выплаты: now={now.strftime('%H:%M:%S')} > payout={payout_dt.strftime('%H:%M:%S')}")
+    payout_server_ms = int(p.next_funding_time_ms)
+    # Sync with Bybit server time to avoid relying on local clock.
+    offset_ms = await _bybit_estimate_time_offset_ms(exchange_obj=exchange_obj, samples=5)
+    if offset_ms is None:
+        logger.error("❌ Не удалось получить Bybit server time для синхронизации (market/time)")
+        return 2
+    # local_target_ms = server_target_ms - offset_ms
+    payout_local_ms = int(payout_server_ms - offset_ms)
+    now_local_ms = int(time.time() * 1000)
+    if now_local_ms > payout_local_ms + 50:
+        logger.error("❌ Скрипт запущен после времени выплаты (по server time Bybit)")
         return 2
 
-    # --- FAST mode: everything heavy BEFORE 09:59:59, and no price/orderbook calls at 10:00:00 ---
-    prep_dt = payout_dt - timedelta(seconds=max(0.0, float(FAST_PREP_LEAD_SEC)))
-    if prep_dt < now:
-        prep_dt = now
-    logger.info(f"⏳ Ждём подготовки (filters/isolated/leverage) до: {prep_dt.strftime('%H:%M:%S')} (локальное время)")
-    await _sleep_until(prep_dt)
+    # --- FAST mode (server-time synced): plan by Bybit server timestamp ---
+    prep_server_ms = int(payout_server_ms - int(max(0.0, float(FAST_PREP_LEAD_SEC)) * 1000))
+    prep_local_ms = int(prep_server_ms - offset_ms)
+    logger.info(f"⏳ Ждём подготовки (server-time) | offset_ms={offset_ms} | до: {datetime.fromtimestamp(prep_local_ms/1000.0).strftime('%H:%M:%S')} (локальное время)")
+    await _sleep_until_epoch_ms(prep_local_ms)
 
     # Prepare trading settings (isolated + leverage 1) BEFORE payout time
     ok_prep = await po._prepare_exchange_for_trading(exchange_name="bybit", exchange_obj=exchange_obj, coin=p.coin)
@@ -1396,12 +1510,13 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
     tick = float(tick_raw) if tick_raw else 0.0
     qty_str = po._format_by_step(p.coin_qty, qty_step_raw)
 
-    fix_dt = payout_dt - timedelta(seconds=1)
-    logger.info(f"⏳ Ждём фиксации цены/стакана: {fix_dt.strftime('%H:%M:%S')} (локальное время)")
-    await _sleep_until(fix_dt)
+    fix_server_ms = int(payout_server_ms - 1000)
+    fix_local_ms = int(fix_server_ms - offset_ms)
+    logger.info(f"⏳ Ждём фиксации цены/стакана (server-time): {datetime.fromtimestamp(fix_local_ms/1000.0).strftime('%H:%M:%S')} (локальное время)")
+    await _sleep_until_epoch_ms(fix_local_ms)
 
-    # Capture everything we need (funding/price/orderbook/wick) in parallel at HH:MM:59.
-    fix_ms = int(fix_dt.timestamp() * 1000)
+    # Capture everything we need (funding/price/orderbook/wick) in parallel at server fix time.
+    fix_ms = int(fix_server_ms)
     tick_item_task = asyncio.create_task(_bybit_fetch_tickers_item(exchange_obj=exchange_obj, coin=p.coin))
     ob2_task = asyncio.create_task(exchange_obj.get_orderbook(p.coin, limit=MAIN_OB_LEVELS))
     trades_task = asyncio.create_task(_bybit_fetch_recent_trades(exchange_obj=exchange_obj, coin=p.coin, limit=200))
@@ -1556,26 +1671,11 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
 
     # We want a HIGH open price, but still fillable fast.
     # To avoid stale bids, take one more lightweight snapshot shortly before sending the order.
-    open_dt = payout_dt - timedelta(milliseconds=max(0, int(FAST_OPEN_LEAD_MS)))
-    if open_dt < datetime.now():
-        open_dt = payout_dt
-
-    # Snapshot bid/ask shortly before open_dt (still BEFORE payout, so it doesn't slow HH:MM:00).
+    open_server_ms = int(payout_server_ms - max(0, int(FAST_OPEN_LEAD_MS)))
+    open_local_ms = int(open_server_ms - offset_ms)
+    # No extra API calls between fix and open; use the snapshot from fix time.
     bid_open = best_bid_fix
     ask_open = best_ask_fix
-    snap_dt = open_dt - timedelta(milliseconds=120)
-    if snap_dt > datetime.now():
-        await _sleep_until(snap_dt)
-        ti2 = await _bybit_fetch_tickers_item(exchange_obj=exchange_obj, coin=p.coin)
-        if isinstance(ti2, dict):
-            try:
-                bid_open = float(ti2.get("bid1Price")) if ti2.get("bid1Price") is not None else bid_open
-            except Exception:
-                pass
-            try:
-                ask_open = float(ti2.get("ask1Price")) if ti2.get("ask1Price") is not None else ask_open
-            except Exception:
-                pass
 
     # Choose a fillable open limit for Sell:
     # For Sell IOC to fill immediately, limit must be <= current best bid. We cap by bid_open.
@@ -1585,13 +1685,15 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
     px_open = po._round_price_for_side(float(open_limit_raw), tick, "sell")
     px_open_str = po._format_by_step(px_open, tick_raw)
 
+    payout_local_str = datetime.fromtimestamp(payout_local_ms / 1000.0).strftime("%H:%M:%S")
+    close_local_str = datetime.fromtimestamp(close_local_ms / 1000.0).strftime("%H:%M:%S")
     post_logs.append(
-        f"🧠 План (БОЕВОЙ): открыть Short в {payout_dt.strftime('%H:%M:%S')} (Sell IOC, лимит) | qty={qty_str} | "
+        f"🧠 План (БОЕВОЙ, server-time): открыть Short в {payout_local_str} (Sell IOC, лимит) | qty={qty_str} | "
         f"limit_open={px_open_str} (close_price={_fmt(close_price)}, bid_open={_fmt(bid_open)}, ask_open={_fmt(ask_open)}) | "
-        f"затем закрывать Short c { (payout_dt + timedelta(seconds=max(0.0, float(FAST_CLOSE_DELAY_SEC)))).strftime('%H:%M:%S') } (Buy reduceOnly IOC, ∞ до закрытия или Ctrl+C)"
+        f"затем закрывать Short c {close_local_str} (Buy reduceOnly IOC, ∞ до закрытия или Ctrl+C)"
     )
 
-    await _sleep_until(open_dt)
+    await _sleep_until_epoch_ms(open_local_ms)
 
     # --- CRITICAL WINDOW: no logs & minimal overhead ---
     old_disable_level = None
@@ -1674,8 +1776,9 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
             pass
 
     # 10:00:01 — start closing short (important to close even if open was partial)
-    close_dt = payout_dt + timedelta(seconds=max(0.0, float(FAST_CLOSE_DELAY_SEC)))
-    await _sleep_until(close_dt)
+    close_server_ms = int(payout_server_ms + int(max(0.0, float(FAST_CLOSE_DELAY_SEC)) * 1000))
+    close_local_ms = int(close_server_ms - offset_ms)
+    await _sleep_until_epoch_ms(close_local_ms)
     t_close_start = datetime.now()
 
     # Re-enable logging after the strict window (but keep it minimal until fully closed)

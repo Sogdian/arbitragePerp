@@ -82,12 +82,21 @@
   - снимок стакана (orderbook)
   - вычисление **лимита для открытия Short** (агрессивно): берём цену на уровне bids, где **cum_bids >= qty** (в пределах первых `FUN_SHORT_OPEN_LEVELS`, максимум 10 уровней)
 
-#### 4.2. Открытие Short (ровно в HH:MM:00)
-- В **HH:MM:00.000** выставляется **один** ордер:
-  - `Sell Limit IOC` (не FOK), на заранее рассчитанном `limit`
-- В этот момент скрипт **не делает** запросы цены/стакана и (опционально) **отключает логирование**, чтобы минимизировать задержку.
-- **Важно про fill:** `Sell limit` должен быть **<= best_bid**, иначе IOC отменится. Поэтому лимит открытия берётся как `min(close_price, best_bid_fix)`; также можно отправлять ордер чуть заранее (`FUN_FAST_OPEN_LEAD_MS`).
-- **Fallback открытия:** если `Sell IOC` отменился без fill, можно включить `FUN_SHORT_OPEN_FALLBACK_MARKET=1` — тогда бот сразу отправит `Sell Market`, чтобы Short точно открылся.
+#### 4.2. Открытие Short (по server-time Bybit)
+
+Критично не доверять локальным часам: в момент выплаты важны сотни миллисекунд.
+
+- Бот получает Bybit server time через `/v5/market/time`
+- Оценивает смещение: `offset_ms = server_ms - local_ms`
+- Все ожидания строятся от server timestamp выплаты (`nextFundingTime` из `/v5/market/tickers`):
+  - `local_target_ms = server_target_ms - offset_ms`
+  - пример для открытия: `open_local_ms = (payout_server_ms - FUN_FAST_OPEN_LEAD_MS) - offset_ms`
+
+**Открытие Short:**
+- Выставляется **`Sell Limit IOC`** в момент `payout_server_ms - FUN_FAST_OPEN_LEAD_MS` (по умолчанию 300ms до выплаты)
+- В критический момент скрипт не делает лишние запросы/логи
+- **Важно про fill:** `Sell limit` должен быть **<= best_bid**, иначе IOC отменится. Поэтому лимит открытия берётся как `min(close_price, best_bid_fix)`
+- **Fallback открытия (опционально):** если `Sell IOC` отменился без fill, можно включить `FUN_SHORT_OPEN_FALLBACK_MARKET=1` (по умолчанию 0), тогда бот отправит `Sell Market`
 
 #### 4.3. Закрытие Short (начиная с HH:MM:01)
 - В **HH:MM:01.000** начинается закрытие Short:
