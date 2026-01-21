@@ -1421,16 +1421,19 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
     offset_str = f"{_fmt(p.offset_pct*100, 3)}%"
     min_qty_str = _fmt(min_qty_allowed)
 
-    print(sep)
-    print(f"Анализ арбитража для {exchange_cap} ({coin_upper})")
-    print(sep)
-    print(f"Цена: {price_str} (количество монет: {_fmt(p.coin_qty)} {coin_upper} | ~{notional_str} USDT)")
-    print(f"Фандинг: {funding_str}")
-    print(f"Время следующей выплаты: {payout_time_str}")
-    print(f"Доп отступ вниз от справедливой цены: {offset_str}")
-    print(f"Мин количество монет для ордера: {min_qty_str}")
-    print(f"Кол-во монет (нормализовано по шагу): {_fmt(p.coin_qty)}")
-    print(sep)
+    # Собираем summary в один блок для минимализма (вместо множественных print)
+    summary_lines: List[str] = []
+    summary_lines.append(sep)
+    summary_lines.append(f"Анализ арбитража для {exchange_cap} ({coin_upper})")
+    summary_lines.append(sep)
+    summary_lines.append(f"Цена: {price_str} (количество монет: {_fmt(p.coin_qty)} {coin_upper} | ~{notional_str} USDT)")
+    summary_lines.append(f"Фандинг: {funding_str}")
+    summary_lines.append(f"Время следующей выплаты: {payout_time_str}")
+    summary_lines.append(f"Доп отступ вниз от справедливой цены: {offset_str}")
+    summary_lines.append(f"Мин количество монет для ордера: {min_qty_str}")
+    summary_lines.append(f"Кол-во монет (нормализовано по шагу): {_fmt(p.coin_qty)}")
+    summary_lines.append(sep)
+    print("\n".join(summary_lines))
 
     # News output
     if delisting_news:
@@ -1547,6 +1550,22 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
         p.funding_pct = float(pred_fr)
     elif fr is not None:
         p.funding_pct = float(fr)
+
+    # --- ENFORCE: режим только при отрицательном funding (финальная проверка прямо перед payout) ---
+    # ВАЖНО: никаких API вызовов, только проверки в памяти. Логи — через post_logs (будут выведены после критического окна).
+    abort_reason: Optional[str] = None
+    if p.funding_pct is None:
+        abort_reason = "funding перед payout не подтверждён (tickers вернул None)"
+    elif float(p.funding_pct) >= 0:
+        abort_reason = f"funding стал неотрицательным перед payout: {p.funding_pct*100:.6f}%"
+
+    if abort_reason:
+        # не логируем сейчас через logger (лишний оверхед), только копим строку
+        post_logs.append(f"⛔ ОТМЕНА БОЕВОГО ВХОДА: {abort_reason}. Режим short-only работает только при отрицательном funding.")
+        # После этого выведем post_logs обычным logger.info и выйдем
+        for m in post_logs:
+            logger.info(m)
+        return 0
 
     # Extract best bid/ask at HH:MM:59 (needed for a fillable Sell limit).
     best_bid_fix: Optional[float] = None
@@ -1705,7 +1724,6 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
     # 10:00:00.000 — place ONE Short (Sell IOC) with the precomputed limit, no orderbook/price calls here.
     short_order_id: Optional[str] = None
     short_place_err: Optional[str] = None
-    t_send_open = datetime.now()
     try:
         try:
             short_order_id = await _bybit_place_limit(
@@ -1720,7 +1738,6 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
                 reduce_only=None,
                 position_idx=2,
             )
-            t_send_open = datetime.now()
         except Exception as e1:
             # Сохраняем детали первой ошибки для логирования
             err1_str = str(e1)
@@ -1737,7 +1754,6 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
                     reduce_only=None,
                     position_idx=None,
                 )
-                t_send_open = datetime.now()
             except Exception as e2:
                 short_order_id = None
                 short_place_err = f"create_failed: hedge={err1_str}, one-way={str(e2)}"
@@ -1745,8 +1761,27 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
         short_order_id = None
         short_place_err = f"create_failed: {str(e)}"
 
-    # If IOC didn't fill (Cancelled) we may want an optional immediate fallback to Market to ensure opening.
-    # Default is OFF (FUN_SHORT_OPEN_FALLBACK_MARKET=0) because user prefers limit only.
+    # 10:00:01 — start closing short (important to close even if open was partial)
+    # close_local_ms already calculated above (before critical window) for logging
+    await _sleep_until_epoch_ms(close_local_ms)
+    t_close_start = datetime.now()
+
+    # Re-enable logging after the strict window (but keep it minimal until fully closed)
+    if old_disable_level is not None:
+        logging.disable(old_disable_level)
+        old_disable_level = None
+
+    # Print delayed plan/logs here (after critical window), but still before any heavy post-trade analysis.
+    for m in post_logs:
+        logger.info(m)
+    # Тайминги считаем вне critical window (плановые значения по server-time + фактический старт закрытия)
+    open_local_ms_str = datetime.fromtimestamp(open_local_ms / 1000.0).strftime("%H:%M:%S.%f")[:-3]
+    close_local_ms_str = datetime.fromtimestamp(close_local_ms / 1000.0).strftime("%H:%M:%S.%f")[:-3]
+    logger.info(f"⏱️ Тайминги: open(план)={open_local_ms_str} | close_start(план)={close_local_ms_str} | close_start(факт)={t_close_start.strftime('%H:%M:%S.%f')[:-3]}")
+    if short_place_err:
+        logger.warning(f"⚠️ Short: ошибка создания ордера в критический момент: {short_place_err}")
+
+    # OPTIONAL fallback (если включено): любые polling/статус-чек запросы делаем только ПОСЛЕ critical window
     if short_order_id and int(SHORT_OPEN_FALLBACK_MARKET) == 1:
         try:
             st0, filled0, _avg0 = await _bybit_wait_done_get_filled_qty(
@@ -1783,23 +1818,6 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
                     )
         except Exception:
             pass
-
-    # 10:00:01 — start closing short (important to close even if open was partial)
-    # close_local_ms already calculated above (before critical window) for logging
-    await _sleep_until_epoch_ms(close_local_ms)
-    t_close_start = datetime.now()
-
-    # Re-enable logging after the strict window (but keep it minimal until fully closed)
-    if old_disable_level is not None:
-        logging.disable(old_disable_level)
-        old_disable_level = None
-
-    # Print delayed plan/logs here (after critical window), but still before any heavy post-trade analysis.
-    for m in post_logs:
-        logger.info(m)
-    logger.info(f"⏱️ Тайминги: отправка_short={t_send_open.strftime('%H:%M:%S.%f')[:-3]} | старт_закрытия={t_close_start.strftime('%H:%M:%S.%f')[:-3]}")
-    if short_place_err:
-        logger.warning(f"⚠️ Short: ошибка создания ордера в критический момент: {short_place_err}")
     filled_open: Optional[float] = None
     if short_order_id:
         try:
