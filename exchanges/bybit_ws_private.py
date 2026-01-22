@@ -12,7 +12,8 @@ import json
 import logging
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, List
+from collections import deque
 
 import websockets
 from websockets.exceptions import ConnectionClosed, WebSocketException
@@ -66,6 +67,11 @@ class BybitPrivateWS:
         self._pos_last_ms: Dict[Tuple[str, int, str], int] = {}
         self._pos_events: Dict[Tuple[str, int, str], asyncio.Event] = {}
         self._pos_any = asyncio.Event()
+
+        # --- execution cache (0-REST PnL) ---
+        # Store raw execution items from topic "execution" for later PnL calculation.
+        # Bounded to avoid memory leak.
+        self._exec_cache = deque(maxlen=5000)  # type: ignore[var-annotated]
         
         # last update timestamp (monotonic ms)
         self._last_msg_ms: Optional[int] = None
@@ -152,6 +158,11 @@ class BybitPrivateWS:
         self._pos_last_ms.clear()
         try:
             self._pos_any.set()
+        except Exception:
+            pass
+
+        try:
+            self._exec_cache.clear()
         except Exception:
             pass
         
@@ -267,8 +278,7 @@ class BybitPrivateWS:
                 if topic == "order":
                     self._handle_order_updates(data)
                 elif topic == "execution":
-                    # если захочешь точнее считать fee/avg — можно расширить
-                    pass
+                    self._handle_execution_updates(data)
                 elif topic == "position":
                     self._handle_position_updates(data)
         except asyncio.CancelledError:
@@ -331,6 +341,57 @@ class BybitPrivateWS:
         except asyncio.TimeoutError:
             return self._pos_any.is_set()
         return True
+
+    # ----------------------------
+    # Execution cache helpers
+    # ----------------------------
+    @staticmethod
+    def _extract_exec_time_ms(it: Dict[str, Any]) -> Optional[int]:
+        """
+        Extract execution time in epoch ms from common Bybit fields.
+        Bybit can send execTime/tradeTimeMs/execTimeMs depending on endpoint/version.
+        """
+        for k in ("execTime", "execTimeMs", "tradeTimeMs", "time"):
+            v = it.get(k)
+            if v is None:
+                continue
+            try:
+                # Some fields are strings, some ints; execTime can be seconds or ms in some APIs.
+                x = int(str(v))
+                if x <= 0:
+                    continue
+                # Heuristic: if looks like seconds, convert to ms.
+                if x < 10_000_000_000:
+                    return x * 1000
+                return x
+            except Exception:
+                continue
+        return None
+
+    def get_executions(self, *, symbol: str, start_ms: int, end_ms: int) -> List[Dict[str, Any]]:
+        """
+        Returns cached executions for `symbol` within [start_ms, end_ms] (epoch ms).
+        Note: cache is best-effort; gaps are possible on reconnect -> keep REST fallback for reporting.
+        """
+        sym = str(symbol).strip().upper()
+        s = int(start_ms)
+        e = int(end_ms)
+        out: List[Dict[str, Any]] = []
+        try:
+            for it in list(self._exec_cache):
+                if not isinstance(it, dict):
+                    continue
+                it_sym = str(it.get("symbol") or "").strip().upper()
+                if it_sym and it_sym != sym:
+                    continue
+                t = self._extract_exec_time_ms(it)
+                if t is None:
+                    continue
+                if s <= int(t) <= e:
+                    out.append(it)
+        except Exception:
+            return []
+        return out
     
     def _handle_order_updates(self, items: list[dict]) -> None:
         """Обрабатывает обновления ордеров."""
@@ -417,6 +478,17 @@ class BybitPrivateWS:
 
             try:
                 self._pos_any.set()
+            except Exception:
+                pass
+
+    def _handle_execution_updates(self, items: list[dict]) -> None:
+        """Caches execution updates for later PnL calculation (best-effort)."""
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            # Keep raw item; filtering happens in get_executions()
+            try:
+                self._exec_cache.append(it)
             except Exception:
                 pass
     

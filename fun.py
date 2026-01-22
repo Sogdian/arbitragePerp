@@ -1413,8 +1413,10 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
         return 2
 
     # Preflight qty against filters
+    # Сохраняем filters для последующего использования (избегаем повторного REST запроса)
+    filters_preflight = None
     try:
-        min_qty_allowed, filters = await _bybit_preflight_and_min_qty(
+        min_qty_allowed, filters_preflight = await _bybit_preflight_and_min_qty(
             exchange_obj=exchange_obj,
             coin=p.coin,
             qty_desired=p.coin_qty,
@@ -1424,7 +1426,7 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
         logger.error(f"❌ Preflight qty error: {e}")
         return 2
 
-    qty_step_raw = filters.get("qtyStep")
+    qty_step_raw = filters_preflight.get("qtyStep")
     qty_step = float(qty_step_raw) if qty_step_raw else 0.0
     qty_norm = po._floor_to_step(float(p.coin_qty), qty_step) if qty_step > 0 else float(p.coin_qty)
     if qty_norm <= 0:
@@ -1632,10 +1634,18 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
         logger.error("❌ Не удалось подготовить торговые параметры (isolated/leverage=1)")
         return 2
 
-    # Fetch filters BEFORE payout
-    f = await _bybit_get_filters(exchange_obj, p.coin)
-    tick_raw = f.get("tickSize")
-    qty_step_raw = f.get("qtyStep")
+    # Используем filters из preflight (избегаем повторного REST запроса)
+    # Если filters_preflight не сохранились (не должно быть), делаем fallback
+    if filters_preflight is None:
+        logger.warning("⚠️ filters_preflight не сохранены, делаем REST запрос")
+        f = await _bybit_get_filters(exchange_obj, p.coin)
+        tick_raw = f.get("tickSize")
+        qty_step_raw = f.get("qtyStep")
+    else:
+        # Используем сохранённые filters из preflight (0-REST)
+        tick_raw = filters_preflight.get("tickSize")
+        qty_step_raw = filters_preflight.get("qtyStep")
+    
     tick = float(tick_raw) if tick_raw else 0.0
     qty_str = po._format_by_step(p.coin_qty, qty_step_raw)
 
@@ -1992,16 +2002,29 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
         logger.error(f"❌ Short НЕ закрыт полностью (best-effort) | qty={_fmt(opened_qty)} | avg_exit_buy={_fmt(avg_exit_short)}")
 
     # Post-trade executions / PnL
+    # Prefer Private WS execution cache (0-REST). Keep REST fallback for completeness (cache gaps on reconnect are possible).
     t_start_ms = int(open_server_ms - 5_000)
     t_end_ms = int(close_server_ms + 10_000)
-    execs = await _bybit_fetch_executions(
-        exchange_obj=exchange_obj,
-        api_key=api_key,
-        api_secret=api_secret,
-        coin=p.coin,
-        start_ms=t_start_ms,
-        end_ms=t_end_ms,
-    )
+
+    execs: List[Dict[str, Any]] = []
+    try:
+        if ws_private is not None and getattr(ws_private, "ready", False) and hasattr(ws_private, "get_executions"):
+            execs = ws_private.get_executions(symbol=symbol, start_ms=t_start_ms, end_ms=t_end_ms) or []
+            logger.info(f"📦 WS executions cache: got {len(execs)} items in window [{t_start_ms},{t_end_ms}]")
+    except Exception as e:
+        logger.warning(f"⚠️ WS executions cache error: {type(e).__name__}: {e}")
+        execs = []
+
+    if not execs:
+        execs = await _bybit_fetch_executions(
+            exchange_obj=exchange_obj,
+            api_key=api_key,
+            api_secret=api_secret,
+            coin=p.coin,
+            start_ms=t_start_ms,
+            end_ms=t_end_ms,
+        )
+        logger.info(f"🌐 REST executions: got {len(execs)} items in window [{t_start_ms},{t_end_ms}]")
     pnl_hist, buys_n, sells_n, avg_buy, avg_sell = _bybit_calc_pnl_usdt_from_execs(execs)
     logger.info(
         f"📊 Итог (БОЕВОЙ): монета={p.coin} | ср_цена_покупки={_fmt(avg_buy)} | ср_цена_продажи={_fmt(avg_sell)} | "
