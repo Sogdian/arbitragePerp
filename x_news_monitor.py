@@ -1,0 +1,359 @@
+"""
+X (Twitter) news integration (optional).
+
+Purpose:
+- Provide additional "delisting" and "security/hack" signals from X that can be used
+  alongside exchange announcements when deciding verdicts.
+
+This module is intentionally optional:
+- If `X_BEARER_TOKEN` is not set, all methods return [] and do not make network calls.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import re
+import time
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional, Tuple
+
+import httpx
+
+logger = logging.getLogger(__name__)
+
+
+def _iso(dt: datetime) -> str:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _clamp_recent_search_lookback(lookback: Optional[datetime]) -> Optional[datetime]:
+    """
+    Twitter/X v2 recent search is typically limited to ~7 days (depending on access tier).
+    We clamp lookback to now-7d to avoid useless requests with too-old start_time.
+    """
+    if lookback is None:
+        return None
+    if lookback.tzinfo is None:
+        lookback = lookback.replace(tzinfo=timezone.utc)
+    now = datetime.now(timezone.utc)
+    min_dt = now - timedelta(days=7)
+    return lookback if lookback > min_dt else min_dt
+
+
+def _dedupe_by_url(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    seen: set[str] = set()
+    out: List[Dict[str, Any]] = []
+    for it in items:
+        url = str(it.get("url") or "").strip()
+        key = url or (str(it.get("title") or "").strip()[:200])
+        if not key:
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(it)
+    return out
+
+
+class XNewsMonitor:
+    """
+    Minimal X(Twitter) recent search client.
+
+    Env:
+    - X_BEARER_TOKEN: required to enable
+    - X_NEWS_CACHE_TTL_SEC: cache TTL per query (default 600)
+    - X_NEWS_MAX_RESULTS: max tweets per query (default 25, capped to [10..100])
+    """
+
+    API_URL = "https://api.twitter.com/2/tweets/search/recent"
+
+    def __init__(self) -> None:
+        self.bearer_token = (os.getenv("X_BEARER_TOKEN") or "").strip()
+        # Увеличиваем TTL по умолчанию до 10 минут (600 сек) для более эффективного использования лимитов
+        self.cache_ttl_sec = float(os.getenv("X_NEWS_CACHE_TTL_SEC", "600"))
+        self.max_results = int(os.getenv("X_NEWS_MAX_RESULTS", "25"))
+        self.max_results = max(10, min(100, self.max_results))
+        # key -> (expires_monotonic, items)
+        self._cache: Dict[Tuple[str, str], Tuple[float, List[Dict[str, Any]]]] = {}
+        # Флаг для отслеживания исчерпания лимита (429)
+        self._rate_limit_reset_at: Optional[float] = None  # monotonic time
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.bearer_token)
+
+    def _coin_query_terms(self, coin: str) -> str:
+        c = coin.upper()
+        # Prefer more specific patterns to reduce false positives for short tickers (e.g. ALL, ONE, IN).
+        # Keep both cashtag and USDT-pair variants.
+        return f'(${c} OR {c}USDT OR "{c}/USDT" OR "{c} USDT")'
+
+    def _exchange_query_terms(self, exchanges: Optional[List[str]]) -> str:
+        if not exchanges:
+            return ""
+        # Keep it simple: exchange names are often mentioned in posts about delists/incidents.
+        # (If this is too noisy, we can later add X_NEWS_ACCOUNTS / handle filters.)
+        ex_terms = [re.sub(r"[^a-z0-9_]+", "", (e or "").lower()) for e in exchanges]
+        ex_terms = [e for e in ex_terms if e]
+        if not ex_terms:
+            return ""
+        joined = " OR ".join(ex_terms)
+        return f"({joined})"
+
+    async def _search_recent(self, query: str, start_time: Optional[datetime]) -> List[Dict[str, Any]]:
+        if not self.enabled:
+            return []
+
+        # Проверяем, не исчерпан ли лимит (429)
+        now_m = time.monotonic()
+        if self._rate_limit_reset_at is not None and self._rate_limit_reset_at > now_m:
+            # Лимит исчерпан, пропускаем запрос
+            logger.debug(f"X API: пропуск запроса из-за исчерпания лимита (сброс через {int(self._rate_limit_reset_at - now_m)} сек)")
+            return []
+
+        # ВАЖНО: start_time (особенно "now-7d") меняется каждую секунду → кеш по точному ISO почти не попадает.
+        # Поэтому кешируем по "ведру" времени (5 минут), чтобы эффективно экономить лимиты API.
+        start_bucket = ""
+        if start_time is not None:
+            try:
+                start_bucket = str(int(start_time.timestamp()) // 300)  # 5-min buckets
+            except Exception:
+                start_bucket = ""
+        cache_key = (query, start_bucket)
+        cached = self._cache.get(cache_key)
+        if cached and cached[0] > now_m:
+            return cached[1]
+
+        headers = {"Authorization": f"Bearer {self.bearer_token}"}
+        params: Dict[str, Any] = {
+            "query": query,
+            "max_results": self.max_results,
+            "tweet.fields": "created_at",
+            "expansions": "author_id",
+            "user.fields": "username",
+        }
+        if start_time is not None:
+            params["start_time"] = _iso(start_time)
+
+        timeout = httpx.Timeout(connect=5.0, read=10.0, write=10.0, pool=5.0)
+        try:
+            async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+                r = await client.get(self.API_URL, headers=headers, params=params)
+            if r.status_code != 200:
+                # Обработка превышения лимита API (429 Too Many Requests)
+                if r.status_code == 429:
+                    # Извлекаем информацию о лимитах из заголовков
+                    limit_total = r.headers.get("x-rate-limit-limit", "N/A")
+                    limit_remaining = r.headers.get("x-rate-limit-remaining", "0")
+                    limit_reset = r.headers.get("x-rate-limit-reset", "N/A")
+                    
+                    # Пытаемся вычислить время сброса лимита
+                    reset_info = "N/A"
+                    wait_seconds = 0
+                    if limit_reset != "N/A":
+                        try:
+                            reset_timestamp = int(limit_reset)
+                            reset_dt = datetime.fromtimestamp(reset_timestamp, tz=timezone.utc)
+                            now_utc = datetime.now(timezone.utc)
+                            wait_seconds = int((reset_dt - now_utc).total_seconds())
+                            if wait_seconds > 0:
+                                wait_minutes = wait_seconds // 60
+                                reset_info = f"{reset_dt.strftime('%Y-%m-%d %H:%M:%S')} UTC (через {wait_minutes} мин)"
+                            else:
+                                reset_info = f"{reset_dt.strftime('%Y-%m-%d %H:%M:%S')} UTC (скоро)"
+                        except (ValueError, OSError):
+                            reset_info = limit_reset
+                            # Если не удалось распарсить, используем консервативное значение (15 минут)
+                            wait_seconds = 900
+                    
+                    # Устанавливаем время сброса лимита (добавляем небольшой запас в 30 секунд)
+                    if wait_seconds > 0:
+                        self._rate_limit_reset_at = now_m + wait_seconds + 30
+                    else:
+                        # Если не удалось определить, используем консервативное значение (15 минут)
+                        self._rate_limit_reset_at = now_m + 900
+                    
+                    logger.warning(
+                        f"⚠️ X API: превышен лимит запросов (429). "
+                        f"Лимит: {limit_total}, осталось: {limit_remaining}, сброс: {reset_info}. "
+                        f"Запросы к X API будут пропущены до сброса лимита."
+                    )
+                    return []  # Возвращаем пустой список, не сохраняем в кеш
+                elif r.status_code == 403:
+                    # 403 Forbidden - может быть связано с лимитами или доступом
+                    error_body = (r.text or "")[:250]
+                    logger.warning(
+                        f"⚠️ X API: доступ запрещен (403). "
+                        f"Возможно, превышен лимит или проблемы с токеном. "
+                        f"Ответ: {error_body}"
+                    )
+                elif r.status_code == 503:
+                    # 503 Service Unavailable - временная перегрузка
+                    logger.warning(
+                        f"⚠️ X API: сервис временно недоступен (503). "
+                        f"Возможно, временная перегрузка. Повторите запрос позже."
+                    )
+                    return []  # Возвращаем пустой список, не сохраняем в кеш
+                else:
+                    # Другие ошибки API логируем на уровне debug
+                    logger.debug(f"X search failed: status={r.status_code} body={(r.text or '')[:250]}")
+                    return []  # Возвращаем пустой список, не сохраняем в кеш
+            else:
+                # Успешный ответ - проверяем лимиты и предупреждаем, если они близки к исчерпанию
+                limit_total_str = r.headers.get("x-rate-limit-limit", "")
+                limit_remaining_str = r.headers.get("x-rate-limit-remaining", "")
+                
+                if limit_total_str and limit_remaining_str:
+                    try:
+                        limit_total = int(limit_total_str)
+                        limit_remaining = int(limit_remaining_str)
+                        
+                        # Предупреждаем, если осталось меньше 10% или меньше 5 запросов
+                        if limit_total > 0:
+                            remaining_percent = (limit_remaining / limit_total) * 100
+                            if remaining_percent < 10.0 or limit_remaining < 5:
+                                logger.warning(
+                                    f"⚠️ X API: лимит запросов близок к исчерпанию. "
+                                    f"Осталось: {limit_remaining}/{limit_total} ({remaining_percent:.1f}%)"
+                                )
+                    except (ValueError, ZeroDivisionError):
+                        pass  # Игнорируем ошибки парсинга
+                
+                payload = r.json() or {}
+                data = payload.get("data") or []
+                includes = payload.get("includes") or {}
+                users = includes.get("users") or []
+                id_to_user: Dict[str, str] = {str(u.get("id")): str(u.get("username") or "") for u in users if u}
+
+                items = []
+                for tw in data:
+                    tid = str(tw.get("id") or "").strip()
+                    text = str(tw.get("text") or "").strip()
+                    created_at_raw = tw.get("created_at")
+                    created_at = None
+                    if isinstance(created_at_raw, str):
+                        try:
+                            created_at = datetime.fromisoformat(created_at_raw.replace("Z", "+00:00"))
+                        except Exception:
+                            created_at = None
+                    author_id = str(tw.get("author_id") or "").strip()
+                    username = id_to_user.get(author_id, "")
+                    if username and tid:
+                        url = f"https://x.com/{username}/status/{tid}"
+                    elif tid:
+                        url = f"https://x.com/i/web/status/{tid}"
+                    else:
+                        url = ""
+
+                    title = text.replace("\n", " ").strip()
+                    items.append(
+                        {
+                            "title": title[:280],
+                            "url": url,
+                            "published_at": created_at,
+                            "source": "x",
+                        }
+                    )
+
+            items = _dedupe_by_url(items)
+            self._cache[cache_key] = (now_m + self.cache_ttl_sec, items)
+            return items
+        except Exception as e:
+            logger.debug(f"X search error: {e}", exc_info=True)
+            return []
+
+    async def find_delisting_news(
+        self,
+        coin_symbol: str,
+        exchanges: Optional[List[str]],
+        lookback: Optional[datetime],
+    ) -> List[Dict[str, Any]]:
+        """
+        Returns X posts that look like delisting / suspension / removal announcements for the coin.
+        
+        ВАЖНО: для оптимизации лимитов запросы кешируются по монете (без учета exchanges),
+        так как новости о делистинге монеты не зависят от конкретной пары бирж.
+        """
+        if not self.enabled:
+            return []
+
+        start_time = _clamp_recent_search_lookback(lookback)
+        coin_terms = self._coin_query_terms(coin_symbol)
+        # ОПТИМИЗАЦИЯ: не включаем exchanges в query для лучшего кеширования
+        # Новости о делистинге монеты обычно не зависят от конкретной биржи
+        # ex_terms = self._exchange_query_terms(exchanges)
+
+        delist_terms = (
+            "(delist OR delisting OR \"will delist\" OR \"to delist\" OR \"remove\" OR "
+            "\"trading will be suspended\" OR \"suspend trading\" OR \"terminate\" OR \"remove trading\" OR "
+            "\"perpetual\" OR \"futures\" OR \"contract\")"
+        )
+
+        parts = [coin_terms, delist_terms]
+        # if ex_terms:
+        #     parts.append(ex_terms)
+        query = " ".join(parts) + " -is:retweet"
+
+        items = await self._search_recent(query=query, start_time=start_time)
+        # Tag them like exchange announcements so existing code can treat them the same way.
+        out: List[Dict[str, Any]] = []
+        for it in items:
+            tagged = it.copy()
+            tags = list(tagged.get("tags", []) or [])
+            if "delisting" not in tags:
+                tags.append("delisting")
+            if "x" not in tags:
+                tags.append("x")
+            tagged["tags"] = tags
+            out.append(tagged)
+        return out
+
+    async def find_security_news(
+        self,
+        coin_symbol: str,
+        exchanges: Optional[List[str]],
+        lookback: Optional[datetime],
+    ) -> List[Dict[str, Any]]:
+        """
+        Returns X posts that look like security/hack/exploit news for the coin.
+        
+        ВАЖНО: для оптимизации лимитов запросы кешируются по монете (без учета exchanges),
+        так как новости о безопасности монеты не зависят от конкретной пары бирж.
+        """
+        if not self.enabled:
+            return []
+
+        start_time = _clamp_recent_search_lookback(lookback)
+        coin_terms = self._coin_query_terms(coin_symbol)
+        # ОПТИМИЗАЦИЯ: не включаем exchanges в query для лучшего кеширования
+        # Новости о безопасности монеты обычно не зависят от конкретной биржи
+        # ex_terms = self._exchange_query_terms(exchanges)
+
+        sec_terms = (
+            "(security OR hack OR hacked OR exploit OR exploited OR breach OR compromised OR "
+            "vulnerab* OR phishing OR scam OR rug OR \"funds stolen\" OR stolen OR drain OR drained OR attacker OR "
+            "взлом OR уязв* OR фишинг OR мошенн* OR украл* OR краж*)"
+        )
+
+        parts = [coin_terms, sec_terms]
+        # if ex_terms:
+        #     parts.append(ex_terms)
+        query = " ".join(parts) + " -is:retweet"
+
+        items = await self._search_recent(query=query, start_time=start_time)
+        out: List[Dict[str, Any]] = []
+        for it in items:
+            tagged = it.copy()
+            tags = list(tagged.get("tags", []) or [])
+            if "security" not in tags:
+                tags.append("security")
+            if "x" not in tags:
+                tags.append("x")
+            tagged["tags"] = tags
+            out.append(tagged)
+        return out
+
+

@@ -1,12 +1,12 @@
 """
 Асинхронная реализация Gate.io для фьючерсов на базе AsyncBaseExchange
 """
-from typing import Dict, Optional
+from typing import Dict, Optional, Set, Tuple, Any, List
 import logging
 from .async_base_exchange import AsyncBaseExchange
+from .coin_list_fetchers import fetch_gate_coins
 
 logger = logging.getLogger(__name__)
-
 
 class AsyncGateExchange(AsyncBaseExchange):
     BASE_URL = "https://api.gateio.ws"
@@ -15,69 +15,161 @@ class AsyncGateExchange(AsyncBaseExchange):
         super().__init__("Gate")
 
     def _normalize_symbol(self, coin: str) -> str:
-        """Преобразует монету в формат Gate.io для фьючерсов (например, CVC -> CVC_USDT)"""
-        return f"{coin.upper()}_USDT"
+        """
+        Преобразует монету в формат Gate.io для фьючерсов (например, CVC -> CVC_USDT)
+        
+        ВАЖНО: На Gate.io FUN_USDT соответствует SPORTFUN (Sport.Fun), а не FUNTOKEN.
+        FUNTOKEN на Gate.io отсутствует.
+        """
+        c = coin.upper()
+        # Алиасы для известных коллизий
+        aliases = {
+            "SPORTFUN": "FUN_USDT",  # SPORTFUN -> FUN_USDT (на Gate FUN_USDT это SPORTFUN)
+            # FUN (FUNTOKEN) на Gate отсутствует — возвращаем несуществующий символ, чтобы получить N/A
+            "FUN": "FUNTOKEN_USDT",
+        }
+        return aliases.get(c, f"{c}_USDT")
+
+    def _safe_px(self, raw: object, fallback: float, sanity_mult: float = 20.0) -> float:
+        """
+        Безопасное преобразование цены с проверками на разумность
+        """
+        try:
+            v = float(raw)
+        except (TypeError, ValueError):
+            return fallback
+
+        if v <= 0:
+            return fallback
+
+        # Для нормальных цен применяем sanity-check
+        if fallback >= 0.0001:
+            if v > fallback * sanity_mult or v < fallback / sanity_mult:
+                return fallback
+
+        return v
+
+    def _parse_ob_levels(
+        self,
+        levels: Any,
+        side: str,
+        coin: str,
+    ) -> Optional[List[List[float]]]:
+        """
+        Gate может вернуть уровни в разных форматах:
+        1) REST/WS-legacy: [{"p":"97.1","s":2245}, ...]
+        2) REST (часто): [["97.1","2245"], ...] или [[price, size], ...]
+        3) Иногда может быть tuple/list длины >= 2
+        Возвращаем нормализованный формат: [[price(float), size(float)], ...]
+        """
+        if not isinstance(levels, list) or not levels:
+            return None
+
+        out: List[List[float]] = []
+
+        for i, lvl in enumerate(levels):
+            price_raw = None
+            size_raw = None
+
+            if isinstance(lvl, dict):
+                # WS legacy формат: {"p": "...", "s": ...}
+                price_raw = lvl.get("p") or lvl.get("price")
+                size_raw = lvl.get("s") or lvl.get("size")
+            elif isinstance(lvl, (list, tuple)):
+                if len(lvl) < 2:
+                    logger.warning(f"Gate: level too short in {side} for {coin}: {lvl}")
+                    return None
+                price_raw, size_raw = lvl[0], lvl[1]
+            else:
+                logger.warning(f"Gate: unexpected level type in {side} for {coin}: {type(lvl)}")
+                return None
+
+            try:
+                p = float(price_raw)
+                s = float(size_raw)
+            except (TypeError, ValueError):
+                logger.warning(f"Gate: non-numeric level in {side} for {coin}: {lvl}")
+                return None
+
+            if p <= 0:
+                continue
+
+            # size в ордербуке должен быть положительным; на всякий случай нормализуем
+            if s < 0:
+                s = abs(s)
+
+            out.append([p, s])
+
+            # лёгкая защита от безумных ответов
+            if i > 5000:
+                break
+
+        return out if out else None
 
     async def get_futures_ticker(self, coin: str) -> Optional[Dict]:
         """
         Получить тикер фьючерса для монеты
-        
-        Args:
-            coin: Название монеты без /USDT (например, "CVC")
-            
-        Returns:
-            Словарь с данными тикера:
-            {
-                "price": float,  # Текущая цена
-                "bid": float,     # Лучшая цена покупки
-                "ask": float,     # Лучшая цена продажи
-            }
-            или None если ошибка
         """
         try:
-            symbol = self._normalize_symbol(coin)
+            symbol = self._normalize_symbol(coin)  # e.g. TUT_USDT
             url = "/api/v4/futures/usdt/tickers"
             params = {"contract": symbol}
+
             data = await self._request_json("GET", url, params=params)
-            
-            if not data:
-                logger.warning(f"Gate: не удалось получить тикер для {coin}")
+
+            # 1) Реальная проблема сети/HTTP/парсинга -> data == None (или Falsey не-list/dict)
+            if data is None:
+                # Причина чаще всего уже залогирована в AsyncBaseExchange._request_json (timeout/connection/HTTP status),
+                # поэтому здесь не дублируем WARNING.
+                logger.debug(f"Gate: тикер запрос вернул None для {coin} (contract={symbol})")
                 return None
-            
-            # Gate.io возвращает список или словарь
-            item = None
-            if isinstance(data, list) and data:
-                item = data[0]
+
+            # 2) Нормальная ситуация "контракт не найден / не активен": API вернул пустой список
+            if isinstance(data, list):
+                if not data:
+                    logger.debug(f"Gate: тикер не найден для {coin} (contract={symbol})")
+                    return None
+
+                # если contract-параметр сработал, обычно будет один элемент;
+                # но на всякий случай ищем точное совпадение и НЕ берем data[0], если совпадения нет
+                item = next((x for x in data if isinstance(x, dict) and x.get("contract") == symbol), None)
+                if item is None:
+                    logger.debug(f"Gate: тикер список без нужного contract для {coin} (contract={symbol})")
+                    return None
+
             elif isinstance(data, dict):
                 item = data
-            
-            if not item:
-                logger.warning(f"Gate: тикер для {coin} не найден")
+                # Иногда Gate может вернуть dict с ошибкой вида {"label": "...", "message": "..."}
+                # Если видишь такие поля — лучше логировать warning.
+                if "message" in item and "label" in item and "contract" not in item:
+                    logger.warning(f"Gate: ticker API error для {coin}: {item}")
+                    return None
+            else:
+                logger.warning(f"Gate: неожиданный формат тикера для {coin}: {type(data)}")
                 return None
-            
-            # Извлекаем цены
-            last_price_raw = item.get("last")
-            bid_raw = item.get("bid")
-            ask_raw = item.get("ask")
-            
-            if not last_price_raw:
-                logger.warning(f"Gate: нет цены для {coin}")
+
+            # дальше парсинг цены
+            last_raw = item.get("last")
+            if last_raw is None:
+                logger.debug(f"Gate: нет last для {coin} (contract={symbol})")
                 return None
-            
-            try:
-                price = float(last_price_raw)
-                bid = float(bid_raw) if bid_raw else price
-                ask = float(ask_raw) if ask_raw else price
-                
-                return {
-                    "price": price,
-                    "bid": bid,
-                    "ask": ask,
-                }
-            except (ValueError, TypeError) as e:
-                logger.warning(f"Gate: ошибка парсинга цен для {coin}: {e}")
+
+            last = float(last_raw)
+            if last <= 0:
                 return None
-                
+
+            bid_raw = item.get("bid") or item.get("highest_bid")
+            ask_raw = item.get("ask") or item.get("lowest_ask")
+
+            bid = self._safe_px(bid_raw, last)
+            ask = self._safe_px(ask_raw, last)
+
+            if bid > ask:
+                bid = last
+                ask = last
+
+            return {"price": last, "bid": bid, "ask": ask}
+
         except Exception as e:
             logger.error(f"Gate: ошибка при получении тикера для {coin}: {e}", exc_info=True)
             return None
@@ -86,57 +178,181 @@ class AsyncGateExchange(AsyncBaseExchange):
         """
         Получить текущую ставку фандинга для монеты
         
-        Args:
-            coin: Название монеты без /USDT (например, "CVC")
-            
-        Returns:
-            Ставка фандинга (например, 0.0001 = 0.01%) или None если ошибка
+        Gate:
+        - /futures/usdt/contracts/{contract} -> текущая/индикативная ставка (UI "Текущая")
+        - /futures/usdt/funding_rate -> история (UI "Предыдущая")
         """
         try:
             symbol = self._normalize_symbol(coin)
-            # Gate.io использует эндпоинт для получения текущей ставки фандинга
+
+            # 1) CURRENT (contract info)
+            url = f"/api/v4/futures/usdt/contracts/{symbol}"
+            data = await self._request_json("GET", url)
+
+            if isinstance(data, dict):
+                # приоритет: funding_rate (обычно то, что UI показывает как текущую)
+                r = data.get("funding_rate")
+                if r is None:
+                    # иногда полезно взять indicative
+                    r = data.get("funding_rate_indicative")
+                if r is not None:
+                    return float(r)
+
+            # 2) FALLBACK: HISTORY (previous applied)
             url = "/api/v4/futures/usdt/funding_rate"
-            params = {"contract": symbol}
+            params = {"contract": symbol, "limit": 1}
             data = await self._request_json("GET", url, params=params)
-            
-            if not data:
-                logger.warning(f"Gate: не удалось получить фандинг для {coin}")
-                return None
-            
-            # Gate.io возвращает список или словарь
-            item = None
+
             if isinstance(data, list) and data:
                 item = data[0]
-            elif isinstance(data, dict):
-                # Если это словарь, проверяем наличие поля "result"
-                if "result" in data:
-                    result = data["result"]
-                    if isinstance(result, list) and result:
-                        item = result[0]
-                    elif isinstance(result, dict):
-                        item = result
-                else:
-                    item = data
-            
-            if not item:
-                logger.warning(f"Gate: фандинг для {coin} не найден")
-                return None
-            
-            # Gate.io может возвращать ставку в разных полях
-            funding_rate_raw = item.get("r") or item.get("funding_rate") or item.get("rate")
-            
-            if funding_rate_raw is None:
-                logger.warning(f"Gate: нет ставки фандинга для {coin} в ответе: {item}")
-                return None
-            
-            try:
-                funding_rate = float(funding_rate_raw)
-                return funding_rate
-            except (ValueError, TypeError) as e:
-                logger.warning(f"Gate: ошибка парсинга фандинга для {coin}: {e}")
-                return None
-                
+                r = item.get("r") or item.get("funding_rate") or item.get("rate")
+                if r is not None:
+                    return float(r)
+
+            logger.warning(f"Gate: не удалось получить funding_rate для {coin} (symbol={symbol})")
+            return None
+
         except Exception as e:
             logger.error(f"Gate: ошибка при получении фандинга для {coin}: {e}", exc_info=True)
             return None
 
+    async def get_funding_info(self, coin: str) -> Optional[Dict]:
+        """
+        Получить информацию о фандинге (ставка и время до следующей выплаты)
+        
+        Gate:
+        - /futures/usdt/contracts/{contract} -> текущая ставка и funding_next_apply_time
+        - Также пробуем получить время из истории фандингов
+        
+        Returns:
+            Словарь с данными:
+            {
+                "funding_rate": float,  # Ставка фандинга (например, 0.0001 = 0.01%)
+                "next_funding_time": int,  # Timestamp следующей выплаты в секундах
+            }
+            или None если ошибка
+        """
+        try:
+            symbol = self._normalize_symbol(coin)
+            url = f"/api/v4/futures/usdt/contracts/{symbol}"
+            data = await self._request_json("GET", url)
+
+            if not isinstance(data, dict):
+                return None
+
+            # приоритет: funding_rate (обычно то, что UI показывает как текущую)
+            r = data.get("funding_rate")
+            if r is None:
+                # иногда полезно взять indicative
+                r = data.get("funding_rate_indicative")
+            if r is None:
+                return None
+
+            # Gate возвращает funding_next_apply_time в секундах (Unix timestamp)
+            # Также может быть в других полях: funding_next_apply_time, next_funding_time, funding_time
+            next_funding_time_raw = (
+                data.get("funding_next_apply_time") or
+                data.get("next_funding_time") or
+                data.get("funding_time") or
+                data.get("next_funding_apply_time")
+            )
+
+            # Если не нашли в contracts, пробуем получить из истории фандингов
+            if next_funding_time_raw is None:
+                try:
+                    url_history = "/api/v4/futures/usdt/funding_rate"
+                    params_history = {"contract": symbol, "limit": 1}
+                    data_history = await self._request_json("GET", url_history, params=params_history)
+                    
+                    if isinstance(data_history, list) and data_history:
+                        item = data_history[0]
+                        # В истории может быть время следующей выплаты или время последней выплаты
+                        next_funding_time_raw = (
+                            item.get("t") or  # timestamp последней выплаты
+                            item.get("time") or
+                            item.get("next_time")
+                        )
+                        # Если получили время последней выплаты, добавляем 8 часов (28800 секунд)
+                        if next_funding_time_raw is not None:
+                            try:
+                                last_time = int(next_funding_time_raw)
+                                # Добавляем 8 часов для следующей выплаты
+                                next_funding_time_raw = last_time + 28800
+                            except (TypeError, ValueError):
+                                next_funding_time_raw = None
+                except Exception:
+                    # Если не удалось получить из истории, оставляем None
+                    pass
+
+            try:
+                funding_rate = float(r)
+                next_funding_time = None
+                if next_funding_time_raw is not None:
+                    try:
+                        # Может быть строка или число
+                        if isinstance(next_funding_time_raw, str):
+                            next_funding_time = int(float(next_funding_time_raw))
+                        else:
+                            next_funding_time = int(next_funding_time_raw)
+                    except (TypeError, ValueError):
+                        # Если не удалось распарсить, оставляем None
+                        pass
+                
+                return {
+                    "funding_rate": funding_rate,
+                    "next_funding_time": next_funding_time,
+                }
+            except (TypeError, ValueError):
+                return None
+
+        except Exception as e:
+            logger.error(f"Gate: ошибка при получении funding info для {coin}: {e}", exc_info=True)
+            return None
+
+    async def get_orderbook(self, coin: str, limit: int = 50) -> Optional[Dict]:
+        """
+        Получить orderbook (книгу заявок) для монеты
+        """
+        try:
+            symbol = self._normalize_symbol(coin)
+            url = "/api/v4/futures/usdt/order_book"
+
+            # Gate принимает limit, но иногда удобнее дать небольшой sanity
+            limit_i = max(1, min(int(limit), 200))
+
+            # with_id=true полезен, если будешь синхронизировать по id, но для разовой ликвидности не обязателен
+            params = {"contract": symbol, "limit": limit_i}
+
+            data = await self._request_json("GET", url, params=params)
+            if not data:
+                logger.warning(f"Gate: не удалось получить orderbook для {coin}")
+                return None
+
+            if not isinstance(data, dict):
+                logger.warning(f"Gate: неожиданный формат orderbook для {coin}: {type(data)}")
+                return None
+
+            bids_raw = data.get("bids")
+            asks_raw = data.get("asks")
+
+            bids = self._parse_ob_levels(bids_raw, "bids", coin)
+            asks = self._parse_ob_levels(asks_raw, "asks", coin)
+
+            if not bids or not asks:
+                logger.warning(f"Gate: пустой/невалидный orderbook для {coin} (bids={type(bids_raw)}, asks={type(asks_raw)})")
+                return None
+
+            return {"bids": bids, "asks": asks}
+
+        except Exception as e:
+            logger.error(f"Gate: ошибка при получении orderbook для {coin}: {e}", exc_info=True)
+            return None
+
+    async def get_all_futures_coins(self) -> Set[str]:
+        """
+        Возвращает множество монет, доступных во фьючерсах на Gate.io.
+        
+        Returns:
+            Множество монет без суффиксов (например, {"BTC", "ETH", "SOL", ...})
+        """
+        return await fetch_gate_coins(self)

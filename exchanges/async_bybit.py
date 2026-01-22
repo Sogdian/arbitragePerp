@@ -1,9 +1,18 @@
 """
 Асинхронная реализация Bybit для фьючерсов на базе AsyncBaseExchange
+
+Фиксированная логика:
+- Рынок: Derivatives
+- Тип: Perpetual
+- Категория: linear (только USDT пары)
+- Символ: COINUSDT (без подчеркивания)
+- USDC / inverse / альтернативные категории - НЕ поддерживаются
+- Если COINUSDT не найден → считаем, что инструмента нет
 """
-from typing import Dict, Optional
+from typing import Dict, Optional, Set
 import logging
 from .async_base_exchange import AsyncBaseExchange
+from .coin_list_fetchers import fetch_bybit_coins
 
 logger = logging.getLogger(__name__)
 
@@ -37,50 +46,71 @@ class AsyncBybitExchange(AsyncBaseExchange):
         try:
             symbol = self._normalize_symbol(coin)
             url = "/v5/market/tickers"
-            params = {"category": "linear", "symbol": symbol}
+            params = {
+                "category": "linear",
+                "symbol": symbol,
+            }
+            
             data = await self._request_json("GET", url, params=params)
-            
-            if not data:
-                logger.warning(f"Bybit: не удалось получить тикер для {coin}")
-                return None
-            
-            ret_code = data.get("retCode")
-            if ret_code != 0:
-                ret_msg = data.get("retMsg", "Unknown error")
-                logger.warning(f"Bybit: API вернул ошибку для {coin}: retCode={ret_code}, retMsg={ret_msg}")
-                return None
-            
-            result = data.get("result", {})
-            list_data = result.get("list", [])
-            
-            if not list_data:
+            if not data or data.get("retCode") != 0:
                 logger.warning(f"Bybit: тикер для {coin} не найден")
                 return None
             
-            item = list_data[0]
-            
-            # Извлекаем цены
-            last_price_raw = item.get("lastPrice")
-            bid_raw = item.get("bid1Price")
-            ask_raw = item.get("ask1Price")
-            
-            if not last_price_raw:
-                logger.warning(f"Bybit: нет цены для {coin}")
+            items = (data.get("result") or {}).get("list") or []
+            if not items:
+                logger.warning(f"Bybit: тикер для {coin} не найден")
                 return None
             
-            try:
-                price = float(last_price_raw)
-                bid = float(bid_raw) if bid_raw else price
-                ask = float(ask_raw) if ask_raw else price
+            item = items[0]
+            last_price = item.get("lastPrice")
+            if last_price is None:
+                return None
+            
+            last = float(last_price)
+            
+            # Проверка, что last_price тоже валиден (не мусор)
+            if last <= 0:
+                return None
+            
+            def _safe_px(raw: object, fallback: float) -> float:
+                """
+                Безопасное преобразование цены с проверками на разумность
                 
-                return {
-                    "price": price,
-                    "bid": bid,
-                    "ask": ask,
-                }
-            except (ValueError, TypeError) as e:
-                logger.warning(f"Bybit: ошибка парсинга цен для {coin}: {e}")
-                return None
+                Args:
+                    raw: Сырое значение цены (может быть строкой, числом, None, или мусором)
+                    fallback: Значение по умолчанию (обычно last_price)
+                    
+                Returns:
+                    Валидная цена или fallback
+                """
+                try:
+                    v = float(raw)
+                except (TypeError, ValueError):
+                    return fallback
+                
+                if v <= 0:
+                    return fallback
+                
+                # Sanity check: если отличается от fallback больше чем в 10 раз — считаем мусором
+                # Порог 10x обычно достаточен; для очень волатильных инструментов можно сделать параметром (5x-20x)
+                if v > fallback * 10 or v < fallback / 10:
+                    return fallback
+                
+                return v
+            
+            bid = _safe_px(item.get("bid1Price"), last)
+            ask = _safe_px(item.get("ask1Price"), last)
+            
+            # Если после проверок bid > ask (бывает на мусорных данных) — откатываем на last
+            if bid > ask:
+                bid = last
+                ask = last
+            
+            return {
+                "price": last,
+                "bid": bid,
+                "ask": ask,
+            }
                 
         except Exception as e:
             logger.error(f"Bybit: ошибка при получении тикера для {coin}: {e}", exc_info=True)
@@ -98,42 +128,148 @@ class AsyncBybitExchange(AsyncBaseExchange):
         """
         try:
             symbol = self._normalize_symbol(coin)
-            url = "/v5/market/funding/history"
-            params = {"category": "linear", "symbol": symbol, "limit": 1}
-            data = await self._request_json("GET", url, params=params)
-            
-            if not data:
-                logger.warning(f"Bybit: не удалось получить фандинг для {coin}")
-                return None
-            
-            ret_code = data.get("retCode")
-            if ret_code != 0:
-                ret_msg = data.get("retMsg", "Unknown error")
-                logger.warning(f"Bybit: API вернул ошибку для фандинга {coin}: retCode={ret_code}, retMsg={ret_msg}")
-                return None
-            
-            result = data.get("result", {})
-            list_data = result.get("list", [])
-            
-            if not list_data:
+
+            # Bybit:
+            # - /v5/market/tickers -> текущая/индикативная ставка (то, что UI показывает как "Текущая ставка")
+            # - /v5/market/funding/history -> история (то, что UI показывает как "Предыдущая ставка")
+            url_tickers = "/v5/market/tickers"
+            params_tickers = {"category": "linear", "symbol": symbol}
+
+            data = await self._request_json("GET", url_tickers, params=params_tickers)
+            if data and data.get("retCode") == 0:
+                items = (data.get("result") or {}).get("list") or []
+                if items and isinstance(items[0], dict):
+                    r = items[0].get("fundingRate")
+                    if r is not None:
+                        try:
+                            return float(r)
+                        except (TypeError, ValueError):
+                            pass
+
+            # Fallback на историю (предыдущая применённая ставка)
+            url_history = "/v5/market/funding/history"
+            params_history = {"category": "linear", "symbol": symbol, "limit": 1}
+
+            data = await self._request_json("GET", url_history, params=params_history)
+            if not data or data.get("retCode") != 0:
                 logger.warning(f"Bybit: фандинг для {coin} не найден")
                 return None
-            
-            item = list_data[0]
-            funding_rate_raw = item.get("fundingRate")
-            
+
+            items = (data.get("result") or {}).get("list") or []
+            if not items:
+                logger.warning(f"Bybit: фандинг для {coin} не найден")
+                return None
+
+            funding_rate_raw = items[0].get("fundingRate")
             if funding_rate_raw is None:
-                logger.warning(f"Bybit: нет ставки фандинга для {coin}")
                 return None
-            
-            try:
-                funding_rate = float(funding_rate_raw)
-                return funding_rate
-            except (ValueError, TypeError) as e:
-                logger.warning(f"Bybit: ошибка парсинга фандинга для {coin}: {e}")
-                return None
+
+            return float(funding_rate_raw)
                 
         except Exception as e:
             logger.error(f"Bybit: ошибка при получении фандинга для {coin}: {e}", exc_info=True)
             return None
+
+    async def get_funding_info(self, coin: str) -> Optional[Dict]:
+        """
+        Получить информацию о фандинге (ставка и время до следующей выплаты)
+        
+        Args:
+            coin: Название монеты без /USDT (например, "CVC")
+            
+        Returns:
+            Словарь с данными:
+            {
+                "funding_rate": float,  # Ставка фандинга (например, 0.0001 = 0.01%)
+                "next_funding_time": int,  # Timestamp следующей выплаты в миллисекундах
+            }
+            или None если ошибка
+        """
+        try:
+            symbol = self._normalize_symbol(coin)
+            url = "/v5/market/tickers"
+            params = {"category": "linear", "symbol": symbol}
+
+            data = await self._request_json("GET", url, params=params)
+            if not data or data.get("retCode") != 0:
+                return None
+
+            items = (data.get("result") or {}).get("list") or []
+            if not items or not isinstance(items[0], dict):
+                return None
+
+            item = items[0]
+            funding_rate_raw = item.get("fundingRate")
+            next_funding_time_raw = item.get("nextFundingTime")
+
+            if funding_rate_raw is None:
+                return None
+
+            try:
+                funding_rate = float(funding_rate_raw)
+                next_funding_time = int(next_funding_time_raw) if next_funding_time_raw is not None else None
+                return {
+                    "funding_rate": funding_rate,
+                    "next_funding_time": next_funding_time,
+                }
+            except (TypeError, ValueError):
+                return None
+
+        except Exception as e:
+            logger.error(f"Bybit: ошибка при получении funding info для {coin}: {e}", exc_info=True)
+            return None
+    
+    async def get_orderbook(self, coin: str, limit: int = 50) -> Optional[Dict]:
+        """
+        Получить книгу заявок (orderbook) для монеты
+        
+        Args:
+            coin: Название монеты без /USDT (например, "GPS")
+            limit: Количество уровней (по умолчанию 50)
+            
+        Returns:
+            Словарь с данными книги заявок:
+            {
+                "bids": [[price, size], ...],  # Заявки на покупку
+                "asks": [[price, size], ...]    # Заявки на продажу
+            }
+            или None если ошибка
+        """
+        try:
+            symbol = self._normalize_symbol(coin)
+            url = "/v5/market/orderbook"
+            params = {
+                "category": "linear",
+                "symbol": symbol,
+                "limit": limit,
+            }
+            
+            data = await self._request_json("GET", url, params=params)
+            if not data or data.get("retCode") != 0:
+                logger.warning(f"Bybit: orderbook error for {coin}: {data}")
+                return None
+            
+            result = data.get("result") or {}
+            bids = result.get("b") or []  # [[price, size], ...]
+            asks = result.get("a") or []
+            
+            if not bids or not asks:
+                return None
+            
+            return {"bids": bids, "asks": asks}
+                
+        except Exception as e:
+            logger.error(f"Bybit: ошибка при получении orderbook для {coin}: {e}", exc_info=True)
+            return None
+
+    async def get_all_futures_coins(self) -> Set[str]:
+        """
+        Возвращает множество монет, доступных во фьючерсах на Bybit.
+        
+        Returns:
+            Множество монет без суффиксов (например, {"BTC", "ETH", "SOL", ...})
+        """
+        return await fetch_bybit_coins(self)
+
+
 
