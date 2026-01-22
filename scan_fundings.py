@@ -72,13 +72,11 @@ FUNDING_EXCHANGES = ["bybit"]
 # Logging
 # ----------------------------
 LOG_LEVEL = os.getenv("SCAN_FUNDING_LOG_LEVEL", "INFO").upper()
-LOG_FILE = os.getenv("SCAN_FUNDING_LOG_FILE", "scan_fundings.log")
 
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     handlers=[
-        logging.FileHandler(LOG_FILE, encoding="utf-8"),
         logging.StreamHandler(sys.stdout),
     ],
 )
