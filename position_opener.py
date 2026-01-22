@@ -23,6 +23,7 @@ import math
 import os
 import time
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_UP
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
@@ -88,14 +89,21 @@ def _get_env_any(names: Tuple[str, ...]) -> Optional[str]:
 
 def _floor_to_step(x: float, step: float) -> float:
     if step <= 0:
-        return x
-    return math.floor(x / step) * step
+        return float(x)
+    x = float(x)
+    step = float(step)
+    # protect against floating error: e.g. 1.0000000002 / 0.1
+    k = math.floor((x + 1e-12) / step)
+    return float(k * step)
 
 
 def _ceil_to_step(x: float, step: float) -> float:
     if step <= 0:
-        return x
-    return math.ceil(x / step) * step
+        return float(x)
+    x = float(x)
+    step = float(step)
+    k = math.ceil((x - 1e-12) / step)
+    return float(k * step)
 
 
 def _is_multiple_of_step(x: float, step: float, eps: float = 1e-12) -> bool:
@@ -107,9 +115,9 @@ def _is_multiple_of_step(x: float, step: float, eps: float = 1e-12) -> bool:
 
 def _round_price_for_side(price: float, tick: float, side: str) -> float:
     """
-    Чтобы лимитка исполнилась агрессивно:
-    - Buy: округляем ВВЕРХ к tick (не ниже ask)
-    - Sell: округляем ВНИЗ к tick (не выше bid)
+    Aggressive rounding:
+    - Buy  -> ceil to tick
+    - Sell -> floor to tick
     """
     price = float(price)
     tick = float(tick)
@@ -122,23 +130,50 @@ def _round_price_for_side(price: float, tick: float, side: str) -> float:
 
 
 def _decimals_from_step_str(step_raw: Optional[str]) -> int:
+    """
+    Returns number of decimals implied by step string.
+    Supports: "0.001", "1", "1e-5", "5E-3".
+    """
     if not step_raw:
-        return 8
-    s = str(step_raw).strip()
-    if "e" in s.lower():
-        # fallback
-        return 8
-    if "." not in s:
         return 0
-    frac = s.split(".", 1)[1]
-    frac = frac.rstrip("0")
-    return max(0, len(frac))
+    s = str(step_raw).strip()
+    if not s:
+        return 0
+    try:
+        d = Decimal(s)
+    except InvalidOperation:
+        # fallback: try float then Decimal
+        try:
+            d = Decimal(str(float(s)))
+        except Exception:
+            return 0
+    # Normalize removes trailing zeros but keeps exponent
+    # Example: Decimal("1e-5").as_tuple().exponent == -5
+    exp = d.as_tuple().exponent
+    return int(max(0, -exp))
 
 
 def _format_by_step(x: float, step_raw: Optional[str]) -> str:
+    """
+    Format number with decimals implied by step_raw.
+    - step_raw="0.001" -> 3 decimals
+    - step_raw="1e-5"  -> 5 decimals
+    Trims trailing zeros.
+    """
     decimals = _decimals_from_step_str(step_raw)
-    s = f"{x:.{decimals}f}" if decimals > 0 else str(int(x))
-    return s.rstrip("0").rstrip(".") if "." in s else s
+    if decimals <= 0:
+        # avoid "-0"
+        xi = int(round(float(x)))
+        return str(xi)
+    # Use Decimal for stable rounding/formatting
+    try:
+        q = Decimal("1").scaleb(-decimals)  # 10^-decimals
+        dx = Decimal(str(float(x))).quantize(q)  # default rounding half-even ok for display
+        s = format(dx, "f")
+    except Exception:
+        s = f"{float(x):.{decimals}f}"
+    s = s.rstrip("0").rstrip(".")
+    return s if s else "0"
 
 
 def _price_level_for_target_size(levels: Any, target_size: float) -> Tuple[Optional[float], float]:
@@ -346,15 +381,15 @@ async def _bybit_get_position_size_one_leg(
     api_secret: str,
     coin: str,
     position_direction: str,  # "short" or "long"
-    position_idx: Optional[int] = None,  # optional hint for hedge mode
+    position_idx: Optional[int] = None,
 ) -> float:
     """
-    Возвращает текущий size позиции (abs) по направлению (short/long) для одного инструмента.
-    Best-effort: работает и в one-way, и в hedge-mode.
-
-    - В hedge-mode удобнее фильтровать по positionIdx (если передан),
-      но также делаем fallback по side.
-    - Возвращает 0.0 если позиции нет или ошибка.
+    Возвращает size позиции (abs) по направлению (short/long) для одного инструмента.
+    Важно:
+    - В hedge-mode удобно фильтровать по positionIdx (1=long, 2=short),
+      но unified/one-way иногда игнорирует/меняет pidx. Поэтому:
+        1) пробуем с position_idx (если задан),
+        2) если не нашли — делаем fallback только по side.
     """
     pos_dir = (position_direction or "").lower().strip()
     if pos_dir not in ("short", "long"):
@@ -369,41 +404,46 @@ async def _bybit_get_position_size_one_leg(
         path="/v5/position/list",
         params={"category": "linear", "symbol": symbol},
     )
+
     if not (isinstance(data, dict) and data.get("retCode") == 0):
         return 0.0
 
     items = ((data.get("result") or {}).get("list") or [])
-    if not isinstance(items, list):
+    if not isinstance(items, list) or not items:
         return 0.0
 
     want_side = "sell" if pos_dir == "short" else "buy"
 
-    best = 0.0
-    for it in items:
-        if not isinstance(it, dict):
-            continue
-
-        # 1) Если передан position_idx, пытаемся матчить его (hedge-mode)
-        if position_idx is not None:
-            try:
-                pidx = int(it.get("positionIdx")) if it.get("positionIdx") is not None else None
-            except Exception:
-                pidx = None
-            if pidx is not None and pidx != int(position_idx):
+    def _best_match(use_pidx: bool) -> float:
+        best = 0.0
+        for it in items:
+            if not isinstance(it, dict):
                 continue
+            if use_pidx and position_idx is not None:
+                try:
+                    pidx = int(it.get("positionIdx")) if it.get("positionIdx") is not None else None
+                except Exception:
+                    pidx = None
+                if pidx is None or pidx != int(position_idx):
+                    continue
+            side = str(it.get("side") or "").lower().strip()
+            if side and side != want_side:
+                continue
+            try:
+                sz = float(it.get("size") or 0.0)
+            except Exception:
+                sz = 0.0
+            if sz > best:
+                best = sz
+        return float(abs(best))
 
-        side = str(it.get("side") or "").lower().strip()  # "Buy"/"Sell"
-        if side and side != want_side:
-            continue
-
-        try:
-            sz = float(it.get("size") or 0.0)
-        except Exception:
-            sz = 0.0
-        if sz > best:
-            best = sz
-
-    return float(abs(best))
+    # 1) если дали position_idx — сначала по нему
+    if position_idx is not None:
+        v = _best_match(use_pidx=True)
+        if v > 0:
+            return v
+    # 2) fallback без position_idx
+    return _best_match(use_pidx=False)
 
 
 async def _bybit_close_leg_partial_ioc(
@@ -1527,76 +1567,94 @@ async def _bybit_private_request(
 
 async def _bybit_wait_full_fill(*, planned: Dict[str, Any], order_id: str) -> Tuple[bool, float]:
     """
-    Bybit: realtime endpoint может не возвращать уже filled/cancelled ордера,
-    поэтому используем fallback на /v5/order/history.
+    Возвращает (is_full, filled_qty).
+    Почему так:
+    - /v5/order/realtime иногда "не видит" уже завершённые ордера.
+    - Для IOC нормальная ситуация: частично исполнилось и ордер стал Cancelled.
+      Это НЕ ошибка — filled_qty просто будет < qty_req.
     """
     api_key = planned["api_key"]
     api_secret = planned["api_secret"]
     exchange_obj = planned["exchange_obj"]
     symbol = planned["symbol"]
-    qty_req = float(planned["qty"])
-    eps = max(1e-10, qty_req * 1e-8)
+    try:
+        qty_req = float(planned["qty"])
+    except Exception:
+        qty_req = 0.0
+    eps = max(1e-10, abs(qty_req) * 1e-8)
+    poll_sleep = float(os.getenv("PO_BYBIT_FILL_POLL_SEC", "0.2") or "0.2")
+    max_polls = int(os.getenv("PO_BYBIT_FILL_MAX_POLLS", "30") or "30")  # 30 * 0.2 = ~6s
 
     import asyncio
     last_seen: Optional[Dict[str, Any]] = None
     last_err: Optional[str] = None
-    for _ in range(30):  # ~6s total
-        # 1) realtime (open orders)
-        data_rt = await _bybit_private_request(
-            exchange_obj=exchange_obj,
-            api_key=api_key,
-            api_secret=api_secret,
-            method="GET",
-            path="/v5/order/realtime",
-            params={"category": "linear", "symbol": symbol, "orderId": order_id},
-        )
-        if isinstance(data_rt, dict) and data_rt.get("_error"):
-            last_err = str(data_rt)
-            logger.debug(f"Bybit fill check realtime error: {data_rt}")
-        elif isinstance(data_rt, dict) and data_rt.get("retCode") not in (None, 0):
-            last_err = f"realtime retCode={data_rt.get('retCode')} retMsg={data_rt.get('retMsg')}"
-        if isinstance(data_rt, dict) and data_rt.get("retCode") == 0:
-            items = ((data_rt.get("result") or {}).get("list") or [])
-            item = items[0] if items and isinstance(items[0], dict) else None
-            if item:
-                last_seen = item
 
-        # 2) history (filled/cancelled)
-        data_h = await _bybit_private_request(
+    async def _fetch_one(path: str) -> Optional[Dict[str, Any]]:
+        nonlocal last_err
+        data = await _bybit_private_request(
             exchange_obj=exchange_obj,
             api_key=api_key,
             api_secret=api_secret,
             method="GET",
-            path="/v5/order/history",
-            params={"category": "linear", "symbol": symbol, "orderId": order_id},
+            path=path,
+            params={"category": "linear", "symbol": symbol, "orderId": str(order_id)},
         )
-        if isinstance(data_h, dict) and data_h.get("_error"):
-            last_err = str(data_h)
-            logger.debug(f"Bybit fill check history error: {data_h}")
-        elif isinstance(data_h, dict) and data_h.get("retCode") not in (None, 0):
-            last_err = f"history retCode={data_h.get('retCode')} retMsg={data_h.get('retMsg')}"
-        if isinstance(data_h, dict) and data_h.get("retCode") == 0:
-            items = ((data_h.get("result") or {}).get("list") or [])
-            item = items[0] if items and isinstance(items[0], dict) else None
-            if item:
-                last_seen = item
+        if isinstance(data, dict) and data.get("_error"):
+            last_err = str(data)
+            return None
+        if not (isinstance(data, dict) and data.get("retCode") == 0):
+            if isinstance(data, dict):
+                last_err = f"{path} retCode={data.get('retCode')} retMsg={data.get('retMsg')}"
+            return None
+        items = ((data.get("result") or {}).get("list") or [])
+        item = items[0] if items and isinstance(items[0], dict) else None
+        return item
+
+    def _parse_filled(item: Dict[str, Any]) -> float:
+        v = item.get("cumExecQty")
+        try:
+            return float(v) if v is not None else 0.0
+        except Exception:
+            return 0.0
+
+    def _parse_status(item: Dict[str, Any]) -> str:
+        s = str(item.get("orderStatus") or "").strip()
+        return s
+
+    terminal = {
+        "filled",
+        "cancelled", "canceled",
+        "rejected",
+        "deactivated",
+        "partiallyfilledcanceled",  # встречается у некоторых шлюзов
+    }
+
+    for _ in range(max_polls):
+        # realtime
+        item_rt = await _fetch_one("/v5/order/realtime")
+        if item_rt:
+            last_seen = item_rt
+        # history (важнее)
+        item_h = await _fetch_one("/v5/order/history")
+        if item_h:
+            last_seen = item_h
 
         if last_seen:
-            status = str(last_seen.get("orderStatus") or "")
-            cum_exec = last_seen.get("cumExecQty")
-            try:
-                filled = float(cum_exec) if cum_exec is not None else 0.0
-            except Exception:
-                filled = 0.0
-            if status.lower() in ("filled", "cancelled", "canceled", "rejected", "partiallyfilled", "partially_filled"):
-                logger.info(f"Bybit: статус ордера: {status} | исполнено={_format_number(filled)} | требовалось={_format_number(qty_req)}")
-                return (filled + eps >= qty_req), filled
+            status = _parse_status(last_seen)
+            filled = _parse_filled(last_seen)
+            st_low = status.lower().replace("_", "").replace(" ", "")
 
-        await asyncio.sleep(0.2)
+            # Filled — успех, Cancelled/Rej — терминал, но не обязательно full
+            if st_low in terminal or st_low == "partiallyfilled":
+                # Для IOC: PartiallyFilled может очень быстро перейти в Cancelled.
+                # Поэтому считаем "full" только по qty.
+                is_full = (filled + eps) >= qty_req if qty_req > 0 else (filled > 0)
+                return is_full, float(filled)
 
-    # если ничего не нашли — это скорее проблема доступа/подписи/ответа API
+        await asyncio.sleep(max(0.05, poll_sleep))
+
     tail = f" | last_error={last_err}" if last_err else ""
-    logger.error(f"Bybit fill check: не удалось получить статус ордера (symbol={symbol}){tail}")
+    # Если ничего не нашли — считаем 0 исполнено
     return False, 0.0
 
 
