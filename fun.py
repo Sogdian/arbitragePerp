@@ -557,6 +557,27 @@ async def _bybit_get_short_position_qty(
     return float(short_qty)
 
 
+async def _bybit_get_short_qty_snapshot(
+    *,
+    exchange_obj: Any,
+    api_key: str,
+    api_secret: str,
+    coin: str,
+) -> float:
+    """
+    Snapshot total short size (Sell side) for symbol.
+    Use BEFORE/AFTER to compute delta-opened.
+    """
+    return float(
+        await _bybit_get_short_position_qty(
+            exchange_obj=exchange_obj,
+            api_key=api_key,
+            api_secret=api_secret,
+            coin=coin,
+        )
+    )
+
+
 async def _bybit_fetch_recent_trades(*, exchange_obj: Any, coin: str, limit: int = 200) -> List[Dict[str, Any]]:
     """
     Public trades: /v5/market/recent-trade
@@ -1516,6 +1537,15 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
         f"затем закрывать Short c {close_local_str}"
     )
 
+    # Snapshot existing short BEFORE open (important!)
+    short_before = await _bybit_get_short_qty_snapshot(
+        exchange_obj=exchange_obj,
+        api_key=api_key,
+        api_secret=api_secret,
+        coin=p.coin,
+    )
+    post_logs.append(f"📍 Позиция до входа: short_before={_fmt(short_before)} {p.coin}")
+
     # Wait until open time
     await _sleep_until_epoch_ms(open_local_ms)
 
@@ -1527,10 +1557,9 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
         old_disable_level = logging.root.manager.disable
         logging.disable(logging.CRITICAL)
 
-    short_place_err: Optional[str] = None
+    short_place_errs: List[str] = []
 
     async def _place_sell_ioc(qty_to_sell: float, px: float) -> None:
-        nonlocal short_place_err
         qty_to_sell = float(qty_to_sell)
         if qty_to_sell <= 0:
             return
@@ -1567,31 +1596,45 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
                     position_idx=None,
                 )
         except Exception as e:
-            short_place_err = str(e)
+            short_place_errs.append(str(e))
 
     target_qty = float(p.coin_qty)
-    qty_pos_now: float = 0.0
 
-    # Phase-1: quality attempts (на весь target)
+    def _delta_opened(short_after: float, short_before_: float) -> float:
+        return max(0.0, float(short_after) - float(short_before_))
+
+    # Phase-1: quality attempts, but always send ONLY remaining qty
+    short_after = float(short_before)
+    opened = 0.0
+
     for px_try in phase1_prices:
-        await _place_sell_ioc(target_qty, float(px_try))
+        remain = max(0.0, target_qty - opened)
+        if remain <= 0:
+            break
 
-    # маленькая пауза, потом проверим сколько реально открылось
-    if OPEN_PHASE1_WAIT_MS > 0:
-        time.sleep(max(0, int(OPEN_PHASE1_WAIT_MS)) / 1000.0)
+        await _place_sell_ioc(remain, float(px_try))
 
-    # Проверка позиции (1 вызов после phase-1; это ключ к "и исполнено")
-    qty_pos_now = await _bybit_get_short_position_qty(exchange_obj=exchange_obj, api_key=api_key, api_secret=api_secret, coin=p.coin)
-    qty_pos_now = float(qty_pos_now)
+        if OPEN_PHASE1_WAIT_MS > 0:
+            time.sleep(max(0, int(OPEN_PHASE1_WAIT_MS)) / 1000.0)
 
-    # Жёсткий кап: не добирать, если уже >= target
-    if int(OPEN_HARD_CAP_ENABLE) == 1 and qty_pos_now >= target_qty - 1e-12:
+        short_after = await _bybit_get_short_qty_snapshot(
+            exchange_obj=exchange_obj,
+            api_key=api_key,
+            api_secret=api_secret,
+            coin=p.coin,
+        )
+        opened = _delta_opened(short_after, short_before)
+
+        if opened >= target_qty - 1e-12:
+            break
+
+    # Phase-2: guarantee ladder on remaining qty only
+    if int(OPEN_HARD_CAP_ENABLE) == 1 and opened >= target_qty - 1e-12:
         pass
     else:
-        qty_remain = max(0.0, target_qty - qty_pos_now)
+        qty_remain = max(0.0, target_qty - opened)
         if int(OPEN_PHASE2_ENABLE) == 1 and qty_remain > 0:
-            # Phase-2: guarantee ladder on REMAINING qty only
-            # 1) Один быстрый refresh стакана (ТОЛЬКО если Phase-1 не дал fill)
+            # Optional refresh best bid ONLY if still not filled
             best_bid_now: Optional[float] = None
             try:
                 ob_now = await exchange_obj.get_orderbook(p.coin, limit=5)
@@ -1600,7 +1643,6 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
             except Exception:
                 best_bid_now = None
 
-            # 2) Если получили best_bid_now — строим phase2 от него (а не от best_bid_fix)
             if best_bid_now and best_bid_now > 0:
                 ded2_now = _deduct_from_best_bid(
                     float(best_bid_now),
@@ -1614,13 +1656,30 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
                     extra_bps=OPEN_PHASE2_EXTRA_BPS,
                 )
             else:
-                phase2_prices_now = phase2_prices  # fallback старый план
+                phase2_prices_now = phase2_prices
 
             for px_try in phase2_prices_now:
+                qty_remain = max(0.0, target_qty - opened)
+                if qty_remain <= 0:
+                    break
+
                 await _place_sell_ioc(qty_remain, float(px_try))
-            # финальный пересчёт позиции после phase-2
-            qty_pos_now = await _bybit_get_short_position_qty(exchange_obj=exchange_obj, api_key=api_key, api_secret=api_secret, coin=p.coin)
-            qty_pos_now = float(qty_pos_now)
+
+                # маленькая пауза, чтобы позиция успела обновиться
+                time.sleep(0.02)
+
+                short_after = await _bybit_get_short_qty_snapshot(
+                    exchange_obj=exchange_obj,
+                    api_key=api_key,
+                    api_secret=api_secret,
+                    coin=p.coin,
+                )
+                opened = _delta_opened(short_after, short_before)
+
+                if opened >= target_qty - 1e-12:
+                    break
+
+    qty_pos_now = float(short_after)
 
     # Wait until close start time
     await _sleep_until_epoch_ms(close_local_ms)
@@ -1633,20 +1692,29 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
     # Print delayed logs here (after critical window)
     for m in post_logs:
         logger.info(m)
-    if short_place_err:
-        logger.warning(f"⚠️ Short: ошибка создания ордера: {short_place_err}")
+    if short_place_errs:
+        logger.warning(f"⚠️ Short: ошибки создания ордера (первые 2): {short_place_errs[:2]}")
 
-    # Use qty_pos_now as фактически открытый размер (после phase-1/phase-2)
-    qty_pos = float(qty_pos_now)
-    if qty_pos <= 0:
-        logger.warning("⚠️ Похоже, Short не открылся (позиция=0). Завершаем.")
+    # Compute opened delta
+    short_after_final = await _bybit_get_short_qty_snapshot(
+        exchange_obj=exchange_obj,
+        api_key=api_key,
+        api_secret=api_secret,
+        coin=p.coin,
+    )
+    opened_qty = max(0.0, float(short_after_final) - float(short_before))
+
+    logger.info(f"📍 Позиция после входа: short_after={_fmt(short_after_final)} | opened_delta={_fmt(opened_qty)} {p.coin}")
+
+    if opened_qty <= 0:
+        logger.warning("⚠️ Новый Short не открылся (opened_delta=0). Ничего не закрываем. Завершаем.")
         return 0
 
     ok_close, avg_exit_short = await po._bybit_close_leg_partial_ioc(
         exchange_obj=exchange_obj,
         coin=p.coin,
         position_direction="short",
-        coin_amount=float(qty_pos),
+        coin_amount=float(opened_qty),
         position_idx=2,
     )
     if not ok_close:
@@ -1654,14 +1722,14 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
             exchange_obj=exchange_obj,
             coin=p.coin,
             position_direction="short",
-            coin_amount=float(qty_pos),
+            coin_amount=float(opened_qty),
             position_idx=None,
         )
 
     if ok_close:
-        logger.info(f"✅ Short закрыт | qty={_fmt(qty_pos)} | avg_exit_buy={_fmt(avg_exit_short)}")
+        logger.info(f"✅ Short закрыт | qty={_fmt(opened_qty)} | avg_exit_buy={_fmt(avg_exit_short)}")
     else:
-        logger.error(f"❌ Short НЕ закрыт полностью (best-effort) | qty={_fmt(qty_pos)} | avg_exit_buy={_fmt(avg_exit_short)}")
+        logger.error(f"❌ Short НЕ закрыт полностью (best-effort) | qty={_fmt(opened_qty)} | avg_exit_buy={_fmt(avg_exit_short)}")
 
     # Post-trade executions / PnL
     t_start_ms = int(open_server_ms - 5_000)
