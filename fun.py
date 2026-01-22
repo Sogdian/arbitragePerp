@@ -361,7 +361,12 @@ async def _bybit_place_limit(
     reduce_only: Optional[bool] = None,
     position_idx: Optional[int] = None,
 ) -> str:
+    """
+    Place limit order via REST with automatic retry on positionIdx mismatch (retCode=10001).
+    """
     symbol = exchange_obj._normalize_symbol(coin)
+    
+    # Первая попытка с указанным position_idx
     body: Dict[str, Any] = {
         "category": "linear",
         "symbol": symbol,
@@ -376,15 +381,43 @@ async def _bybit_place_limit(
     if position_idx is not None:
         body["positionIdx"] = int(position_idx)
 
-    data = await po._bybit_private_post(
-        exchange_obj=exchange_obj,
-        api_key=api_key,
-        api_secret=api_secret,
-        path="/v5/order/create",
-        body=body,
-    )
-    if not isinstance(data, dict) or data.get("retCode") != 0:
-        raise RuntimeError(f"Bybit create order failed: {data}")
+    try:
+        data = await po._bybit_private_post(
+            exchange_obj=exchange_obj,
+            api_key=api_key,
+            api_secret=api_secret,
+            path="/v5/order/create",
+            body=body,
+        )
+        if not isinstance(data, dict) or data.get("retCode") != 0:
+            ret_code = data.get("retCode") if isinstance(data, dict) else None
+            ret_msg = data.get("retMsg") if isinstance(data, dict) else None
+            # Runtime fallback: retCode=10001 = position idx not match position mode
+            if ret_code == 10001 and position_idx is not None:
+                # Пробуем с альтернативным positionIdx: 0 вместо 2, или 2 вместо 0
+                alt_idx = 0 if int(position_idx) == 2 else 2
+                logger.warning(
+                    f"⚠️ Bybit REST: retCode=10001 (position idx mismatch) | "
+                    f"tried positionIdx={position_idx}, retrying with positionIdx={alt_idx}"
+                )
+                body_retry = body.copy()
+                body_retry["positionIdx"] = int(alt_idx)
+                data = await po._bybit_private_post(
+                    exchange_obj=exchange_obj,
+                    api_key=api_key,
+                    api_secret=api_secret,
+                    path="/v5/order/create",
+                    body=body_retry,
+                )
+                if not isinstance(data, dict) or data.get("retCode") != 0:
+                    raise RuntimeError(f"Bybit create order failed (after retry): {data}")
+            else:
+                raise RuntimeError(f"Bybit create order failed: {data}")
+    except RuntimeError:
+        raise
+    except Exception as e:
+        raise RuntimeError(f"Bybit create order error: {e}")
+    
     order_id = (data.get("result") or {}).get("orderId") if isinstance(data.get("result"), dict) else None
     if not order_id:
         raise RuntimeError(f"Bybit create order: no orderId: {data}")
@@ -1450,26 +1483,25 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
         logger.error(f"❌ Новости/делистинг: {news_msg}")
         return 2
 
-    # Summary
+    # Summary (используем logger.info вместо print, чтобы попало в лог-файл)
     sep = "=" * 60
     coin_upper = p.coin.upper()
     exchange_cap = p.exchange.capitalize()
     payout_time_str = f"{p.payout_hh:02d}:{p.payout_mm:02d}" if p.payout_hh is not None and p.payout_mm is not None else "N/A"
-    print(
-        "\n".join(
-            [
-                sep,
-                f"Анализ арбитража для {exchange_cap} ({coin_upper})",
-                sep,
-                f"Цена (pre): {_fmt(last_px_pre, 6)} | qty={_fmt(p.coin_qty)} {coin_upper} | notional~{_fmt(p.coin_qty*last_px_pre, 3)} USDT",
-                f"Фандинг (pre): {_fmt(p.funding_pct*100, 6)}%",
-                f"Время следующей выплаты (local): {payout_time_str}",
-                f"Доп отступ: {_fmt(p.offset_pct*100, 6)}%",
-                f"Мин qty: {_fmt(min_qty_allowed)} | qty_norm: {_fmt(p.coin_qty)}",
-                sep,
-            ]
-        )
-    )
+    summary_lines = [
+        sep,
+        f"Анализ арбитража для {exchange_cap} ({coin_upper})",
+        sep,
+        f"Цена (pre): {_fmt(last_px_pre, 6)} | qty={_fmt(p.coin_qty)} {coin_upper} | notional~{_fmt(p.coin_qty*last_px_pre, 3)} USDT",
+        f"Фандинг (pre): {_fmt(p.funding_pct*100, 6)}%",
+        f"Время следующей выплаты (local): {payout_time_str}",
+        f"Доп отступ: {_fmt(p.offset_pct*100, 6)}%",
+        f"Мин qty: {_fmt(min_qty_allowed)} | qty_norm: {_fmt(p.coin_qty)}",
+        sep,
+    ]
+    # Выводим через logger.info, чтобы попало в лог-файл
+    for line in summary_lines:
+        logger.info(line)
 
     if delisting_news:
         logger.info(f"❌ Найдены новости о делистинге {coin_upper} ({exchange_cap}) за {NEWS_DAYS_BACK} дней ({len(delisting_news)} шт.)")
@@ -1544,6 +1576,8 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
     # Public WS
     ws_public = BybitPublicWS(symbol=symbol)
     ws_public_task = asyncio.create_task(ws_public.run())
+    # Сохраняем task в объекте для корректной отмены при stop()
+    ws_public._task = ws_public_task
     
     logger.info("🔌 WS: запускаем public stream (orderbook.1 + publicTrade + tickers)")
     try:
@@ -1721,11 +1755,12 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
     
     qty_str = po._format_by_step(p.coin_qty, qty_step_raw)
     
-    # Лимит "около close_price":
+    # Лимит "около close_price" с учётом best_bid_fix:
     # Sell Limit исполняется, если bid >= limit.
-    # Чтобы попытаться заполниться максимально близко к close_price (и не "догонять"),
-    # ставим limit чуть ниже close_price на OPEN_SAFETY_TICKS.
-    limit_px = float(close_price) - float(OPEN_SAFETY_TICKS) * tick
+    # Базис: min(close_price, best_bid_fix) - защита от случая, когда last_trade пришёл "по аску"
+    # и оказался выше bid. Это улучшает качество входа и снижает риск "не заполнился".
+    base = min(float(close_price), float(best_bid_fix))
+    limit_px = base - float(OPEN_SAFETY_TICKS) * tick
     limit_px = po._floor_to_step(limit_px, tick)
     
     if limit_px <= 0:
@@ -1761,8 +1796,8 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
     }
     
     logger.info(
-        f"🧷 OPEN PREPARED: close_price={_fmt(close_price)} "
-        f"limit_px={px_str} qty={qty_str} (safety_ticks={OPEN_SAFETY_TICKS})"
+        f"🧷 OPEN PREPARED: close_price={_fmt(close_price)} best_bid_fix={_fmt(best_bid_fix)} "
+        f"base={_fmt(base)} limit_px={px_str} qty={qty_str} (safety_ticks={OPEN_SAFETY_TICKS})"
     )
     
     # Snapshot existing short BEFORE open (если у тебя уже переведено на WS — ок)
@@ -1808,13 +1843,47 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
         f"| funding={_fmt((p.funding_pct or 0.0)*100, 6)}%"
     )
     
-    # Отправляем ордер через Trade WS (fast path)
+    # Отправляем ордер через Trade WS (fast path) с retry на retCode=10001
     order_id = None
     if USE_TRADE_WS == 1 and ws_trade is not None:
         try:
             # Важно: timestamp считаем прямо в момент отправки
             server_ts_ms = int(time.time() * 1000) + int(offset_ms)
-            ack = await ws_trade.create_order(order=order, server_ts_ms=server_ts_ms, timeout_sec=1.0)
+            ack = None
+            try:
+                ack = await ws_trade.create_order(order=order, server_ts_ms=server_ts_ms, timeout_sec=1.0)
+            except RuntimeError as e:
+                # Извлекаем retCode из сообщения об ошибке для более надёжной обработки
+                err_str = str(e)
+                ret_code = None
+                # Пытаемся извлечь retCode из сообщения: "order.create retCode=10001 ..."
+                match = re.search(r'retCode[=:](\d+)', err_str)
+                if match:
+                    try:
+                        ret_code = int(match.group(1))
+                    except Exception:
+                        pass
+                
+                # Проверяем, не retCode=10001 ли это (position idx mismatch)
+                if ret_code == 10001 or "retCode=10001" in err_str or "position idx not match" in err_str.lower():
+                    # Runtime fallback: пробуем с альтернативным positionIdx
+                    current_pidx = order.get("positionIdx")
+                    if current_pidx is not None:
+                        alt_pidx = 0 if int(current_pidx) == 2 else 2
+                        logger.warning(
+                            f"⚠️ Bybit Trade WS: retCode=10001 (position idx mismatch) | "
+                            f"tried positionIdx={current_pidx}, retrying with positionIdx={alt_pidx}"
+                        )
+                        order_retry = order.copy()
+                        order_retry["positionIdx"] = int(alt_pidx)
+                        # Обновляем timestamp для retry
+                        server_ts_ms_retry = int(time.time() * 1000) + int(offset_ms)
+                        ack = await ws_trade.create_order(order=order_retry, server_ts_ms=server_ts_ms_retry, timeout_sec=1.0)
+                    else:
+                        raise
+                else:
+                    raise
+            
             result = ack.get("result", {})
             if isinstance(result, dict):
                 order_id = result.get("orderId")
@@ -1826,22 +1895,14 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
                     order_id = data.get("orderId")
             logger.info(f"✅ OPEN ACK (trade ws): order_id={order_id}")
         except Exception as e:
-            logger.error(f"❌ OPEN FAILED (trade ws): {type(e).__name__}: {e}")
-            try:
-                if ws_trade:
-                    await ws_trade.stop()
-            except Exception:
-                pass
-            try:
-                if ws_private:
-                    await ws_private.stop()
-            except Exception:
-                pass
-            try:
-                await ws_public.stop()
-            except Exception:
-                pass
-            return 0
+            # КРИТИЧНО: не выходим сразу! Ордер может быть создан/исполнен несмотря на ошибку (timeout, сетевой лаг и т.д.)
+            # Продолжаем до проверки позиции, чтобы закрыть, если что-то открылось
+            logger.error(
+                f"❌ OPEN FAILED (trade ws): {type(e).__name__}: {e} | "
+                f"⚠️ Продолжаем до проверки позиции (ордер мог быть создан/исполнен)"
+            )
+            # НЕ останавливаем WS и НЕ делаем return - нужны для проверки позиции
+            order_id = None
     else:
         # fallback: REST (если вдруг выключишь FUN_USE_TRADE_WS)
         try:
@@ -1859,22 +1920,14 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
             )
             logger.info(f"✅ OPEN (rest): order_id={order_id}")
         except Exception as e:
-            logger.error(f"❌ OPEN FAILED (rest): {type(e).__name__}: {e}")
-            try:
-                if ws_trade:
-                    await ws_trade.stop()
-            except Exception:
-                pass
-            try:
-                if ws_private:
-                    await ws_private.stop()
-            except Exception:
-                pass
-            try:
-                await ws_public.stop()
-            except Exception:
-                pass
-            return 0
+            # КРИТИЧНО: не выходим сразу! Ордер может быть создан/исполнен несмотря на ошибку (timeout, сетевой лаг и т.д.)
+            # Продолжаем до проверки позиции, чтобы закрыть, если что-то открылось
+            logger.error(
+                f"❌ OPEN FAILED (rest): {type(e).__name__}: {e} | "
+                f"⚠️ Продолжаем до проверки позиции (ордер мог быть создан/исполнен)"
+            )
+            # НЕ останавливаем WS и НЕ делаем return - нужны для проверки позиции
+            order_id = None
     
     # Ждём финальный статус через Private WS (без REST polling)
     if order_id and ws_private and ws_private.ready:
@@ -1900,6 +1953,14 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
     # Wait until close start time
     await _sleep_until_server_ms(close_server_ms, offset_ms)
 
+    # КРИТИЧНО: проверяем позицию даже если открытие "упало" (timeout/сетевой лаг)
+    # Ордер мог быть создан/исполнен, но мы не получили ACK
+    if order_id is None:
+        logger.warning(
+            "⚠️ OPEN: order_id неизвестен (ошибка при открытии) | "
+            "Проверяем позицию на случай, если ордер всё же был создан/исполнен"
+        )
+
     # Compute opened delta (check position at close-start, not immediately after open)
     short_after_final = await _bybit_get_short_qty_snapshot(
         exchange_obj=exchange_obj,
@@ -1915,7 +1976,10 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
     logger.info(f"📍 Позиция после входа: short_after={_fmt(short_after_final)} | opened_delta={_fmt(opened_qty)} {p.coin}")
 
     if opened_qty <= 0:
-        logger.warning("⚠️ Новый Short не открылся (opened_delta=0). Ничего не закрываем. Завершаем.")
+        if order_id is None:
+            logger.info("✅ OPEN: opened_delta=0 и order_id=None - ордер точно не исполнился. Завершаем.")
+        else:
+            logger.warning("⚠️ Новый Short не открылся (opened_delta=0). Ничего не закрываем. Завершаем.")
         try:
             if ws_trade:
                 await ws_trade.stop()
@@ -1931,6 +1995,13 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
         except Exception:
             pass
         return 0
+
+    # КРИТИЧНО: даже если открытие "упало", но позиция открылась - закрываем её
+    if order_id is None:
+        logger.warning(
+            f"⚠️ OPEN: order_id=None, но opened_delta={_fmt(opened_qty)} > 0 | "
+            f"Ордер был создан/исполнен несмотря на ошибку. Закрываем позицию."
+        )
 
     ok_close, avg_exit_short = await po._bybit_close_leg_partial_ioc(
         exchange_obj=exchange_obj,
@@ -1996,6 +2067,13 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
         logger.warning(f"⚠️ Ошибка при остановке Private WS: {e}")
     
     try:
+        # Отменяем task явно для гарантии корректного завершения (защита от "висячих" тасков)
+        if 'ws_public_task' in locals() and ws_public_task and not ws_public_task.done():
+            ws_public_task.cancel()
+            try:
+                await ws_public_task
+            except asyncio.CancelledError:
+                pass
         await ws_public.stop()
         logger.debug("🔌 Public WebSocket остановлен")
     except Exception as e:
