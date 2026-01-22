@@ -649,6 +649,46 @@ async def _bybit_get_short_position_qty(
     return float(short_qty)
 
 
+async def _bybit_detect_position_idx(
+    *,
+    exchange_obj: Any,
+    api_key: str,
+    api_secret: str,
+    symbol: str,
+) -> int:
+    """
+    Return preferred positionIdx for opening SHORT:
+      - 2 for hedge-mode short leg
+      - 0 for one-way mode
+    Uses REST once (NOT in critical window).
+    """
+    data = await _bybit_private_get(
+        exchange_obj=exchange_obj,
+        api_key=api_key,
+        api_secret=api_secret,
+        path="/v5/position/list",
+        params={"category": "linear", "symbol": str(symbol)},
+    )
+    if not (isinstance(data, dict) and data.get("retCode") == 0):
+        return 0
+    items = ((data.get("result") or {}).get("list") or [])
+    if not isinstance(items, list):
+        return 0
+    # If we see positionIdx 1/2 in response, account is likely hedge-mode.
+    seen = set()
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        try:
+            pi = int(it.get("positionIdx", 0))
+        except Exception:
+            pi = 0
+        seen.add(pi)
+    if 2 in seen or 1 in seen:
+        return 2
+    return 0
+
+
 async def _bybit_get_short_qty_snapshot(
     *,
     exchange_obj: Any,
@@ -1487,6 +1527,24 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
         logger.info("Отклонено пользователем. Завершаем.")
         return 0
 
+    # --- Log funding context for BOEVOY run ---
+    try:
+        fr = float(p.funding_pct or 0.0)
+    except Exception:
+        fr = 0.0
+    try:
+        notional_pre = float(p.coin_qty) * float(last_px_pre)
+    except Exception:
+        notional_pre = 0.0
+    est_funding_usdt = notional_pre * fr  # sign included
+    logger.info(
+        f"💸 FUNDING CONTEXT: rate={_fmt(fr*100, 6)}% | qty={_fmt(p.coin_qty)} | "
+        f"px_pre={_fmt(last_px_pre)} | notional~{_fmt(notional_pre, 3)} USDT | "
+        f"est_funding~{_fmt(est_funding_usdt, 4)} USDT (sign included)"
+    )
+    if p.next_funding_time_ms:
+        logger.info(f"🕒 NEXT FUNDING (server ms): {int(p.next_funding_time_ms)}")
+
     if p.next_funding_time_ms is None:
         logger.error("❌ Не удалось получить next_funding_time_ms")
         return 2
@@ -1562,6 +1620,15 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
         if ws_private:
             await ws_private.stop()
         ws_private = None
+
+    # --- Determine positionIdx once (avoid 10001 at payout) ---
+    position_idx = await _bybit_detect_position_idx(
+        exchange_obj=exchange_obj,
+        api_key=api_key,
+        api_secret=api_secret,
+        symbol=symbol,
+    )
+    logger.info(f"🧭 Bybit position mode: using positionIdx={position_idx} (0=one-way, 2=hedge-short)")
 
     # Server-time schedule
     prep_server_ms = int(payout_server_ms - int(max(0.0, float(FAST_PREP_LEAD_SEC)) * 1000))
@@ -1647,13 +1714,83 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
         f"📌 WS FIX: close_price={_fmt(close_price)} best_bid={_fmt(best_bid_fix)} best_ask={_fmt(best_ask_fix)} "
         f"staleness_ms={snap_fix.get('staleness_ms')}"
     )
+    logger.info(f"💸 FUNDING (fixed pre-payout): rate={_fmt((p.funding_pct or 0.0)*100, 6)}%")
 
     # Plan times
     open_server_ms = int(payout_server_ms + max(0, int(OPEN_AFTER_MS)))
     close_server_ms = int(payout_server_ms + int(max(0.0, float(FAST_CLOSE_DELAY_SEC)) * 1000))
     close_local_ms = int(close_server_ms - offset_ms)
 
-    # Snapshot existing short BEFORE open (important!)
+    # --- PREBUILD OPEN ORDER BEFORE PAYOUT ---
+    # Важно: мы НЕ используем best_bid_now после payout как условие входа.
+    # Мы пытаемся попасть в matching как можно раньше.
+    
+    tick = float(tick_raw) if tick_raw else 0.0
+    if tick <= 0:
+        logger.error("❌ tickSize is invalid; cannot compute IOC price safely")
+        try:
+            if ws_trade:
+                await ws_trade.stop()
+        except Exception:
+            pass
+        try:
+            if ws_private:
+                await ws_private.stop()
+        except Exception:
+            pass
+        try:
+            await ws_public.stop()
+        except Exception:
+            pass
+        return 0
+    
+    qty_str = po._format_by_step(p.coin_qty, qty_step_raw)
+    
+    # Лимит "около close_price":
+    # Sell Limit исполняется, если bid >= limit.
+    # Чтобы попытаться заполниться максимально близко к close_price (и не "догонять"),
+    # ставим limit чуть ниже close_price на OPEN_SAFETY_TICKS.
+    limit_px = float(close_price) - float(OPEN_SAFETY_TICKS) * tick
+    limit_px = po._floor_to_step(limit_px, tick)
+    
+    if limit_px <= 0:
+        logger.error("❌ computed limit_px <= 0; abort")
+        try:
+            if ws_trade:
+                await ws_trade.stop()
+        except Exception:
+            pass
+        try:
+            if ws_private:
+                await ws_private.stop()
+        except Exception:
+            pass
+        try:
+            await ws_public.stop()
+        except Exception:
+            pass
+        return 0
+    
+    px_str = po._format_by_step(limit_px, tick_raw)
+    
+    # Сборка order заранее (до payout) — на границе менять только timestamp в header внутри create_order()
+    order = {
+        "category": "linear",
+        "symbol": symbol,
+        "side": "Sell",
+        "orderType": "Limit",
+        "qty": qty_str,
+        "price": px_str,
+        "timeInForce": "IOC",
+        "positionIdx": int(position_idx),
+    }
+    
+    logger.info(
+        f"🧷 OPEN PREPARED: close_price={_fmt(close_price)} "
+        f"limit_px={px_str} qty={qty_str} (safety_ticks={OPEN_SAFETY_TICKS})"
+    )
+    
+    # Snapshot existing short BEFORE open (если у тебя уже переведено на WS — ок)
     short_before = await _bybit_get_short_qty_snapshot(
         exchange_obj=exchange_obj,
         api_key=api_key,
@@ -1661,13 +1798,15 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
         coin=p.coin,
         ws_private=ws_private,
         symbol=symbol,
-        position_idx=2,
+        position_idx=int(position_idx),
     )
     logger.info(f"📍 Позиция до входа: short_before={_fmt(short_before)} {p.coin}")
-
-    # --- OPEN: send as early as possible after payout (server-time) ---
+    
+    # --- OPEN AT PAYOUT (minimal work) ---
     await _sleep_until_server_ms(open_server_ms, offset_ms)
     
+    # Минимальный sanity-check: WS не должен быть "мертвым".
+    # Это НЕ проверка рынка, а только проверка "канал живой".
     snap_open = ws_public.snapshot()
     st_ms = float(snap_open.get("staleness_ms", 1e9))
     if st_ms > float(OPEN_MAX_STALENESS_MS):
@@ -1688,152 +1827,29 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
             pass
         return 0
     
-    best_bid_now = snap_open.get("best_bid")
-    if not best_bid_now or best_bid_now <= 0:
-        logger.warning("⛔ ABORT OPEN: best_bid_now not available from WS")
-        try:
-            if ws_trade:
-                await ws_trade.stop()
-        except Exception:
-            pass
-        try:
-            if ws_private:
-                await ws_private.stop()
-        except Exception:
-            pass
-        try:
-            await ws_public.stop()
-        except Exception:
-            pass
-        return 0
-    
-    # -----------------------------
-    # Rule of admission (НЕ узкий)
-    # -----------------------------
-    # Идея:
-    # - "soft" допуск: если рынок провалился сильнее, мы НЕ abort,
-    #   а просто помечаем режим "drop" (всё равно пробуем открыть, но осознанно).
-    # - "hard" допуск: защита от экстремума/ошибок/аномальной ситуации — тогда abort.
-    
-    # считаем падение best_bid_now относительно close_price (зафиксированного около payout)
-    drop_bps = 0.0
-    if float(close_price) > 0:
-        drop_bps = (float(close_price) - float(best_bid_now)) / float(close_price) * 10_000.0
-    
-    if drop_bps >= OPEN_HARD_DOWN_BPS:
-        logger.warning(
-            f"⛔ ABORT OPEN (HARD): dump too large | close_price={_fmt(close_price)} "
-            f"best_bid_now={_fmt(best_bid_now)} drop_bps={drop_bps:.1f} >= hard={OPEN_HARD_DOWN_BPS:.1f}"
-        )
-        try:
-            if ws_trade:
-                await ws_trade.stop()
-        except Exception:
-            pass
-        try:
-            if ws_private:
-                await ws_private.stop()
-        except Exception:
-            pass
-        try:
-            await ws_public.stop()
-        except Exception:
-            pass
-        return 0
-    
-    drop_mode = False
-    if drop_bps >= OPEN_SOFT_DOWN_BPS:
-        drop_mode = True
-        logger.warning(
-            f"⚠️ OPEN DROP MODE: market dropped fast | close_price={_fmt(close_price)} "
-            f"best_bid_now={_fmt(best_bid_now)} drop_bps={drop_bps:.1f} >= soft={OPEN_SOFT_DOWN_BPS:.1f}. "
-            f"Continue opening (no abort)."
-        )
-    
-    # Build LIMIT price for Sell FOK:
-    # Цена открытия жёстко около close_price, чтобы НЕ разрешать продавать значительно ниже.
-    tick = float(tick_raw) if tick_raw else 0.0
-    if tick <= 0:
-        logger.error("❌ tickSize is invalid; cannot compute FOK price safely")
-        try:
-            if ws_trade:
-                await ws_trade.stop()
-        except Exception:
-            pass
-        try:
-            if ws_private:
-                await ws_private.stop()
-        except Exception:
-            pass
-        try:
-            await ws_public.stop()
-        except Exception:
-            pass
-        return 0
-    
-    base = min(float(close_price), float(best_bid_now))
-    # если рынок уже в drop_mode — увеличиваем "запас" по тикам, чтобы FOK точно был marketable
-    safety_ticks = int(OPEN_SAFETY_TICKS)
-    if drop_mode:
-        safety_ticks = max(safety_ticks, 4)  # можно 4–8, но начнем с 4
-    limit_px = base - float(safety_ticks) * tick
-    limit_px = po._floor_to_step(limit_px, tick)
-    
-    if limit_px <= 0:
-        logger.warning("⛔ ABORT OPEN: computed limit_px <= 0")
-        try:
-            if ws_trade:
-                await ws_trade.stop()
-        except Exception:
-            pass
-        try:
-            if ws_private:
-                await ws_private.stop()
-        except Exception:
-            pass
-        try:
-            await ws_public.stop()
-        except Exception:
-            pass
-        return 0
-    
-    px_str = po._format_by_step(limit_px, tick_raw)
-    qty_str = po._format_by_step(p.coin_qty, qty_step_raw)
-    
-    # Send order via TRADE WS (fast path)
-    server_ts_ms = int(time.time() * 1000) + int(offset_ms)
-    order = {
-        "category": "linear",
-        "symbol": symbol,
-        "side": "Sell",
-        "orderType": "Limit",
-        "qty": qty_str,
-        "price": px_str,
-        "timeInForce": "FOK",
-        "positionIdx": 2,
-    }
-    
     logger.info(
-        f"🚀 OPEN(Sell FOK): close_price={_fmt(close_price)} best_bid_now={_fmt(best_bid_now)} "
-        f"limit_px={px_str} qty={qty_str} staleness_ms={st_ms:.0f}"
+        f"🚀 OPEN SEND (Sell IOC): close_price={_fmt(close_price)} "
+        f"limit_px={px_str} qty={qty_str} staleness_ms={st_ms:.0f} "
+        f"| funding={_fmt((p.funding_pct or 0.0)*100, 6)}%"
     )
     
+    # Отправляем ордер через Trade WS (fast path)
     order_id = None
     if USE_TRADE_WS == 1 and ws_trade is not None:
         try:
+            # Важно: timestamp считаем прямо в момент отправки
+            server_ts_ms = int(time.time() * 1000) + int(offset_ms)
             ack = await ws_trade.create_order(order=order, server_ts_ms=server_ts_ms, timeout_sec=1.0)
-            # Извлекаем order_id из ответа
             result = ack.get("result", {})
             if isinstance(result, dict):
                 order_id = result.get("orderId")
             elif isinstance(result, str):
                 order_id = result
             if not order_id:
-                # Пробуем из data
                 data = ack.get("data", {})
                 if isinstance(data, dict):
                     order_id = data.get("orderId")
-            logger.info(f"✅ OPEN ACK (trade ws): order_id={order_id} ack={ack.get('data')}")
+            logger.info(f"✅ OPEN ACK (trade ws): order_id={order_id}")
         except Exception as e:
             logger.error(f"❌ OPEN FAILED (trade ws): {type(e).__name__}: {e}")
             try:
@@ -1862,9 +1878,9 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
                 side="Sell",
                 qty_str=qty_str,
                 price_str=px_str,
-                tif="FOK",
+                tif="IOC",
                 reduce_only=None,
-                position_idx=2,
+                position_idx=int(position_idx),
             )
             logger.info(f"✅ OPEN (rest): order_id={order_id}")
         except Exception as e:
@@ -1885,7 +1901,7 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
                 pass
             return 0
     
-    # Ждем финального статуса через Private WS (вместо REST polling)
+    # Ждём финальный статус через Private WS (без REST polling)
     if order_id and ws_private and ws_private.ready:
         try:
             final = await ws_private.wait_final(str(order_id), timeout=1.5)
@@ -1896,6 +1912,7 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
                     f"filled_qty={_fmt(final.filled_qty)} avg_price={_fmt(final.avg_price)}"
                 )
             else:
+                # Это нормальный исход для твоей стратегии: не успели до дампа — не заполнились.
                 logger.warning(
                     f"⚠️ OPEN NOT FILLED (private ws): order_id={order_id} "
                     f"status={final.status} filled_qty={_fmt(final.filled_qty)} expected={_fmt(qty_expected)}"
@@ -1916,7 +1933,7 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
         coin=p.coin,
         ws_private=ws_private,
         symbol=symbol,
-        position_idx=2,
+        position_idx=int(position_idx),
     )
     opened_qty = max(0.0, float(short_after_final) - float(short_before))
 
@@ -1945,7 +1962,7 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
         coin=p.coin,
         position_direction="short",
         coin_amount=float(opened_qty),
-        position_idx=2,
+        position_idx=int(position_idx),
         ws_public=ws_public,
         ws_trade=ws_trade,
         ws_private=ws_private,
