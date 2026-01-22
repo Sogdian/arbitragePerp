@@ -108,6 +108,22 @@ OPEN_IOC_TRIES = int(os.getenv("FUN_OPEN_IOC_TRIES", "3"))
 OPEN_IOC_EXTRA_BPS = float(os.getenv("FUN_OPEN_IOC_EXTRA_BPS", "50"))
 OPEN_IOC_GAP_MS = int(os.getenv("FUN_OPEN_IOC_GAP_MS", "0"))
 
+# ---- Phase-1 (quality entry near best_bid_fix) ----
+OPEN_PHASE1_TRIES = int(os.getenv("FUN_OPEN_PHASE1_TRIES", "2"))
+OPEN_PHASE1_MIN_TICKS = int(os.getenv("FUN_OPEN_PHASE1_MIN_TICKS", "1"))
+OPEN_PHASE1_SAFETY_BPS = float(os.getenv("FUN_OPEN_PHASE1_SAFETY_BPS", "0"))
+OPEN_PHASE1_WAIT_MS = int(os.getenv("FUN_OPEN_PHASE1_WAIT_MS", "30"))
+
+# ---- Phase-2 (guarantee fill if price dumps) ----
+OPEN_PHASE2_ENABLE = int(os.getenv("FUN_OPEN_PHASE2_ENABLE", "1"))
+OPEN_PHASE2_TRIES = int(os.getenv("FUN_OPEN_PHASE2_TRIES", str(OPEN_IOC_TRIES)))
+OPEN_PHASE2_EXTRA_BPS = float(os.getenv("FUN_OPEN_PHASE2_EXTRA_BPS", str(OPEN_IOC_EXTRA_BPS)))
+OPEN_PHASE2_MIN_TICKS = int(os.getenv("FUN_OPEN_PHASE2_MIN_TICKS", str(OPEN_SAFETY_MIN_TICKS)))
+OPEN_PHASE2_SAFETY_BPS = float(os.getenv("FUN_OPEN_PHASE2_SAFETY_BPS", str(OPEN_SAFETY_BPS)))
+
+# guardrail
+OPEN_HARD_CAP_ENABLE = int(os.getenv("FUN_OPEN_HARD_CAP_ENABLE", "1"))
+
 # late-start tolerance vs server-time
 LATE_TOL_MS = int(os.getenv("FUN_LATE_TOL_MS", "400"))                          # 300-500ms recommended
 
@@ -1421,84 +1437,83 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
     close_local_ms = int(close_server_ms - offset_ms)
 
     # -----------------------------
-    # OPEN PRICE PLAN (NO EXTRA CALLS AT OPEN TIME)
+    # OPEN PRICE PLAN (2-phase: quality then guarantee)
     # -----------------------------
-    # Мы хотим, чтобы Sell IOC был marketable даже при резком падении цены между fix (HH:MM:59)
-    # и отправкой (HH:MM:00.xxx). Поэтому:
-    # 1) базовый лимит = min(best_bid_fix - safety, fair_price)
-    # 2) в критический момент отправляем ЛЕСЕНКУ IOC ордеров всё ниже и ниже (без запросов стакана/статуса)
-    if tick and float(tick) > 0:
-        _tick = float(tick)
-    else:
-        _tick = 0.0
+    _tick = float(tick) if (tick and float(tick) > 0) else 0.0
+    qty_step = float(qty_step_raw) if qty_step_raw else 0.0
 
     def _floor_to_tick(px: float) -> float:
         if _tick <= 0:
             return float(px)
         return po._floor_to_step(float(px), float(_tick))
 
-    base_open_raw: float
-    if best_bid_fix and float(best_bid_fix) > 0:
-        min_ticks = max(0, int(OPEN_SAFETY_MIN_TICKS))
-        safety_bps = max(0.0, float(OPEN_SAFETY_BPS))
+    def _floor_to_qty_step(q: float) -> float:
+        if qty_step <= 0:
+            return float(q)
+        return po._floor_to_step(float(q), float(qty_step))
+
+    def _deduct_from_best_bid(best_bid: float, *, min_ticks: int, safety_bps: float) -> float:
+        min_ticks = max(0, int(min_ticks))
+        safety_bps = max(0.0, float(safety_bps))
         ded_ticks = float(min_ticks) * (_tick if _tick > 0 else 0.0)
-        ded_bps = float(best_bid_fix) * (safety_bps / 10_000.0)
-        ded = max(ded_ticks, ded_bps)
-        base_open_raw = float(best_bid_fix) - float(ded)
-        # Ключевое: дополнительно прижимаем вниз до fair_price,
-        # чтобы пережить резкий слив сразу после payout.
-        if fair_price and float(fair_price) > 0:
-            base_open_raw = min(float(base_open_raw), float(fair_price))
-    else:
-        # если bid_fix нет — открываемся от fair_price (она уже "низкая")
-        base_open_raw = float(fair_price) if (fair_price and float(fair_price) > 0) else float(close_price)
+        ded_bps = float(best_bid) * (safety_bps / 10_000.0)
+        return max(ded_ticks, ded_bps)
 
-    base_open = _floor_to_tick(base_open_raw)
-    if base_open <= 0:
-        logger.error("❌ base_open для Sell IOC получился <= 0")
+    def _build_down_ladder(base_px: float, *, tries: int, extra_bps: float) -> List[float]:
+        tries = max(1, min(int(tries), 6))
+        extra_bps = max(0.0, float(extra_bps))
+        out: List[float] = []
+        for i in range(tries):
+            factor = 1.0 - (extra_bps / 10_000.0) * float(i)
+            px_i = _floor_to_tick(float(base_px) * float(factor))
+            if px_i > 0:
+                out.append(px_i)
+        # uniq after rounding
+        uniq: List[float] = []
+        last_v: Optional[float] = None
+        for v in out:
+            if last_v is None or abs(v - last_v) > 1e-12:
+                uniq.append(v)
+            last_v = v
+        return uniq
+
+    if not best_bid_fix or float(best_bid_fix) <= 0:
+        logger.error("❌ best_bid_fix недоступен, не можем сделать quality-вход близко к close_price")
         return 2
 
-    # Собираем лесенку цен (вниз). ВАЖНО: не делаем никаких запросов на биржу ради расчёта.
-    tries = max(1, min(int(OPEN_IOC_TRIES), 6))  # hard cap
-    extra_bps = max(0.0, float(OPEN_IOC_EXTRA_BPS))
-
-    open_prices: List[float] = []
-    for i in range(tries):
-        # i=0: base_open
-        # i=1: base_open*(1 - extra_bps)
-        # i=2: base_open*(1 - 2*extra_bps)
-        factor = 1.0 - (extra_bps / 10_000.0) * float(i)
-        px_i = float(base_open) * float(factor)
-        px_i = _floor_to_tick(px_i)
+    # Phase-1: quality prices near best_bid_fix (вход выше)
+    ded1 = _deduct_from_best_bid(float(best_bid_fix), min_ticks=OPEN_PHASE1_MIN_TICKS, safety_bps=OPEN_PHASE1_SAFETY_BPS)
+    phase1_base = _floor_to_tick(float(best_bid_fix) - ded1)
+    # ВАЖНО: если extra_bps=0, то bps-лесенка даст одинаковые цены. Для phase-1 делаем шаги по 1 тика.
+    phase1_prices: List[float] = []
+    tries1 = max(1, min(int(OPEN_PHASE1_TRIES), 6))
+    for i in range(tries1):
+        px_i = _floor_to_tick(float(phase1_base) - float(i) * (_tick if _tick > 0 else 0.0))
         if px_i > 0:
-            open_prices.append(px_i)
+            phase1_prices.append(px_i)
+    # uniq after rounding
+    _p1u: List[float] = []
+    _lv: Optional[float] = None
+    for v in phase1_prices:
+        if _lv is None or abs(v - _lv) > 1e-12:
+            _p1u.append(v)
+        _lv = v
+    phase1_prices = _p1u
 
-    # Уберём дубликаты после floor-to-tick (чтобы не слать одинаковые цены)
-    uniq_prices: List[float] = []
-    last_v: Optional[float] = None
-    for v in open_prices:
-        if last_v is None or abs(v - last_v) > 1e-12:
-            uniq_prices.append(v)
-        last_v = v
-
-    if not uniq_prices:
-        logger.error("❌ Не удалось собрать open_prices для лесенки Sell IOC")
-        return 2
-
-    # Для логов (после окна) сохраняем только первую цену
-    px_open = float(uniq_prices[0])
-    px_open_str = po._format_by_step(px_open, tick_raw)
+    # Phase-2: guarantee ladder (агрессивнее вниз), стартуем от best_bid_fix - phase2_safety
+    ded2 = _deduct_from_best_bid(float(best_bid_fix), min_ticks=OPEN_PHASE2_MIN_TICKS, safety_bps=OPEN_PHASE2_SAFETY_BPS)
+    phase2_base = _floor_to_tick(float(best_bid_fix) - ded2)
+    phase2_prices = _build_down_ladder(phase2_base, tries=OPEN_PHASE2_TRIES, extra_bps=OPEN_PHASE2_EXTRA_BPS)
 
     open_local_str = datetime.fromtimestamp(open_local_ms / 1000.0).strftime("%H:%M:%S")
     close_local_str = datetime.fromtimestamp(close_local_ms / 1000.0).strftime("%H:%M:%S")
-    ladder_preview = ", ".join([po._format_by_step(float(x), tick_raw) for x in uniq_prices[: min(5, len(uniq_prices))]])
 
     post_logs.append(
-        f"🧠 План (БОЕВОЙ, server-time): открыть Short в {open_local_str} (Sell IOC ЛЕСЕНКА, ПОСЛЕ payout+{OPEN_AFTER_MS}ms) | qty={qty_str} | "
-        f"open_prices=[{ladder_preview}{'...' if len(uniq_prices) > 5 else ''}] "
-        f"(best_bid_fix={_fmt(best_bid_fix)}, fair={_fmt(fair_price)}, safety={OPEN_SAFETY_BPS}bps|min_ticks={OPEN_SAFETY_MIN_TICKS}, "
-        f"extra={OPEN_IOC_EXTRA_BPS}bps, tries={OPEN_IOC_TRIES}) | "
-        f"затем закрывать Short c {close_local_str} (Buy reduceOnly IOC, эскалация)"
+        f"🧠 План (БОЕВОЙ, 2-phase): открыть Short в {open_local_str} | qty={qty_str} | "
+        f"phase1_prices={[po._format_by_step(x, tick_raw) for x in phase1_prices]} | "
+        f"phase2_prices={[po._format_by_step(x, tick_raw) for x in phase2_prices[:min(5,len(phase2_prices))]]}{'...' if len(phase2_prices)>5 else ''} | "
+        f"(best_bid_fix={_fmt(best_bid_fix)} close_price={_fmt(close_price)} | phase1_ticks={OPEN_PHASE1_MIN_TICKS} phase2_extra={OPEN_PHASE2_EXTRA_BPS}bps) | "
+        f"затем закрывать Short c {close_local_str}"
     )
 
     # Wait until open time
@@ -1512,54 +1527,77 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
         old_disable_level = logging.root.manager.disable
         logging.disable(logging.CRITICAL)
 
-    # 10:00:00.000 — send multiple Sell IOC orders (ladder) with precomputed limits.
-    # NO orderbook/status calls here. Just fire-and-forget creates.
-    short_order_id: Optional[str] = None
     short_place_err: Optional[str] = None
 
-    gap_ms = max(0, int(OPEN_IOC_GAP_MS))
-
-    # IMPORTANT: positionIdx may fail depending on account mode (hedge vs one-way),
-    # so we try hedge first, then one-way — for EACH ladder step.
-    for px_try in uniq_prices:
-        px_try_str = po._format_by_step(float(px_try), tick_raw)
+    async def _place_sell_ioc(qty_to_sell: float, px: float) -> None:
+        nonlocal short_place_err
+        qty_to_sell = float(qty_to_sell)
+        if qty_to_sell <= 0:
+            return
+        qty_send = _floor_to_qty_step(qty_to_sell)
+        if qty_send <= 0:
+            return
+        qty_to_sell_str = po._format_by_step(qty_send, qty_step_raw)
+        px_str = po._format_by_step(float(px), tick_raw)
         try:
             try:
-                short_order_id = await _bybit_place_limit(
+                await _bybit_place_limit(
                     exchange_obj=exchange_obj,
                     api_key=api_key,
                     api_secret=api_secret,
                     coin=p.coin,
                     side="Sell",
-                    qty_str=qty_str,
-                    price_str=px_try_str,
+                    qty_str=qty_to_sell_str,
+                    price_str=px_str,
                     tif="IOC",
                     reduce_only=None,
                     position_idx=2,
                 )
             except Exception:
-                short_order_id = await _bybit_place_limit(
+                await _bybit_place_limit(
                     exchange_obj=exchange_obj,
                     api_key=api_key,
                     api_secret=api_secret,
                     coin=p.coin,
                     side="Sell",
-                    qty_str=qty_str,
-                    price_str=px_try_str,
+                    qty_str=qty_to_sell_str,
+                    price_str=px_str,
                     tif="IOC",
                     reduce_only=None,
                     position_idx=None,
                 )
-            # Не проверяем статус/filled здесь — это критическое окно.
         except Exception as e:
             short_place_err = str(e)
-            short_order_id = None
 
-        if gap_ms > 0:
-            # микропаузу делаем через time.sleep (не await), чтобы не уступать event loop лишний раз
-            time.sleep(gap_ms / 1000.0)
+    target_qty = float(p.coin_qty)
+    qty_pos_now: float = 0.0
 
-    # Wait until close start time (still no extra calls)
+    # Phase-1: quality attempts (на весь target)
+    for px_try in phase1_prices:
+        await _place_sell_ioc(target_qty, float(px_try))
+
+    # маленькая пауза, потом проверим сколько реально открылось
+    if OPEN_PHASE1_WAIT_MS > 0:
+        time.sleep(max(0, int(OPEN_PHASE1_WAIT_MS)) / 1000.0)
+
+    # Проверка позиции (1 вызов после phase-1; это ключ к "и исполнено")
+    qty_pos_now = await _bybit_get_short_position_qty(exchange_obj=exchange_obj, api_key=api_key, api_secret=api_secret, coin=p.coin)
+    qty_pos_now = float(qty_pos_now)
+
+    # Жёсткий кап: не добирать, если уже >= target
+    if int(OPEN_HARD_CAP_ENABLE) == 1 and qty_pos_now >= target_qty - 1e-12:
+        pass
+    else:
+        qty_remain = max(0.0, target_qty - qty_pos_now)
+        if int(OPEN_PHASE2_ENABLE) == 1 and qty_remain > 0:
+            # Phase-2: guarantee ladder on REMAINING qty only
+            for px_try in phase2_prices:
+                await _place_sell_ioc(qty_remain, float(px_try))
+            # финальный пересчёт позиции после phase-2
+            qty_pos_now = await _bybit_get_short_position_qty(exchange_obj=exchange_obj, api_key=api_key, api_secret=api_secret, coin=p.coin)
+            qty_pos_now = float(qty_pos_now)
+
+    # Wait until close start time
     await _sleep_until_epoch_ms(close_local_ms)
 
     # End critical window: re-enable logs
@@ -1573,10 +1611,8 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
     if short_place_err:
         logger.warning(f"⚠️ Short: ошибка создания ордера: {short_place_err}")
 
-    # IMPORTANT: no market fallback here — only ladder IOC creates.
-
-    # Query position qty and close it
-    qty_pos = await _bybit_get_short_position_qty(exchange_obj=exchange_obj, api_key=api_key, api_secret=api_secret, coin=p.coin)
+    # Use qty_pos_now as фактически открытый размер (после phase-1/phase-2)
+    qty_pos = float(qty_pos_now)
     if qty_pos <= 0:
         logger.warning("⚠️ Похоже, Short не открылся (позиция=0). Завершаем.")
         return 0
