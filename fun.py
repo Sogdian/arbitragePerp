@@ -90,7 +90,7 @@ BALANCE_FEE_SAFETY_BPS = float(os.getenv("FUN_BALANCE_FEE_SAFETY_BPS", "20"))  #
 
 # timing around payout
 FAST_PREP_LEAD_SEC = float(os.getenv("FUN_FAST_PREP_LEAD_SEC", "2.0"))          # prep at payout-2s
-FAST_CLOSE_DELAY_SEC = float(os.getenv("FUN_FAST_CLOSE_DELAY_SEC", "1.0"))      # start close at payout+1s
+FAST_CLOSE_DELAY_SEC = float(os.getenv("FUN_FAST_CLOSE_DELAY_SEC", "1.2"))      # start close at payout+1s
 FAST_CLOSE_MAX_ATTEMPTS = int(os.getenv("FUN_FAST_CLOSE_MAX_ATTEMPTS", "15"))
 
 # critical window: silence logs
@@ -109,15 +109,15 @@ OPEN_IOC_EXTRA_BPS = float(os.getenv("FUN_OPEN_IOC_EXTRA_BPS", "50"))
 OPEN_IOC_GAP_MS = int(os.getenv("FUN_OPEN_IOC_GAP_MS", "0"))
 
 # ---- Phase-1 (quality entry near best_bid_fix) ----
-OPEN_PHASE1_TRIES = int(os.getenv("FUN_OPEN_PHASE1_TRIES", "2"))
+OPEN_PHASE1_TRIES = int(os.getenv("FUN_OPEN_PHASE1_TRIES", "1"))
 OPEN_PHASE1_MIN_TICKS = int(os.getenv("FUN_OPEN_PHASE1_MIN_TICKS", "1"))
 OPEN_PHASE1_SAFETY_BPS = float(os.getenv("FUN_OPEN_PHASE1_SAFETY_BPS", "0"))
 OPEN_PHASE1_WAIT_MS = int(os.getenv("FUN_OPEN_PHASE1_WAIT_MS", "30"))
 
 # ---- Phase-2 (guarantee fill if price dumps) ----
 OPEN_PHASE2_ENABLE = int(os.getenv("FUN_OPEN_PHASE2_ENABLE", "1"))
-OPEN_PHASE2_TRIES = int(os.getenv("FUN_OPEN_PHASE2_TRIES", str(OPEN_IOC_TRIES)))
-OPEN_PHASE2_EXTRA_BPS = float(os.getenv("FUN_OPEN_PHASE2_EXTRA_BPS", str(OPEN_IOC_EXTRA_BPS)))
+OPEN_PHASE2_TRIES = int(os.getenv("FUN_OPEN_PHASE2_TRIES", "6"))
+OPEN_PHASE2_EXTRA_BPS = float(os.getenv("FUN_OPEN_PHASE2_EXTRA_BPS", "200"))
 OPEN_PHASE2_MIN_TICKS = int(os.getenv("FUN_OPEN_PHASE2_MIN_TICKS", str(OPEN_SAFETY_MIN_TICKS)))
 OPEN_PHASE2_SAFETY_BPS = float(os.getenv("FUN_OPEN_PHASE2_SAFETY_BPS", str(OPEN_SAFETY_BPS)))
 
@@ -1591,7 +1591,32 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
         qty_remain = max(0.0, target_qty - qty_pos_now)
         if int(OPEN_PHASE2_ENABLE) == 1 and qty_remain > 0:
             # Phase-2: guarantee ladder on REMAINING qty only
-            for px_try in phase2_prices:
+            # 1) Один быстрый refresh стакана (ТОЛЬКО если Phase-1 не дал fill)
+            best_bid_now: Optional[float] = None
+            try:
+                ob_now = await exchange_obj.get_orderbook(p.coin, limit=5)
+                if ob_now and ob_now.get("bids"):
+                    best_bid_now = float(ob_now["bids"][0][0])
+            except Exception:
+                best_bid_now = None
+
+            # 2) Если получили best_bid_now — строим phase2 от него (а не от best_bid_fix)
+            if best_bid_now and best_bid_now > 0:
+                ded2_now = _deduct_from_best_bid(
+                    float(best_bid_now),
+                    min_ticks=OPEN_PHASE2_MIN_TICKS,
+                    safety_bps=OPEN_PHASE2_SAFETY_BPS,
+                )
+                phase2_base_now = _floor_to_tick(float(best_bid_now) - float(ded2_now))
+                phase2_prices_now = _build_down_ladder(
+                    phase2_base_now,
+                    tries=OPEN_PHASE2_TRIES,
+                    extra_bps=OPEN_PHASE2_EXTRA_BPS,
+                )
+            else:
+                phase2_prices_now = phase2_prices  # fallback старый план
+
+            for px_try in phase2_prices_now:
                 await _place_sell_ioc(qty_remain, float(px_try))
             # финальный пересчёт позиции после phase-2
             qty_pos_now = await _bybit_get_short_position_qty(exchange_obj=exchange_obj, api_key=api_key, api_secret=api_secret, coin=p.coin)
