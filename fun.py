@@ -657,35 +657,10 @@ async def _bybit_detect_position_idx(
     symbol: str,
 ) -> int:
     """
-    Return preferred positionIdx for opening SHORT:
-      - 2 for hedge-mode short leg
-      - 0 for one-way mode
-    Uses REST once (NOT in critical window).
+    Return positionIdx for opening SHORT.
+    Default: 0 (one-way mode) - скальпинг работает в one-way режиме.
     """
-    data = await _bybit_private_get(
-        exchange_obj=exchange_obj,
-        api_key=api_key,
-        api_secret=api_secret,
-        path="/v5/position/list",
-        params={"category": "linear", "symbol": str(symbol)},
-    )
-    if not (isinstance(data, dict) and data.get("retCode") == 0):
-        return 0
-    items = ((data.get("result") or {}).get("list") or [])
-    if not isinstance(items, list):
-        return 0
-    # If we see positionIdx 1/2 in response, account is likely hedge-mode.
-    seen = set()
-    for it in items:
-        if not isinstance(it, dict):
-            continue
-        try:
-            pi = int(it.get("positionIdx", 0))
-        except Exception:
-            pi = 0
-        seen.add(pi)
-    if 2 in seen or 1 in seen:
-        return 2
+    # Всегда возвращаем 0 (one-way mode) для скальпинга фандинга
     return 0
 
 
