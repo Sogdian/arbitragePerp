@@ -284,42 +284,21 @@ def _extract_order_id_from_trade_ack(ack: dict) -> Optional[str]:
     return None
 
 
-def _extract_order_id_from_trade_ack(ack: dict) -> Optional[str]:
+def _is_bybit_position_idx_mode_mismatch(err: Exception) -> bool:
     """
-    Извлекает order_id из ответа Trade WS create_order.
-    
-    Bybit Trade WS ответы могут иметь разную структуру, поэтому проверяем несколько путей.
+    Проверяет, является ли ошибка ошибкой несоответствия positionIdx режиму аккаунта (retCode=10001).
     """
-    if not isinstance(ack, dict):
-        return None
-    
-    for path in (
-        ("result", "orderId"),
-        ("data", "orderId"),
-        ("data", "result", "orderId"),
-        ("result", "list", 0, "orderId"),
-        ("data", "list", 0, "orderId"),
-    ):
-        cur = ack
-        ok = True
-        for key in path:
-            try:
-                cur = cur[key] if isinstance(key, int) else cur.get(key)
-            except Exception:
-                ok = False
-                break
-            if cur is None:
-                ok = False
-                break
-        if ok:
-            try:
-                s = str(cur)
-                if s:
-                    return s
-            except Exception:
-                pass
-    
-    return None
+    s = str(err).lower()
+    return ("retcode=10001" in s) and ("position idx not match position mode" in s)
+
+
+def _toggle_bybit_short_position_idx(cur: int) -> int:
+    """
+    Переключает positionIdx для Short позиции:
+    - one-way short => 0
+    - hedge short => 2
+    """
+    return 0 if int(cur) != 0 else 2
 
 
 def _ticker_last_price(t: Optional[Dict[str, Any]]) -> Optional[float]:
@@ -1759,8 +1738,13 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
     # Sell Limit исполняется, если bid >= limit.
     # Базис: min(close_price, best_bid_fix) - защита от случая, когда last_trade пришёл "по аску"
     # и оказался выше bid. Это улучшает качество входа и снижает риск "не заполнился".
-    base = min(float(close_price), float(best_bid_fix))
-    limit_px = base - float(OPEN_SAFETY_TICKS) * tick
+    ref_px = float(close_price)
+    if best_bid_fix is not None:
+        ref_px = min(ref_px, float(best_bid_fix))
+    
+    # offset_pct можно учитывать как "толеранс" (если хочешь); если нет — оставь 0.
+    limit_px = ref_px * (1.0 + float(p.offset_pct))
+    limit_px = limit_px - float(OPEN_SAFETY_TICKS) * tick
     limit_px = po._floor_to_step(limit_px, tick)
     
     if limit_px <= 0:
@@ -1797,7 +1781,7 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
     
     logger.info(
         f"🧷 OPEN PREPARED: close_price={_fmt(close_price)} best_bid_fix={_fmt(best_bid_fix)} "
-        f"base={_fmt(base)} limit_px={px_str} qty={qty_str} (safety_ticks={OPEN_SAFETY_TICKS})"
+        f"ref_px={_fmt(ref_px)} limit_px={px_str} qty={qty_str} (safety_ticks={OPEN_SAFETY_TICKS})"
     )
     
     # Snapshot existing short BEFORE open (если у тебя уже переведено на WS — ок)
@@ -1845,64 +1829,35 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
     
     # Отправляем ордер через Trade WS (fast path) с retry на retCode=10001
     order_id = None
+    open_submit_error = None
+    
     if USE_TRADE_WS == 1 and ws_trade is not None:
         try:
-            # Важно: timestamp считаем прямо в момент отправки
             server_ts_ms = int(time.time() * 1000) + int(offset_ms)
-            ack = None
-            try:
-                ack = await ws_trade.create_order(order=order, server_ts_ms=server_ts_ms, timeout_sec=1.0)
-            except RuntimeError as e:
-                # Извлекаем retCode из сообщения об ошибке для более надёжной обработки
-                err_str = str(e)
-                ret_code = None
-                # Пытаемся извлечь retCode из сообщения: "order.create retCode=10001 ..."
-                match = re.search(r'retCode[=:](\d+)', err_str)
-                if match:
-                    try:
-                        ret_code = int(match.group(1))
-                    except Exception:
-                        pass
-                
-                # Проверяем, не retCode=10001 ли это (position idx mismatch)
-                if ret_code == 10001 or "retCode=10001" in err_str or "position idx not match" in err_str.lower():
-                    # Runtime fallback: пробуем с альтернативным positionIdx
-                    current_pidx = order.get("positionIdx")
-                    if current_pidx is not None:
-                        alt_pidx = 0 if int(current_pidx) == 2 else 2
-                        logger.warning(
-                            f"⚠️ Bybit Trade WS: retCode=10001 (position idx mismatch) | "
-                            f"tried positionIdx={current_pidx}, retrying with positionIdx={alt_pidx}"
-                        )
-                        order_retry = order.copy()
-                        order_retry["positionIdx"] = int(alt_pidx)
-                        # Обновляем timestamp для retry
-                        server_ts_ms_retry = int(time.time() * 1000) + int(offset_ms)
-                        ack = await ws_trade.create_order(order=order_retry, server_ts_ms=server_ts_ms_retry, timeout_sec=1.0)
-                    else:
-                        raise
-                else:
-                    raise
-            
-            result = ack.get("result", {})
-            if isinstance(result, dict):
-                order_id = result.get("orderId")
-            elif isinstance(result, str):
-                order_id = result
-            if not order_id:
-                data = ack.get("data", {})
-                if isinstance(data, dict):
-                    order_id = data.get("orderId")
+            ack = await ws_trade.create_order(order=order, server_ts_ms=server_ts_ms, timeout_sec=1.0)
+            order_id = _extract_order_id_from_trade_ack(ack)
             logger.info(f"✅ OPEN ACK (trade ws): order_id={order_id}")
         except Exception as e:
-            # КРИТИЧНО: не выходим сразу! Ордер может быть создан/исполнен несмотря на ошибку (timeout, сетевой лаг и т.д.)
-            # Продолжаем до проверки позиции, чтобы закрыть, если что-то открылось
-            logger.error(
-                f"❌ OPEN FAILED (trade ws): {type(e).__name__}: {e} | "
-                f"⚠️ Продолжаем до проверки позиции (ордер мог быть создан/исполнен)"
-            )
-            # НЕ останавливаем WS и НЕ делаем return - нужны для проверки позиции
-            order_id = None
+            open_submit_error = e
+            logger.error(f"❌ OPEN FAILED (trade ws): {type(e).__name__}: {e}")
+            
+            # Retry once on positionIdx mismatch
+            if _is_bybit_position_idx_mode_mismatch(e) and isinstance(order, dict) and "positionIdx" in order:
+                prev = int(order.get("positionIdx", 0))
+                alt = _toggle_bybit_short_position_idx(prev)
+                logger.warning(f"🔁 OPEN retry due to position mode mismatch: positionIdx {prev} -> {alt}")
+                order["positionIdx"] = alt
+                try:
+                    server_ts_ms = int(time.time() * 1000) + int(offset_ms)
+                    ack = await ws_trade.create_order(order=order, server_ts_ms=server_ts_ms, timeout_sec=1.0)
+                    order_id = _extract_order_id_from_trade_ack(ack)
+                    logger.info(f"✅ OPEN ACK (retry): order_id={order_id}")
+                    open_submit_error = None
+                    position_idx = alt  # важно: дальше все снапшоты/закрытие должны использовать этот idx
+                except Exception as e2:
+                    logger.error(f"❌ OPEN RETRY FAILED: {type(e2).__name__}: {e2}")
+            
+            # НИКАКОГО return: продолжаем, чтобы на close-window проверить opened_delta и закрыть если надо
     else:
         # fallback: REST (если вдруг выключишь FUN_USE_TRADE_WS)
         try:
