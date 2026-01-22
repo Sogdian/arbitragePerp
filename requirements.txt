@@ -2,6 +2,7 @@ httpx
 python-dotenv
 beautifulsoup4>=4.12.0
 Pillow>=10.0.0
+websockets>=12.0
 
 
 

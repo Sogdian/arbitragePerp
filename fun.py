@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from bot import PerpArbitrageBot
 import position_opener as po
+from exchanges.bybit_ws import BybitPublicWS
 
 
 # ----------------------------
@@ -1255,16 +1256,34 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
 
     payout_server_ms = int(p.next_funding_time_ms)
 
+    # Запуск WebSocket для получения данных в реальном времени
+    symbol = exchange_obj._normalize_symbol(p.coin)
+    ws_client = BybitPublicWS(symbol=symbol)
+    ws_task = asyncio.create_task(ws_client.run())
+    
+    try:
+        # Ждем готовности WebSocket данных
+        logger.info(f"🔌 Запуск WebSocket для {symbol}, ожидание готовности...")
+        ready = await ws_client.wait_ready(timeout=15.0)
+        if not ready:
+            logger.warning("⚠️ WebSocket не готов в течение 15 секунд, продолжаем (best-effort)")
+        else:
+            logger.info("✅ WebSocket готов, данные поступают")
+    except Exception as e:
+        logger.warning(f"⚠️ Ошибка при ожидании готовности WebSocket: {e}, продолжаем (best-effort)")
+
     # Sync local with server clock (critical for scheduling)
     offset_ms = await _bybit_estimate_time_offset_ms(exchange_obj=exchange_obj, samples=5)
     if offset_ms is None:
         logger.error("❌ Не удалось получить Bybit server time (market/time)")
+        await ws_client.stop()
         return 2
 
     now_local_ms = int(time.time() * 1000)
     now_server_est_ms = int(now_local_ms + int(offset_ms))
     if now_server_est_ms > payout_server_ms + int(max(0, int(LATE_TOL_MS))):
         logger.error("❌ Скрипт запущен слишком поздно относительно времени выплаты (по server time Bybit)")
+        await ws_client.stop()
         return 2
 
     # Server-time schedule
@@ -1294,21 +1313,52 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
     logger.info(f"⏳ Ждём фиксации (server-time): {datetime.fromtimestamp(fix_local_ms/1000.0).strftime('%H:%M:%S')} (локальное время)")
     await _sleep_until_epoch_ms(fix_local_ms)
 
-    # Collect snapshot in parallel
+    # Collect snapshot: используем WebSocket данные вместо REST около границы
     fix_ms = int(fix_server_ms)
+    
+    # Получаем данные из WebSocket (источник данных у границы)
+    ws_snapshot = await ws_client.get_snapshot()
+    
+    # REST вызовы только для данных, которых нет в WS (funding, OHLC)
     tick_item_task = asyncio.create_task(_bybit_fetch_tickers_item(exchange_obj=exchange_obj, coin=p.coin))
+    ohlc_task = asyncio.create_task(_bybit_kline_ohlc_for_bucket_ending_at(exchange_obj=exchange_obj, coin=p.coin, end_ms_inclusive=fix_ms))
+    
+    # Orderbook и trades берем из WebSocket, но оставляем REST как fallback
     ob2_task = asyncio.create_task(exchange_obj.get_orderbook(p.coin, limit=MAIN_OB_LEVELS))
     trades_task = asyncio.create_task(_bybit_fetch_recent_trades(exchange_obj=exchange_obj, coin=p.coin, limit=200))
-    ohlc_task = asyncio.create_task(_bybit_kline_ohlc_for_bucket_ending_at(exchange_obj=exchange_obj, coin=p.coin, end_ms_inclusive=fix_ms))
 
     done, pending = await asyncio.wait({tick_item_task, ob2_task, trades_task, ohlc_task}, timeout=0.9)
     for t in pending:
         t.cancel()
 
     tick_item = _task_result_safe(tick_item_task, None)
-    ob2 = _task_result_safe(ob2_task, None)
-    trades = _task_result_safe(trades_task, [])
+    ob2_rest = _task_result_safe(ob2_task, None)  # REST fallback
+    trades_rest = _task_result_safe(trades_task, [])  # REST fallback
     ohlc = _task_result_safe(ohlc_task, (None, None, None, None))
+    
+    # Используем данные из WebSocket (приоритет) или REST (fallback)
+    # Orderbook из WS
+    ob2 = None
+    if ws_snapshot.best_bid is not None and ws_snapshot.best_ask is not None:
+        # Создаем минимальный orderbook из WS данных
+        ob2 = {
+            "bids": [[str(ws_snapshot.best_bid), "0"]],
+            "asks": [[str(ws_snapshot.best_ask), "0"]],
+        }
+        logger.debug(f"📡 Orderbook из WebSocket: bid={ws_snapshot.best_bid}, ask={ws_snapshot.best_ask}")
+    elif ob2_rest:
+        ob2 = ob2_rest
+        logger.debug("📡 Orderbook из REST (fallback)")
+    
+    # Trades из WS
+    trades = None
+    if ws_snapshot.last_trade is not None:
+        # Используем последнюю цену из WS
+        trades = [{"p": str(ws_snapshot.last_trade)}]
+        logger.debug(f"📡 Trade из WebSocket: {ws_snapshot.last_trade}")
+    elif trades_rest:
+        trades = trades_rest
+        logger.debug("📡 Trades из REST (fallback)")
 
     # Delayed logs (print only after critical window)
     post_logs: List[str] = []
@@ -1349,12 +1399,21 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
         post_logs.append(f"⛔ ОТМЕНА БОЕВОГО ВХОДА: {abort_reason}. Режим short-only работает только при отрицательном funding.")
         for m in post_logs:
             logger.info(m)
+        try:
+            await ws_client.stop()
+        except Exception:
+            pass
         return 0
 
-    # Extract best bid/ask from orderbook snapshot
+    # Extract best bid/ask: приоритет WebSocket, fallback REST
     best_bid_fix: Optional[float] = None
     best_ask_fix: Optional[float] = None
-    if isinstance(ob2, dict):
+    
+    # Сначала пробуем из WebSocket
+    if ws_snapshot.best_bid is not None and ws_snapshot.best_ask is not None:
+        best_bid_fix = ws_snapshot.best_bid
+        best_ask_fix = ws_snapshot.best_ask
+    elif isinstance(ob2, dict):
         try:
             if ob2.get("bids"):
                 best_bid_fix = float(ob2["bids"][0][0])
@@ -1364,45 +1423,64 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
             best_bid_fix = None
             best_ask_fix = None
 
-    # Extract last/bid/ask from tickers snapshot
+    # Extract last/bid/ask: приоритет WebSocket, fallback tickers REST
     last_px: Optional[float] = None
     bid1: Optional[float] = None
     ask1: Optional[float] = None
-    if isinstance(tick_item, dict):
+    
+    # Сначала пробуем из WebSocket
+    if ws_snapshot.last_trade is not None:
+        last_px = ws_snapshot.last_trade
+    elif ws_snapshot.last_ticker is not None:
+        last_px = ws_snapshot.last_ticker
+    
+    if ws_snapshot.best_bid is not None:
+        bid1 = ws_snapshot.best_bid
+    if ws_snapshot.best_ask is not None:
+        ask1 = ws_snapshot.best_ask
+    
+    # Fallback на REST ticker если WS не дал данных
+    if last_px is None and isinstance(tick_item, dict):
         try:
             last_px = float(tick_item.get("lastPrice")) if tick_item.get("lastPrice") is not None else None
         except Exception:
             last_px = None
+    if bid1 is None and isinstance(tick_item, dict):
         try:
             bid1 = float(tick_item.get("bid1Price")) if tick_item.get("bid1Price") is not None else None
         except Exception:
             bid1 = None
+    if ask1 is None and isinstance(tick_item, dict):
         try:
             ask1 = float(tick_item.get("ask1Price")) if tick_item.get("ask1Price") is not None else None
         except Exception:
             ask1 = None
 
-    # Last trade price <= fix_ms
+    # Last trade price: приоритет WebSocket
     trade_px: Optional[float] = None
-    try:
-        best_t: Optional[int] = None
-        best_px: Optional[float] = None
-        for it in (trades or []):
-            if not isinstance(it, dict):
-                continue
-            tms = _bybit_parse_trade_time_ms(it)
-            if tms is None or tms > fix_ms:
-                continue
-            px = _bybit_parse_trade_price(it)
-            if px is None:
-                continue
-            if best_t is None or tms > best_t:
-                best_t = tms
-                best_px = float(px)
-        if best_px is not None and best_px > 0:
-            trade_px = float(best_px)
-    except Exception:
-        trade_px = None
+    if ws_snapshot.last_trade is not None:
+        trade_px = ws_snapshot.last_trade
+    else:
+        # Fallback на REST trades
+        try:
+            best_t: Optional[int] = None
+            best_px: Optional[float] = None
+            for it in (trades or []):
+                if not isinstance(it, dict):
+                    continue
+                tms = _bybit_parse_trade_time_ms(it)
+                if tms is None or tms > fix_ms:
+                    continue
+                px = _bybit_parse_trade_price(it)
+                if px is None:
+                    continue
+                if best_t is None or tms > best_t:
+                    best_t = tms
+                    best_px = float(px)
+            if best_px is not None and best_px > 0:
+                trade_px = float(best_px)
+        except Exception:
+            trade_px = None
 
     # OHLC
     _o, k_high, _l, k_close = ohlc if isinstance(ohlc, tuple) and len(ohlc) == 4 else (None, None, None, None)
@@ -1429,6 +1507,10 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
     close_price = _pick_fix_price()
     if close_price is None or close_price <= 0:
         logger.error("❌ Не удалось зафиксировать цену close_price (HH:MM:59)")
+        try:
+            await ws_client.stop()
+        except Exception:
+            pass
         return 2
 
     # fair price formula
@@ -1449,6 +1531,10 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
 
     if not isinstance(ob2, dict) or not ob2.get("bids") or not ob2.get("asks"):
         logger.error("❌ Bybit: orderbook недоступен для открытия (HH:MM:59)")
+        try:
+            await ws_client.stop()
+        except Exception:
+            pass
         return 2
 
     # Plan times
@@ -1635,11 +1721,19 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
         qty_remain = max(0.0, target_qty - opened)
         if int(OPEN_PHASE2_ENABLE) == 1 and qty_remain > 0:
             # Optional refresh best bid ONLY if still not filled
+            # Используем WebSocket данные вместо REST вызова
             best_bid_now: Optional[float] = None
             try:
-                ob_now = await exchange_obj.get_orderbook(p.coin, limit=5)
-                if ob_now and ob_now.get("bids"):
-                    best_bid_now = float(ob_now["bids"][0][0])
+                ws_snap = await ws_client.get_snapshot()
+                if ws_snap.best_bid is not None:
+                    best_bid_now = ws_snap.best_bid
+                    logger.debug(f"📡 Best bid из WebSocket: {best_bid_now}")
+                else:
+                    # Fallback на REST если WS не дал данных
+                    ob_now = await exchange_obj.get_orderbook(p.coin, limit=5)
+                    if ob_now and ob_now.get("bids"):
+                        best_bid_now = float(ob_now["bids"][0][0])
+                        logger.debug(f"📡 Best bid из REST (fallback): {best_bid_now}")
             except Exception:
                 best_bid_now = None
 
@@ -1747,6 +1841,14 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
         f"📊 Итог (БОЕВОЙ): монета={p.coin} | ср_цена_покупки={_fmt(avg_buy)} | ср_цена_продажи={_fmt(avg_sell)} | "
         f"покупок={buys_n} продаж={sells_n} | PnL_USDT_итого={_fmt(pnl_hist, 3) if pnl_hist is not None else 'N/A'}"
     )
+    
+    # Остановка WebSocket
+    try:
+        await ws_client.stop()
+        logger.debug("🔌 WebSocket остановлен")
+    except Exception as e:
+        logger.warning(f"⚠️ Ошибка при остановке WebSocket: {e}")
+    
     return 0
 
 
