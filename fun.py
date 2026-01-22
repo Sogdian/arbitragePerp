@@ -105,9 +105,12 @@ OPEN_AFTER_MS = int(os.getenv("FUN_OPEN_AFTER_MS", "0"))                       #
 # WS strategy: "enter near close_price or abort"
 WS_FIX_LEAD_MS = int(os.getenv("FUN_WS_FIX_LEAD_MS", "30"))                 # за сколько мс до payout фиксируем ref
 OPEN_MAX_STALENESS_MS = int(os.getenv("FUN_OPEN_MAX_STALENESS_MS", "200"))  # если WS-данные старее — abort
-OPEN_MAX_DOWN_BPS = float(os.getenv("FUN_OPEN_MAX_DOWN_BPS", "80"))         # допуск вниз от close_price (bps)
 OPEN_SAFETY_TICKS = int(os.getenv("FUN_OPEN_SAFETY_TICKS", "1"))            # 1 тик агрессии для sell
 USE_TRADE_WS = int(os.getenv("FUN_USE_TRADE_WS", "1"))
+
+# Rule of admission: soft/hard допуски для падения рынка
+OPEN_SOFT_DOWN_BPS = float(os.getenv("FUN_OPEN_SOFT_DOWN_BPS", "600"))      # 6% — не узко, предупреждение
+OPEN_HARD_DOWN_BPS = float(os.getenv("FUN_OPEN_HARD_DOWN_BPS", "2500"))     # 25% — жесткий стоп, abort
 
 # open safety for Sell IOC (use fixed snapshot; no runtime orderbook calls)
 OPEN_SAFETY_BPS = float(os.getenv("FUN_OPEN_SAFETY_BPS", "10"))                 # 10 bps = 0.10%
@@ -1674,12 +1677,23 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
             pass
         return 0
     
-    # Rule of admission (not narrow, but prevents "рынок уже улетел вниз")
-    min_allowed = float(close_price) * (1.0 - float(OPEN_MAX_DOWN_BPS) / 10_000.0)
-    if float(best_bid_now) < float(min_allowed):
-        logger.info(
-            f"⛔ ABORT OPEN: market already dropped. best_bid_now={_fmt(best_bid_now)} "
-            f"< min_allowed={_fmt(min_allowed)} (down_bps={OPEN_MAX_DOWN_BPS})"
+    # -----------------------------
+    # Rule of admission (НЕ узкий)
+    # -----------------------------
+    # Идея:
+    # - "soft" допуск: если рынок провалился сильнее, мы НЕ abort,
+    #   а просто помечаем режим "drop" (всё равно пробуем открыть, но осознанно).
+    # - "hard" допуск: защита от экстремума/ошибок/аномальной ситуации — тогда abort.
+    
+    # считаем падение best_bid_now относительно close_price (зафиксированного около payout)
+    drop_bps = 0.0
+    if float(close_price) > 0:
+        drop_bps = (float(close_price) - float(best_bid_now)) / float(close_price) * 10_000.0
+    
+    if drop_bps >= OPEN_HARD_DOWN_BPS:
+        logger.warning(
+            f"⛔ ABORT OPEN (HARD): dump too large | close_price={_fmt(close_price)} "
+            f"best_bid_now={_fmt(best_bid_now)} drop_bps={drop_bps:.1f} >= hard={OPEN_HARD_DOWN_BPS:.1f}"
         )
         try:
             if ws_trade:
@@ -1696,6 +1710,15 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
         except Exception:
             pass
         return 0
+    
+    drop_mode = False
+    if drop_bps >= OPEN_SOFT_DOWN_BPS:
+        drop_mode = True
+        logger.warning(
+            f"⚠️ OPEN DROP MODE: market dropped fast | close_price={_fmt(close_price)} "
+            f"best_bid_now={_fmt(best_bid_now)} drop_bps={drop_bps:.1f} >= soft={OPEN_SOFT_DOWN_BPS:.1f}. "
+            f"Continue opening (no abort)."
+        )
     
     # Build LIMIT price for Sell FOK:
     # Цена открытия жёстко около close_price, чтобы НЕ разрешать продавать значительно ниже.
@@ -1718,7 +1741,12 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
             pass
         return 0
     
-    limit_px = float(close_price) - float(OPEN_SAFETY_TICKS) * tick
+    base = min(float(close_price), float(best_bid_now))
+    # если рынок уже в drop_mode — увеличиваем "запас" по тикам, чтобы FOK точно был marketable
+    safety_ticks = int(OPEN_SAFETY_TICKS)
+    if drop_mode:
+        safety_ticks = max(safety_ticks, 4)  # можно 4–8, но начнем с 4
+    limit_px = base - float(safety_ticks) * tick
     limit_px = po._floor_to_step(limit_px, tick)
     
     if limit_px <= 0:
