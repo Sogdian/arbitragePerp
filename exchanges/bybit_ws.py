@@ -14,7 +14,7 @@ import json
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Dict, Optional
 
 import websockets
 from websockets.exceptions import ConnectionClosed, WebSocketException
@@ -101,6 +101,7 @@ class BybitPublicWS:
         self._task: Optional[asyncio.Task] = None
         self._reconnect_delay = 0.5  # Начальная задержка для reconnect
         self._max_reconnect_delay = 15.0  # Максимальная задержка
+        self.last_update_local_ms: float = 0.0  # Время получения последнего сообщения (local time)
     
     async def run(self) -> None:
         """
@@ -289,6 +290,7 @@ class BybitPublicWS:
                 self.state.best_bid = best_bid
                 self.state.best_ask = best_ask
                 self.state.ts_bidask_monotonic = time.monotonic()
+                self.last_update_local_ms = time.time() * 1000.0
     
     async def _handle_trade(self, data: dict) -> None:
         """Обрабатывает обновление trades."""
@@ -312,6 +314,7 @@ class BybitPublicWS:
             async with self.lock:
                 self.state.last_trade = last_price
                 self.state.ts_trade_monotonic = time.monotonic()
+                self.last_update_local_ms = time.time() * 1000.0
     
     async def _handle_ticker(self, data: dict) -> None:
         """Обрабатывает обновление ticker."""
@@ -331,6 +334,7 @@ class BybitPublicWS:
             async with self.lock:
                 self.state.last_ticker = last_price
                 self.state.ts_ticker_monotonic = time.monotonic()
+                self.last_update_local_ms = time.time() * 1000.0
     
     async def _close_ws(self) -> None:
         """Закрывает WebSocket соединение."""
@@ -379,4 +383,38 @@ class BybitPublicWS:
         """
         async with self.lock:
             return self.state.get_snapshot()
+    
+    def snapshot(self) -> Dict[str, Optional[float]]:
+        """
+        Возвращает моментальный snapshot данных (без блокировки, может быть устаревшим).
+        
+        Важно: last_update_local_ms — время ПОЛУЧЕНИЯ последнего сообщения (local time)
+        staleness_ms = now_local_ms - last_update_local_ms
+        
+        Returns:
+            Словарь с данными: best_bid, best_ask, last_trade, last_price, staleness_ms, last_update_local_ms,
+            trade_age_ms, ticker_age_ms
+        """
+        now = int(time.time() * 1000)
+        lu = int(self.last_update_local_ms or 0)
+        st = (now - lu) if lu > 0 else 1_000_000_000  # 1e9 если нет обновлений
+        
+        # Берем last_price из ticker или trade
+        last_price = self.state.last_ticker if self.state.last_ticker is not None else self.state.last_trade
+        
+        # Возраст данных в миллисекундах (monotonic)
+        now_mono = time.monotonic()
+        trade_age_ms = (now_mono - self.state.ts_trade_monotonic) * 1000.0 if self.state.ts_trade_monotonic > 0 else 1e9
+        ticker_age_ms = (now_mono - self.state.ts_ticker_monotonic) * 1000.0 if self.state.ts_ticker_monotonic > 0 else 1e9
+        
+        return {
+            "best_bid": self.state.best_bid,
+            "best_ask": self.state.best_ask,
+            "last_trade": self.state.last_trade,  # цена последней сделки (publicTrade)
+            "last_price": last_price,  # lastPrice из tickers или last_trade
+            "staleness_ms": float(st),
+            "last_update_local_ms": float(lu),
+            "trade_age_ms": float(trade_age_ms),
+            "ticker_age_ms": float(ticker_age_ms),
+        }
 

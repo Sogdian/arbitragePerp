@@ -12,6 +12,8 @@ from typing import Any, Dict, List, Optional, Tuple
 from bot import PerpArbitrageBot
 import position_opener as po
 from exchanges.bybit_ws import BybitPublicWS
+from exchanges.bybit_ws_trade import BybitTradeWS
+from exchanges.bybit_ws_private import BybitPrivateWS
 
 
 # ----------------------------
@@ -98,7 +100,14 @@ FAST_CLOSE_MAX_ATTEMPTS = int(os.getenv("FUN_FAST_CLOSE_MAX_ATTEMPTS", "15"))
 FAST_SILENT_TRADING = int(os.getenv("FUN_FAST_SILENT_TRADING", "1"))            # 1 => disable logging during open/close window
 
 # open timing
-OPEN_AFTER_MS = int(os.getenv("FUN_OPEN_AFTER_MS", "10"))                       # открыть ПОСЛЕ payout (мс)
+OPEN_AFTER_MS = int(os.getenv("FUN_OPEN_AFTER_MS", "0"))                       # открыть ПОСЛЕ payout (мс) - теперь 0 для WS
+
+# WS strategy: "enter near close_price or abort"
+WS_FIX_LEAD_MS = int(os.getenv("FUN_WS_FIX_LEAD_MS", "30"))                 # за сколько мс до payout фиксируем ref
+OPEN_MAX_STALENESS_MS = int(os.getenv("FUN_OPEN_MAX_STALENESS_MS", "200"))  # если WS-данные старее — abort
+OPEN_MAX_DOWN_BPS = float(os.getenv("FUN_OPEN_MAX_DOWN_BPS", "80"))         # допуск вниз от close_price (bps)
+OPEN_SAFETY_TICKS = int(os.getenv("FUN_OPEN_SAFETY_TICKS", "1"))            # 1 тик агрессии для sell
+USE_TRADE_WS = int(os.getenv("FUN_USE_TRADE_WS", "1"))
 
 # open safety for Sell IOC (use fixed snapshot; no runtime orderbook calls)
 OPEN_SAFETY_BPS = float(os.getenv("FUN_OPEN_SAFETY_BPS", "10"))                 # 10 bps = 0.10%
@@ -203,8 +212,8 @@ def _epoch_ms_to_local_hhmm(ms: Optional[int]) -> Optional[Tuple[int, int]]:
 
 async def _sleep_until_epoch_ms(target_epoch_ms: int) -> None:
     """
-    Best-effort precise sleep until local epoch ms (time.time()*1000).
-    Uses dynamic sleeps + short tail wait (Windows-friendly).
+    Best-effort precise sleep until local epoch ms (time.time()*1000),
+    WITHOUT blocking the event loop (no time.sleep).
     """
     target = int(target_epoch_ms)
     while True:
@@ -212,23 +221,102 @@ async def _sleep_until_epoch_ms(target_epoch_ms: int) -> None:
         delta = target - now_ms
         if delta <= 0:
             return
-        if delta > 1500:
-            await asyncio.sleep(max(0.05, (delta - 800) / 1000.0))
+        # coarse sleep
+        if delta > 200:
+            await asyncio.sleep((delta - 80) / 1000.0)
             continue
-        if delta > 300:
-            await asyncio.sleep(max(0.02, (delta - 160) / 1000.0))
+        if delta > 40:
+            await asyncio.sleep((delta - 15) / 1000.0)
             continue
-        if delta > 80:
-            await asyncio.sleep(max(0.005, (delta - 40) / 1000.0))
+        if delta > 8:
+            await asyncio.sleep(delta / 2000.0)  # half of remaining
             continue
-        if delta > 25:
-            await asyncio.sleep(max(0.001, delta / 2000.0))
-            continue
-        # Tail wait (<=25ms)
-        deadline = time.perf_counter() + (delta / 1000.0)
-        while time.perf_counter() < deadline:
-            time.sleep(0.001)
-        return
+        # last ~8ms: yield loop without blocking
+        await asyncio.sleep(0)
+
+
+async def _sleep_until_server_ms(target_server_ms: int, offset_ms: int) -> None:
+    """
+    Sleep until server time target.
+    server_ms = local_ms + offset_ms  => local_target = server_target - offset_ms
+    """
+    await _sleep_until_epoch_ms(int(target_server_ms - offset_ms))
+
+
+def _extract_order_id_from_trade_ack(ack: dict) -> Optional[str]:
+    """
+    Извлекает order_id из ответа Trade WS create_order.
+    
+    Bybit Trade WS ответы могут иметь разную структуру, поэтому проверяем несколько путей.
+    """
+    if not isinstance(ack, dict):
+        return None
+    
+    for path in (
+        ("result", "orderId"),
+        ("data", "orderId"),
+        ("data", "result", "orderId"),
+        ("result", "list", 0, "orderId"),
+        ("data", "list", 0, "orderId"),
+    ):
+        cur = ack
+        ok = True
+        for key in path:
+            try:
+                cur = cur[key] if isinstance(key, int) else cur.get(key)
+            except Exception:
+                ok = False
+                break
+            if cur is None:
+                ok = False
+                break
+        if ok:
+            try:
+                s = str(cur)
+                if s:
+                    return s
+            except Exception:
+                pass
+    
+    return None
+
+
+def _extract_order_id_from_trade_ack(ack: dict) -> Optional[str]:
+    """
+    Извлекает order_id из ответа Trade WS create_order.
+    
+    Bybit Trade WS ответы могут иметь разную структуру, поэтому проверяем несколько путей.
+    """
+    if not isinstance(ack, dict):
+        return None
+    
+    for path in (
+        ("result", "orderId"),
+        ("data", "orderId"),
+        ("data", "result", "orderId"),
+        ("result", "list", 0, "orderId"),
+        ("data", "list", 0, "orderId"),
+    ):
+        cur = ack
+        ok = True
+        for key in path:
+            try:
+                cur = cur[key] if isinstance(key, int) else cur.get(key)
+            except Exception:
+                ok = False
+                break
+            if cur is None:
+                ok = False
+                break
+        if ok:
+            try:
+                s = str(cur)
+                if s:
+                    return s
+            except Exception:
+                pass
+    
+    return None
 
 
 def _ticker_last_price(t: Optional[Dict[str, Any]]) -> Optional[float]:
@@ -1256,35 +1344,70 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
 
     payout_server_ms = int(p.next_funding_time_ms)
 
-    # Запуск WebSocket для получения данных в реальном времени
-    symbol = exchange_obj._normalize_symbol(p.coin)
-    ws_client = BybitPublicWS(symbol=symbol)
-    ws_task = asyncio.create_task(ws_client.run())
-    
-    try:
-        # Ждем готовности WebSocket данных
-        logger.info(f"🔌 Запуск WebSocket для {symbol}, ожидание готовности...")
-        ready = await ws_client.wait_ready(timeout=15.0)
-        if not ready:
-            logger.warning("⚠️ WebSocket не готов в течение 15 секунд, продолжаем (best-effort)")
-        else:
-            logger.info("✅ WebSocket готов, данные поступают")
-    except Exception as e:
-        logger.warning(f"⚠️ Ошибка при ожидании готовности WebSocket: {e}, продолжаем (best-effort)")
-
     # Sync local with server clock (critical for scheduling)
     offset_ms = await _bybit_estimate_time_offset_ms(exchange_obj=exchange_obj, samples=5)
     if offset_ms is None:
         logger.error("❌ Не удалось получить Bybit server time (market/time)")
-        await ws_client.stop()
         return 2
 
     now_local_ms = int(time.time() * 1000)
     now_server_est_ms = int(now_local_ms + int(offset_ms))
     if now_server_est_ms > payout_server_ms + int(max(0, int(LATE_TOL_MS))):
         logger.error("❌ Скрипт запущен слишком поздно относительно времени выплаты (по server time Bybit)")
-        await ws_client.stop()
         return 2
+
+    # --- START WS EARLY (public + trade) ---
+    symbol = exchange_obj._normalize_symbol(p.coin)
+    
+    # Public WS
+    ws_public = BybitPublicWS(symbol=symbol)
+    ws_public_task = asyncio.create_task(ws_public.run())
+    
+    logger.info("🔌 WS: запускаем public stream (orderbook.1 + publicTrade + tickers)")
+    try:
+        ready = await ws_public.wait_ready(timeout=15.0)
+        if not ready:
+            logger.warning("⚠️ Public WS не готов в течение 15 секунд, продолжаем (best-effort)")
+        else:
+            logger.info("✅ Public WS готов, данные поступают")
+    except Exception as e:
+        logger.warning(f"⚠️ Ошибка при ожидании готовности Public WS: {e}, продолжаем (best-effort)")
+    
+    # Trade WS
+    ws_trade = None
+    if USE_TRADE_WS == 1:
+        logger.info("🔌 WS: запускаем trade stream (order.create)")
+        try:
+            ws_trade = BybitTradeWS(
+                api_key=api_key,
+                api_secret=api_secret,
+                logger=logger,
+                referer="arb-bot",
+                recv_window_ms=8000,
+            )
+            await ws_trade.start()
+            logger.info("✅ Trade WS готов")
+        except Exception as e:
+            logger.error(f"❌ Ошибка запуска Trade WS: {e}")
+            if ws_trade:
+                await ws_trade.stop()
+            ws_trade = None
+    
+    # Private WS (order/execution stream)
+    ws_private = None
+    try:
+        logger.info("🔌 WS: запускаем private stream (order/execution)")
+        ws_private = BybitPrivateWS(
+            api_key=api_key,
+            api_secret=api_secret,
+        )
+        await ws_private.start()
+        logger.info("✅ Private WS готов (order/execution stream)")
+    except Exception as e:
+        logger.error(f"❌ Ошибка запуска Private WS: {e}")
+        if ws_private:
+            await ws_private.stop()
+        ws_private = None
 
     # Server-time schedule
     prep_server_ms = int(payout_server_ms - int(max(0.0, float(FAST_PREP_LEAD_SEC)) * 1000))
@@ -1307,321 +1430,74 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
     tick = float(tick_raw) if tick_raw else 0.0
     qty_str = po._format_by_step(p.coin_qty, qty_step_raw)
 
-    # Fix snapshot at payout-1000ms (server time)
-    fix_server_ms = int(payout_server_ms - 1000)
-    fix_local_ms = int(fix_server_ms - offset_ms)
-    logger.info(f"⏳ Ждём фиксации (server-time): {datetime.fromtimestamp(fix_local_ms/1000.0).strftime('%H:%M:%S')} (локальное время)")
-    await _sleep_until_epoch_ms(fix_local_ms)
-
-    # Collect snapshot: используем WebSocket данные вместо REST около границы
-    fix_ms = int(fix_server_ms)
+    # --- FIX REFERENCE PRICE FROM WS (very close to payout) ---
+    fix_server_ms = int(payout_server_ms - max(0, WS_FIX_LEAD_MS))
+    await _sleep_until_server_ms(fix_server_ms, offset_ms)
     
-    # Получаем данные из WebSocket (источник данных у границы)
-    ws_snapshot = await ws_client.get_snapshot()
+    snap_fix = ws_public.snapshot()
     
-    # REST вызовы только для данных, которых нет в WS (funding, OHLC)
-    tick_item_task = asyncio.create_task(_bybit_fetch_tickers_item(exchange_obj=exchange_obj, coin=p.coin))
-    ohlc_task = asyncio.create_task(_bybit_kline_ohlc_for_bucket_ending_at(exchange_obj=exchange_obj, coin=p.coin, end_ms_inclusive=fix_ms))
+    # Выбираем close_price на основе свежести данных
+    trade_age = snap_fix.get("trade_age_ms", 1e9)
+    ticker_age = snap_fix.get("ticker_age_ms", 1e9)
     
-    # Orderbook и trades берем из WebSocket, но оставляем REST как fallback
-    ob2_task = asyncio.create_task(exchange_obj.get_orderbook(p.coin, limit=MAIN_OB_LEVELS))
-    trades_task = asyncio.create_task(_bybit_fetch_recent_trades(exchange_obj=exchange_obj, coin=p.coin, limit=200))
-
-    done, pending = await asyncio.wait({tick_item_task, ob2_task, trades_task, ohlc_task}, timeout=0.9)
-    for t in pending:
-        t.cancel()
-
-    tick_item = _task_result_safe(tick_item_task, None)
-    ob2_rest = _task_result_safe(ob2_task, None)  # REST fallback
-    trades_rest = _task_result_safe(trades_task, [])  # REST fallback
-    ohlc = _task_result_safe(ohlc_task, (None, None, None, None))
+    close_price = None
+    if trade_age <= OPEN_MAX_STALENESS_MS:
+        close_price = snap_fix.get("last_trade")
+    elif ticker_age <= OPEN_MAX_STALENESS_MS:
+        close_price = snap_fix.get("last_price")
     
-    # Используем данные из WebSocket (приоритет) или REST (fallback)
-    # Orderbook из WS
-    ob2 = None
-    if ws_snapshot.best_bid is not None and ws_snapshot.best_ask is not None:
-        # Создаем минимальный orderbook из WS данных
-        ob2 = {
-            "bids": [[str(ws_snapshot.best_bid), "0"]],
-            "asks": [[str(ws_snapshot.best_ask), "0"]],
-        }
-        logger.debug(f"📡 Orderbook из WebSocket: bid={ws_snapshot.best_bid}, ask={ws_snapshot.best_ask}")
-    elif ob2_rest:
-        ob2 = ob2_rest
-        logger.debug("📡 Orderbook из REST (fallback)")
+    best_bid_fix = snap_fix.get("best_bid")
+    best_ask_fix = snap_fix.get("best_ask")
     
-    # Trades из WS
-    trades = None
-    if ws_snapshot.last_trade is not None:
-        # Используем последнюю цену из WS
-        trades = [{"p": str(ws_snapshot.last_trade)}]
-        logger.debug(f"📡 Trade из WebSocket: {ws_snapshot.last_trade}")
-    elif trades_rest:
-        trades = trades_rest
-        logger.debug("📡 Trades из REST (fallback)")
-
-    # Delayed logs (print only after critical window)
-    post_logs: List[str] = []
-
-    # Funding just before payout: prefer predictedFundingRate
-    pred_fr: Optional[float] = None
-    fr: Optional[float] = None
-    if isinstance(tick_item, dict):
-        for k in ("predictedFundingRate", "predFundingRate", "predicted_funding_rate"):
-            v = tick_item.get(k)
-            if v is None:
-                continue
-            try:
-                pred_fr = float(v)
-                break
-            except Exception:
-                pass
-        v = tick_item.get("fundingRate")
-        if v is not None:
-            try:
-                fr = float(v)
-            except Exception:
-                pass
-
-    if pred_fr is not None:
-        p.funding_pct = float(pred_fr)
-    elif fr is not None:
-        p.funding_pct = float(fr)
-
-    # Final in-memory funding gate (no extra network calls)
-    abort_reason: Optional[str] = None
-    if p.funding_pct is None:
-        abort_reason = "funding перед payout не подтверждён (tickers=None)"
-    elif float(p.funding_pct) >= 0:
-        abort_reason = f"funding стал неотрицательным перед payout: {p.funding_pct*100:.6f}%"
-
-    if abort_reason:
-        post_logs.append(f"⛔ ОТМЕНА БОЕВОГО ВХОДА: {abort_reason}. Режим short-only работает только при отрицательном funding.")
-        for m in post_logs:
-            logger.info(m)
+    if not close_price or close_price <= 0:
+        logger.error(
+            f"❌ WS FIX: close_price is not available | "
+            f"trade_age={trade_age:.0f}ms ticker_age={ticker_age:.0f}ms "
+            f"(max={OPEN_MAX_STALENESS_MS}ms)"
+        )
         try:
-            await ws_client.stop()
+            if ws_trade:
+                await ws_trade.stop()
+        except Exception:
+            pass
+        try:
+            if ws_private:
+                await ws_private.stop()
+        except Exception:
+            pass
+        try:
+            await ws_public.stop()
         except Exception:
             pass
         return 0
-
-    # Extract best bid/ask: приоритет WebSocket, fallback REST
-    best_bid_fix: Optional[float] = None
-    best_ask_fix: Optional[float] = None
     
-    # Сначала пробуем из WebSocket
-    if ws_snapshot.best_bid is not None and ws_snapshot.best_ask is not None:
-        best_bid_fix = ws_snapshot.best_bid
-        best_ask_fix = ws_snapshot.best_ask
-    elif isinstance(ob2, dict):
+    if not best_bid_fix or best_bid_fix <= 0:
+        logger.error("❌ WS FIX: best_bid not available")
         try:
-            if ob2.get("bids"):
-                best_bid_fix = float(ob2["bids"][0][0])
-            if ob2.get("asks"):
-                best_ask_fix = float(ob2["asks"][0][0])
-        except Exception:
-            best_bid_fix = None
-            best_ask_fix = None
-
-    # Extract last/bid/ask: приоритет WebSocket, fallback tickers REST
-    last_px: Optional[float] = None
-    bid1: Optional[float] = None
-    ask1: Optional[float] = None
-    
-    # Сначала пробуем из WebSocket
-    if ws_snapshot.last_trade is not None:
-        last_px = ws_snapshot.last_trade
-    elif ws_snapshot.last_ticker is not None:
-        last_px = ws_snapshot.last_ticker
-    
-    if ws_snapshot.best_bid is not None:
-        bid1 = ws_snapshot.best_bid
-    if ws_snapshot.best_ask is not None:
-        ask1 = ws_snapshot.best_ask
-    
-    # Fallback на REST ticker если WS не дал данных
-    if last_px is None and isinstance(tick_item, dict):
-        try:
-            last_px = float(tick_item.get("lastPrice")) if tick_item.get("lastPrice") is not None else None
-        except Exception:
-            last_px = None
-    if bid1 is None and isinstance(tick_item, dict):
-        try:
-            bid1 = float(tick_item.get("bid1Price")) if tick_item.get("bid1Price") is not None else None
-        except Exception:
-            bid1 = None
-    if ask1 is None and isinstance(tick_item, dict):
-        try:
-            ask1 = float(tick_item.get("ask1Price")) if tick_item.get("ask1Price") is not None else None
-        except Exception:
-            ask1 = None
-
-    # Last trade price: приоритет WebSocket
-    trade_px: Optional[float] = None
-    if ws_snapshot.last_trade is not None:
-        trade_px = ws_snapshot.last_trade
-    else:
-        # Fallback на REST trades
-        try:
-            best_t: Optional[int] = None
-            best_px: Optional[float] = None
-            for it in (trades or []):
-                if not isinstance(it, dict):
-                    continue
-                tms = _bybit_parse_trade_time_ms(it)
-                if tms is None or tms > fix_ms:
-                    continue
-                px = _bybit_parse_trade_price(it)
-                if px is None:
-                    continue
-                if best_t is None or tms > best_t:
-                    best_t = tms
-                    best_px = float(px)
-            if best_px is not None and best_px > 0:
-                trade_px = float(best_px)
-        except Exception:
-            trade_px = None
-
-    # OHLC
-    _o, k_high, _l, k_close = ohlc if isinstance(ohlc, tuple) and len(ohlc) == 4 else (None, None, None, None)
-
-    def _pick_fix_price() -> Optional[float]:
-        base_last = trade_px if (trade_px is not None and trade_px > 0) else (last_px if (last_px is not None and last_px > 0) else None)
-        if FIX_PRICE_MODE in ("last", "trade_last", "trade_or_last"):
-            return base_last
-        if FIX_PRICE_MODE in ("kclose", "kline_close"):
-            return k_close if (k_close is not None and k_close > 0) else base_last
-        if FIX_PRICE_MODE in ("wick", "high", "khigh", "kline_high"):
-            return k_high if (k_high is not None and k_high > 0) else base_last
-        if FIX_PRICE_MODE in ("max", "max_all"):
-            candidates: List[float] = []
-            for v in (trade_px, last_px, ask1, best_ask_fix, bid1, best_bid_fix, k_high, k_close):
-                try:
-                    if v is not None and float(v) > 0:
-                        candidates.append(float(v))
-                except Exception:
-                    continue
-            return max(candidates) if candidates else base_last
-        return base_last
-
-    close_price = _pick_fix_price()
-    if close_price is None or close_price <= 0:
-        logger.error("❌ Не удалось зафиксировать цену close_price (HH:MM:59)")
-        try:
-            await ws_client.stop()
+            if ws_trade:
+                await ws_trade.stop()
         except Exception:
             pass
-        return 2
-
-    # fair price formula
-    total_pct_abs = abs(float(p.funding_pct)) + abs(float(p.offset_pct))
-    fair_price = float(close_price) - (float(close_price) * float(total_pct_abs))
-    long_target_price = fair_price
-
-    post_logs.append(
-        f"📌 Фиксация: close_price={_fmt(close_price)} | fair={_fmt(fair_price)} | long_target={_fmt(long_target_price)} "
-        f"(funding={_fmt(p.funding_pct*100,6)}%, offset={_fmt(p.offset_pct*100,6)}%)"
-    )
-    post_logs.append(
-        f"📌 Диагностика: last={_fmt(last_px)} trade={_fmt(trade_px)} ask1={_fmt(ask1)} bid1={_fmt(bid1)} "
-        f"| ob_best_bid={_fmt(best_bid_fix)} ob_best_ask={_fmt(best_ask_fix)} | k_high={_fmt(k_high)} k_close={_fmt(k_close)} "
-        f"| fundingRate={_fmt(fr*100,6) if fr is not None else 'N/A'} predicted={_fmt(pred_fr*100,6) if pred_fr is not None else 'N/A'} "
-        f"| fix_price_mode={FIX_PRICE_MODE}"
-    )
-
-    if not isinstance(ob2, dict) or not ob2.get("bids") or not ob2.get("asks"):
-        logger.error("❌ Bybit: orderbook недоступен для открытия (HH:MM:59)")
         try:
-            await ws_client.stop()
+            if ws_private:
+                await ws_private.stop()
         except Exception:
             pass
-        return 2
+        try:
+            await ws_public.stop()
+        except Exception:
+            pass
+        return 0
+    
+    logger.info(
+        f"📌 WS FIX: close_price={_fmt(close_price)} best_bid={_fmt(best_bid_fix)} best_ask={_fmt(best_ask_fix)} "
+        f"staleness_ms={snap_fix.get('staleness_ms')}"
+    )
 
     # Plan times
     open_server_ms = int(payout_server_ms + max(0, int(OPEN_AFTER_MS)))
-    open_local_ms = int(open_server_ms - offset_ms)
     close_server_ms = int(payout_server_ms + int(max(0.0, float(FAST_CLOSE_DELAY_SEC)) * 1000))
     close_local_ms = int(close_server_ms - offset_ms)
-
-    # -----------------------------
-    # OPEN PRICE PLAN (2-phase: quality then guarantee)
-    # -----------------------------
-    _tick = float(tick) if (tick and float(tick) > 0) else 0.0
-    qty_step = float(qty_step_raw) if qty_step_raw else 0.0
-
-    def _floor_to_tick(px: float) -> float:
-        if _tick <= 0:
-            return float(px)
-        return po._floor_to_step(float(px), float(_tick))
-
-    def _floor_to_qty_step(q: float) -> float:
-        if qty_step <= 0:
-            return float(q)
-        return po._floor_to_step(float(q), float(qty_step))
-
-    def _deduct_from_best_bid(best_bid: float, *, min_ticks: int, safety_bps: float) -> float:
-        min_ticks = max(0, int(min_ticks))
-        safety_bps = max(0.0, float(safety_bps))
-        ded_ticks = float(min_ticks) * (_tick if _tick > 0 else 0.0)
-        ded_bps = float(best_bid) * (safety_bps / 10_000.0)
-        return max(ded_ticks, ded_bps)
-
-    def _build_down_ladder(base_px: float, *, tries: int, extra_bps: float) -> List[float]:
-        tries = max(1, min(int(tries), 6))
-        extra_bps = max(0.0, float(extra_bps))
-        out: List[float] = []
-        for i in range(tries):
-            factor = 1.0 - (extra_bps / 10_000.0) * float(i)
-            px_i = _floor_to_tick(float(base_px) * float(factor))
-            if px_i > 0:
-                out.append(px_i)
-        # uniq after rounding
-        uniq: List[float] = []
-        last_v: Optional[float] = None
-        for v in out:
-            if last_v is None or abs(v - last_v) > 1e-12:
-                uniq.append(v)
-            last_v = v
-        return uniq
-
-    if not best_bid_fix or float(best_bid_fix) <= 0:
-        logger.error("❌ best_bid_fix недоступен, не можем сделать quality-вход близко к close_price")
-        return 2
-
-    # Phase-1: quality prices near best_bid_fix (вход выше)
-    ded1 = _deduct_from_best_bid(float(best_bid_fix), min_ticks=OPEN_PHASE1_MIN_TICKS, safety_bps=OPEN_PHASE1_SAFETY_BPS)
-    phase1_base = _floor_to_tick(float(best_bid_fix) - ded1)
-    # ВАЖНО: если extra_bps=0, то bps-лесенка даст одинаковые цены. Для phase-1 делаем шаги по 1 тика.
-    phase1_prices: List[float] = []
-    tries1 = max(1, min(int(OPEN_PHASE1_TRIES), 6))
-    for i in range(tries1):
-        px_i = _floor_to_tick(float(phase1_base) - float(i) * (_tick if _tick > 0 else 0.0))
-        if px_i > 0:
-            phase1_prices.append(px_i)
-    # uniq after rounding
-    _p1u: List[float] = []
-    _lv: Optional[float] = None
-    for v in phase1_prices:
-        if _lv is None or abs(v - _lv) > 1e-12:
-            _p1u.append(v)
-        _lv = v
-    phase1_prices = _p1u
-
-    # Phase-2: guarantee ladder (агрессивнее вниз), стартуем от best_bid_fix - phase2_safety
-    ded2 = _deduct_from_best_bid(float(best_bid_fix), min_ticks=OPEN_PHASE2_MIN_TICKS, safety_bps=OPEN_PHASE2_SAFETY_BPS)
-    phase2_base = _floor_to_tick(float(best_bid_fix) - ded2)
-    phase2_prices = _build_down_ladder(phase2_base, tries=OPEN_PHASE2_TRIES, extra_bps=OPEN_PHASE2_EXTRA_BPS)
-
-    open_local_str = datetime.fromtimestamp(open_local_ms / 1000.0).strftime("%H:%M:%S")
-    close_local_str = datetime.fromtimestamp(close_local_ms / 1000.0).strftime("%H:%M:%S")
-
-    post_logs.append(
-        f"🧠 План (БОЕВОЙ, 2-phase): открыть Short в {open_local_str} | qty={qty_str} | "
-        f"phase1_prices={[po._format_by_step(x, tick_raw) for x in phase1_prices]} | "
-        f"phase2_prices={[po._format_by_step(x, tick_raw) for x in phase2_prices[:min(5,len(phase2_prices))]]}{'...' if len(phase2_prices)>5 else ''} | "
-        f"(best_bid_fix={_fmt(best_bid_fix)} close_price={_fmt(close_price)} | phase1_ticks={OPEN_PHASE1_MIN_TICKS} phase2_extra={OPEN_PHASE2_EXTRA_BPS}bps) | "
-        f"затем закрывать Short c {close_local_str}"
-    )
 
     # Snapshot existing short BEFORE open (important!)
     short_before = await _bybit_get_short_qty_snapshot(
@@ -1630,166 +1506,227 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
         api_secret=api_secret,
         coin=p.coin,
     )
-    post_logs.append(f"📍 Позиция до входа: short_before={_fmt(short_before)} {p.coin}")
+    logger.info(f"📍 Позиция до входа: short_before={_fmt(short_before)} {p.coin}")
 
-    # Wait until open time
-    await _sleep_until_epoch_ms(open_local_ms)
-
-    # ----------------------------
-    # CRITICAL WINDOW: минимальный overhead
-    # ----------------------------
-    old_disable_level = None
-    if int(FAST_SILENT_TRADING) == 1:
-        old_disable_level = logging.root.manager.disable
-        logging.disable(logging.CRITICAL)
-
-    short_place_errs: List[str] = []
-
-    async def _place_sell_ioc(qty_to_sell: float, px: float) -> None:
-        qty_to_sell = float(qty_to_sell)
-        if qty_to_sell <= 0:
-            return
-        qty_send = _floor_to_qty_step(qty_to_sell)
-        if qty_send <= 0:
-            return
-        qty_to_sell_str = po._format_by_step(qty_send, qty_step_raw)
-        px_str = po._format_by_step(float(px), tick_raw)
+    # --- OPEN: send as early as possible after payout (server-time) ---
+    await _sleep_until_server_ms(open_server_ms, offset_ms)
+    
+    snap_open = ws_public.snapshot()
+    st_ms = float(snap_open.get("staleness_ms", 1e9))
+    if st_ms > float(OPEN_MAX_STALENESS_MS):
+        logger.warning(f"⛔ ABORT OPEN: WS stale {st_ms:.0f}ms > {OPEN_MAX_STALENESS_MS}ms")
         try:
-            try:
-                await _bybit_place_limit(
-                    exchange_obj=exchange_obj,
-                    api_key=api_key,
-                    api_secret=api_secret,
-                    coin=p.coin,
-                    side="Sell",
-                    qty_str=qty_to_sell_str,
-                    price_str=px_str,
-                    tif="IOC",
-                    reduce_only=None,
-                    position_idx=2,
-                )
-            except Exception:
-                await _bybit_place_limit(
-                    exchange_obj=exchange_obj,
-                    api_key=api_key,
-                    api_secret=api_secret,
-                    coin=p.coin,
-                    side="Sell",
-                    qty_str=qty_to_sell_str,
-                    price_str=px_str,
-                    tif="IOC",
-                    reduce_only=None,
-                    position_idx=None,
-                )
-        except Exception as e:
-            short_place_errs.append(str(e))
-
-    target_qty = float(p.coin_qty)
-
-    def _delta_opened(short_after: float, short_before_: float) -> float:
-        return max(0.0, float(short_after) - float(short_before_))
-
-    # Phase-1: quality attempts, but always send ONLY remaining qty
-    short_after = float(short_before)
-    opened = 0.0
-
-    for px_try in phase1_prices:
-        remain = max(0.0, target_qty - opened)
-        if remain <= 0:
-            break
-
-        await _place_sell_ioc(remain, float(px_try))
-
-        if OPEN_PHASE1_WAIT_MS > 0:
-            time.sleep(max(0, int(OPEN_PHASE1_WAIT_MS)) / 1000.0)
-
-        short_after = await _bybit_get_short_qty_snapshot(
-            exchange_obj=exchange_obj,
-            api_key=api_key,
-            api_secret=api_secret,
-            coin=p.coin,
+            if ws_trade:
+                await ws_trade.stop()
+        except Exception:
+            pass
+        try:
+            if ws_private:
+                await ws_private.stop()
+        except Exception:
+            pass
+        try:
+            await ws_public.stop()
+        except Exception:
+            pass
+        return 0
+    
+    best_bid_now = snap_open.get("best_bid")
+    if not best_bid_now or best_bid_now <= 0:
+        logger.warning("⛔ ABORT OPEN: best_bid_now not available from WS")
+        try:
+            if ws_trade:
+                await ws_trade.stop()
+        except Exception:
+            pass
+        try:
+            if ws_private:
+                await ws_private.stop()
+        except Exception:
+            pass
+        try:
+            await ws_public.stop()
+        except Exception:
+            pass
+        return 0
+    
+    # Rule of admission (not narrow, but prevents "рынок уже улетел вниз")
+    min_allowed = float(close_price) * (1.0 - float(OPEN_MAX_DOWN_BPS) / 10_000.0)
+    if float(best_bid_now) < float(min_allowed):
+        logger.info(
+            f"⛔ ABORT OPEN: market already dropped. best_bid_now={_fmt(best_bid_now)} "
+            f"< min_allowed={_fmt(min_allowed)} (down_bps={OPEN_MAX_DOWN_BPS})"
         )
-        opened = _delta_opened(short_after, short_before)
-
-        if opened >= target_qty - 1e-12:
-            break
-
-    # Phase-2: guarantee ladder on remaining qty only
-    if int(OPEN_HARD_CAP_ENABLE) == 1 and opened >= target_qty - 1e-12:
-        pass
-    else:
-        qty_remain = max(0.0, target_qty - opened)
-        if int(OPEN_PHASE2_ENABLE) == 1 and qty_remain > 0:
-            # Optional refresh best bid ONLY if still not filled
-            # Используем WebSocket данные вместо REST вызова
-            best_bid_now: Optional[float] = None
+        try:
+            if ws_trade:
+                await ws_trade.stop()
+        except Exception:
+            pass
+        try:
+            if ws_private:
+                await ws_private.stop()
+        except Exception:
+            pass
+        try:
+            await ws_public.stop()
+        except Exception:
+            pass
+        return 0
+    
+    # Build LIMIT price for Sell FOK:
+    # Цена открытия жёстко около close_price, чтобы НЕ разрешать продавать значительно ниже.
+    tick = float(tick_raw) if tick_raw else 0.0
+    if tick <= 0:
+        logger.error("❌ tickSize is invalid; cannot compute FOK price safely")
+        try:
+            if ws_trade:
+                await ws_trade.stop()
+        except Exception:
+            pass
+        try:
+            if ws_private:
+                await ws_private.stop()
+        except Exception:
+            pass
+        try:
+            await ws_public.stop()
+        except Exception:
+            pass
+        return 0
+    
+    limit_px = float(close_price) - float(OPEN_SAFETY_TICKS) * tick
+    limit_px = po._floor_to_step(limit_px, tick)
+    
+    if limit_px <= 0:
+        logger.warning("⛔ ABORT OPEN: computed limit_px <= 0")
+        try:
+            if ws_trade:
+                await ws_trade.stop()
+        except Exception:
+            pass
+        try:
+            if ws_private:
+                await ws_private.stop()
+        except Exception:
+            pass
+        try:
+            await ws_public.stop()
+        except Exception:
+            pass
+        return 0
+    
+    px_str = po._format_by_step(limit_px, tick_raw)
+    qty_str = po._format_by_step(p.coin_qty, qty_step_raw)
+    
+    # Send order via TRADE WS (fast path)
+    server_ts_ms = int(time.time() * 1000) + int(offset_ms)
+    order = {
+        "category": "linear",
+        "symbol": symbol,
+        "side": "Sell",
+        "orderType": "Limit",
+        "qty": qty_str,
+        "price": px_str,
+        "timeInForce": "FOK",
+        "positionIdx": 2,
+    }
+    
+    logger.info(
+        f"🚀 OPEN(Sell FOK): close_price={_fmt(close_price)} best_bid_now={_fmt(best_bid_now)} "
+        f"limit_px={px_str} qty={qty_str} staleness_ms={st_ms:.0f}"
+    )
+    
+    order_id = None
+    if USE_TRADE_WS == 1 and ws_trade is not None:
+        try:
+            ack = await ws_trade.create_order(order=order, server_ts_ms=server_ts_ms, timeout_sec=1.0)
+            # Извлекаем order_id из ответа
+            result = ack.get("result", {})
+            if isinstance(result, dict):
+                order_id = result.get("orderId")
+            elif isinstance(result, str):
+                order_id = result
+            if not order_id:
+                # Пробуем из data
+                data = ack.get("data", {})
+                if isinstance(data, dict):
+                    order_id = data.get("orderId")
+            logger.info(f"✅ OPEN ACK (trade ws): order_id={order_id} ack={ack.get('data')}")
+        except Exception as e:
+            logger.error(f"❌ OPEN FAILED (trade ws): {type(e).__name__}: {e}")
             try:
-                ws_snap = await ws_client.get_snapshot()
-                if ws_snap.best_bid is not None:
-                    best_bid_now = ws_snap.best_bid
-                    logger.debug(f"📡 Best bid из WebSocket: {best_bid_now}")
-                else:
-                    # Fallback на REST если WS не дал данных
-                    ob_now = await exchange_obj.get_orderbook(p.coin, limit=5)
-                    if ob_now and ob_now.get("bids"):
-                        best_bid_now = float(ob_now["bids"][0][0])
-                        logger.debug(f"📡 Best bid из REST (fallback): {best_bid_now}")
+                if ws_trade:
+                    await ws_trade.stop()
             except Exception:
-                best_bid_now = None
-
-            if best_bid_now and best_bid_now > 0:
-                ded2_now = _deduct_from_best_bid(
-                    float(best_bid_now),
-                    min_ticks=OPEN_PHASE2_MIN_TICKS,
-                    safety_bps=OPEN_PHASE2_SAFETY_BPS,
-                )
-                phase2_base_now = _floor_to_tick(float(best_bid_now) - float(ded2_now))
-                phase2_prices_now = _build_down_ladder(
-                    phase2_base_now,
-                    tries=OPEN_PHASE2_TRIES,
-                    extra_bps=OPEN_PHASE2_EXTRA_BPS,
+                pass
+            try:
+                if ws_private:
+                    await ws_private.stop()
+            except Exception:
+                pass
+            try:
+                await ws_public.stop()
+            except Exception:
+                pass
+            return 0
+    else:
+        # fallback: REST (если вдруг выключишь FUN_USE_TRADE_WS)
+        try:
+            order_id = await _bybit_place_limit(
+                exchange_obj=exchange_obj,
+                api_key=api_key,
+                api_secret=api_secret,
+                coin=p.coin,
+                side="Sell",
+                qty_str=qty_str,
+                price_str=px_str,
+                tif="FOK",
+                reduce_only=None,
+                position_idx=2,
+            )
+            logger.info(f"✅ OPEN (rest): order_id={order_id}")
+        except Exception as e:
+            logger.error(f"❌ OPEN FAILED (rest): {type(e).__name__}: {e}")
+            try:
+                if ws_trade:
+                    await ws_trade.stop()
+            except Exception:
+                pass
+            try:
+                if ws_private:
+                    await ws_private.stop()
+            except Exception:
+                pass
+            try:
+                await ws_public.stop()
+            except Exception:
+                pass
+            return 0
+    
+    # Ждем финального статуса через Private WS (вместо REST polling)
+    if order_id and ws_private and ws_private.ready:
+        try:
+            final = await ws_private.wait_final(str(order_id), timeout=1.5)
+            qty_expected = float(p.coin_qty)
+            if final.status.lower() == "filled" and final.filled_qty >= 0.999 * qty_expected:
+                logger.info(
+                    f"✅ OPEN FILLED (private ws): order_id={order_id} "
+                    f"filled_qty={_fmt(final.filled_qty)} avg_price={_fmt(final.avg_price)}"
                 )
             else:
-                phase2_prices_now = phase2_prices
-
-            for px_try in phase2_prices_now:
-                qty_remain = max(0.0, target_qty - opened)
-                if qty_remain <= 0:
-                    break
-
-                await _place_sell_ioc(qty_remain, float(px_try))
-
-                # маленькая пауза, чтобы позиция успела обновиться
-                time.sleep(0.02)
-
-                short_after = await _bybit_get_short_qty_snapshot(
-                    exchange_obj=exchange_obj,
-                    api_key=api_key,
-                    api_secret=api_secret,
-                    coin=p.coin,
+                logger.warning(
+                    f"⚠️ OPEN NOT FILLED (private ws): order_id={order_id} "
+                    f"status={final.status} filled_qty={_fmt(final.filled_qty)} expected={_fmt(qty_expected)}"
                 )
-                opened = _delta_opened(short_after, short_before)
-
-                if opened >= target_qty - 1e-12:
-                    break
-
-    qty_pos_now = float(short_after)
+        except asyncio.TimeoutError:
+            logger.warning(f"⚠️ OPEN TIMEOUT (private ws): order_id={order_id} - не получили финальный статус за 1.5s")
+        except Exception as e:
+            logger.warning(f"⚠️ OPEN WAIT ERROR (private ws): order_id={order_id} error={type(e).__name__}: {e}")
 
     # Wait until close start time
-    await _sleep_until_epoch_ms(close_local_ms)
+    await _sleep_until_server_ms(close_server_ms, offset_ms)
 
-    # End critical window: re-enable logs
-    if old_disable_level is not None:
-        logging.disable(old_disable_level)
-        old_disable_level = None
-
-    # Print delayed logs here (after critical window)
-    for m in post_logs:
-        logger.info(m)
-    if short_place_errs:
-        logger.warning(f"⚠️ Short: ошибки создания ордера (первые 2): {short_place_errs[:2]}")
-
-    # Compute opened delta
+    # Compute opened delta (check position at close-start, not immediately after open)
     short_after_final = await _bybit_get_short_qty_snapshot(
         exchange_obj=exchange_obj,
         api_key=api_key,
@@ -1802,6 +1739,20 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
 
     if opened_qty <= 0:
         logger.warning("⚠️ Новый Short не открылся (opened_delta=0). Ничего не закрываем. Завершаем.")
+        try:
+            if ws_trade:
+                await ws_trade.stop()
+        except Exception:
+            pass
+        try:
+            if ws_private:
+                await ws_private.stop()
+        except Exception:
+            pass
+        try:
+            await ws_public.stop()
+        except Exception:
+            pass
         return 0
 
     ok_close, avg_exit_short = await po._bybit_close_leg_partial_ioc(
@@ -1844,10 +1795,22 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
     
     # Остановка WebSocket
     try:
-        await ws_client.stop()
-        logger.debug("🔌 WebSocket остановлен")
+        if ws_trade:
+            await ws_trade.stop()
     except Exception as e:
-        logger.warning(f"⚠️ Ошибка при остановке WebSocket: {e}")
+        logger.warning(f"⚠️ Ошибка при остановке Trade WS: {e}")
+    
+    try:
+        if ws_private:
+            await ws_private.stop()
+    except Exception as e:
+        logger.warning(f"⚠️ Ошибка при остановке Private WS: {e}")
+    
+    try:
+        await ws_public.stop()
+        logger.debug("🔌 Public WebSocket остановлен")
+    except Exception as e:
+        logger.warning(f"⚠️ Ошибка при остановке Public WS: {e}")
     
     return 0
 
