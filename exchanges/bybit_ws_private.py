@@ -12,7 +12,7 @@ import json
 import logging
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import websockets
 from websockets.exceptions import ConnectionClosed, WebSocketException
@@ -59,6 +59,13 @@ class BybitPrivateWS:
         
         # order_id -> Future[OrderFinal]
         self._waiters: Dict[str, asyncio.Future] = {}
+
+        # --- position cache (0-REST) ---
+        # key: (symbol, positionIdx, side) where side is "Buy"/"Sell"
+        self._positions: Dict[Tuple[str, int, str], float] = {}
+        self._pos_last_ms: Dict[Tuple[str, int, str], int] = {}
+        self._pos_events: Dict[Tuple[str, int, str], asyncio.Event] = {}
+        self._pos_any = asyncio.Event()
         
         # last update timestamp (monotonic ms)
         self._last_msg_ms: Optional[int] = None
@@ -95,7 +102,7 @@ class BybitPrivateWS:
         
         self._reader_task = asyncio.create_task(self._reader_loop())
         await self._auth()
-        await self._subscribe(["order", "execution"])
+        await self._subscribe(["order", "execution", "position"])
         
         self._ping_task = asyncio.create_task(self._ping_loop())
         self._ready.set()
@@ -130,6 +137,23 @@ class BybitPrivateWS:
             if not fut.done():
                 fut.set_exception(RuntimeError("Private WS stopped"))
         self._waiters.clear()
+
+        # clear position waiters/events
+        try:
+            for _k, ev in list(self._pos_events.items()):
+                try:
+                    ev.set()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        self._pos_events.clear()
+        self._positions.clear()
+        self._pos_last_ms.clear()
+        try:
+            self._pos_any.set()
+        except Exception:
+            pass
         
         try:
             if self._ws:
@@ -245,10 +269,68 @@ class BybitPrivateWS:
                 elif topic == "execution":
                     # если захочешь точнее считать fee/avg — можно расширить
                     pass
+                elif topic == "position":
+                    self._handle_position_updates(data)
         except asyncio.CancelledError:
             return
         except Exception as e:
             logger.error(f"Bybit Private WS reader error: {type(e).__name__}: {e}")
+
+    # ----------------------------
+    # Position cache helpers
+    # ----------------------------
+    @staticmethod
+    def _norm_side(side: Any) -> str:
+        s = str(side or "").strip()
+        if s.lower() == "buy":
+            return "Buy"
+        if s.lower() == "sell":
+            return "Sell"
+        return s
+
+    def get_position_size(self, *, symbol: str, position_idx: int, side: str) -> Optional[float]:
+        """Returns cached position size (abs qty). None if not yet available."""
+        key = (str(symbol), int(position_idx), self._norm_side(side))
+        v = self._positions.get(key)
+        if v is None:
+            return None
+        try:
+            return float(abs(v))
+        except Exception:
+            return None
+
+    def position_staleness_ms(self, *, symbol: str, position_idx: int, side: str) -> Optional[float]:
+        key = (str(symbol), int(position_idx), self._norm_side(side))
+        last = self._pos_last_ms.get(key)
+        if last is None:
+            return None
+        now = int(time.perf_counter() * 1000)
+        return float(max(0, now - int(last)))
+
+    async def wait_position(self, *, symbol: str, position_idx: int, side: str, timeout: float = 2.0) -> bool:
+        """Wait until we have at least one position update for given key."""
+        key = (str(symbol), int(position_idx), self._norm_side(side))
+        if key in self._positions:
+            return True
+        ev = self._pos_events.get(key)
+        if ev is None or ev.is_set():
+            ev = asyncio.Event()
+            self._pos_events[key] = ev
+        try:
+            await asyncio.wait_for(ev.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            return key in self._positions
+        return key in self._positions
+
+    async def wait_any_position(self, timeout: float = 2.0) -> bool:
+        """Wait until any position update arrives (useful right after subscribe)."""
+        if self._pos_any.is_set():
+            return True
+        try:
+            await asyncio.wait_for(self._pos_any.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            return self._pos_any.is_set()
+        return True
     
     def _handle_order_updates(self, items: list[dict]) -> None:
         """Обрабатывает обновления ордеров."""
@@ -289,6 +371,54 @@ class BybitPrivateWS:
                         avg_price=avg_px,
                         raw=it,
                     ))
+
+    def _handle_position_updates(self, items: list[dict]) -> None:
+        """Обрабатывает position updates и обновляет локальный кэш позиций."""
+        now_ms = int(time.perf_counter() * 1000)
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            symbol = str(it.get("symbol") or "").strip()
+            if not symbol:
+                continue
+            try:
+                pidx = int(it.get("positionIdx") or 0)
+            except Exception:
+                pidx = 0
+            if pidx <= 0:
+                # fallback: one-way аккаунт может присылать 0; всё равно кэшируем под 0
+                pidx = 0
+
+            side = self._norm_side(it.get("side") or it.get("positionSide") or "")
+            if not side:
+                # fallback по positionIdx (hedge): 1=Buy, 2=Sell
+                if pidx == 1:
+                    side = "Buy"
+                elif pidx == 2:
+                    side = "Sell"
+                else:
+                    continue
+
+            try:
+                sz = float(it.get("size") or 0.0)
+            except Exception:
+                sz = 0.0
+
+            key = (symbol, int(pidx), side)
+            self._positions[key] = float(abs(sz))
+            self._pos_last_ms[key] = now_ms
+
+            ev = self._pos_events.get(key)
+            if ev is not None:
+                try:
+                    ev.set()
+                except Exception:
+                    pass
+
+            try:
+                self._pos_any.set()
+            except Exception:
+                pass
     
     async def wait_final(self, order_id: str, timeout: float = 2.0) -> OrderFinal:
         """

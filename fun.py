@@ -655,11 +655,33 @@ async def _bybit_get_short_qty_snapshot(
     api_key: str,
     api_secret: str,
     coin: str,
+    ws_private: Optional["BybitPrivateWS"] = None,
+    symbol: Optional[str] = None,
+    position_idx: int = 2,
 ) -> float:
     """
     Snapshot total short size (Sell side) for symbol.
     Use BEFORE/AFTER to compute delta-opened.
     """
+    # Fast path: use Private WS cached position (0-REST)
+    try:
+        if ws_private is not None and getattr(ws_private, "ready", False) and symbol:
+            v = ws_private.get_position_size(symbol=str(symbol), position_idx=int(position_idx), side="Sell")
+            if v is not None:
+                return float(v)
+            # best-effort wait for initial snapshot
+            try:
+                await ws_private.wait_position(symbol=str(symbol), position_idx=int(position_idx), side="Sell", timeout=0.8)
+            except Exception:
+                pass
+            v2 = ws_private.get_position_size(symbol=str(symbol), position_idx=int(position_idx), side="Sell")
+            if v2 is not None:
+                return float(v2)
+    except Exception:
+        # fallback below
+        pass
+
+    # Fallback: REST position/list (can be slow; avoid in critical windows)
     return float(
         await _bybit_get_short_position_qty(
             exchange_obj=exchange_obj,
@@ -1523,13 +1545,18 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
     # Private WS (order/execution stream)
     ws_private = None
     try:
-        logger.info("🔌 WS: запускаем private stream (order/execution)")
+        logger.info("🔌 WS: запускаем private stream (order/execution/position)")
         ws_private = BybitPrivateWS(
             api_key=api_key,
             api_secret=api_secret,
         )
         await ws_private.start()
-        logger.info("✅ Private WS готов (order/execution stream)")
+        # Best-effort: дождаться хотя бы одного position update, чтобы position snapshot был 0-REST
+        try:
+            await ws_private.wait_any_position(timeout=3.0)
+        except Exception:
+            pass
+        logger.info("✅ Private WS готов (order/execution/position stream)")
     except Exception as e:
         logger.error(f"❌ Ошибка запуска Private WS: {e}")
         if ws_private:
@@ -1632,6 +1659,9 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
         api_key=api_key,
         api_secret=api_secret,
         coin=p.coin,
+        ws_private=ws_private,
+        symbol=symbol,
+        position_idx=2,
     )
     logger.info(f"📍 Позиция до входа: short_before={_fmt(short_before)} {p.coin}")
 
@@ -1884,6 +1914,9 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
         api_key=api_key,
         api_secret=api_secret,
         coin=p.coin,
+        ws_private=ws_private,
+        symbol=symbol,
+        position_idx=2,
     )
     opened_qty = max(0.0, float(short_after_final) - float(short_before))
 
@@ -1913,6 +1946,12 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
         position_direction="short",
         coin_amount=float(opened_qty),
         position_idx=2,
+        ws_public=ws_public,
+        ws_trade=ws_trade,
+        ws_private=ws_private,
+        tick_raw=tick_raw,
+        qty_step_raw=qty_step_raw,
+        offset_ms=offset_ms,
     )
     if not ok_close:
         ok_close, avg_exit_short = await po._bybit_close_leg_partial_ioc(
@@ -1921,6 +1960,12 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
             position_direction="short",
             coin_amount=float(opened_qty),
             position_idx=None,
+            ws_public=ws_public,
+            ws_trade=ws_trade,
+            ws_private=ws_private,
+            tick_raw=tick_raw,
+            qty_step_raw=qty_step_raw,
+            offset_ms=offset_ms,
         )
 
     if ok_close:

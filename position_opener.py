@@ -453,6 +453,13 @@ async def _bybit_close_leg_partial_ioc(
     position_direction: str,
     coin_amount: float,
     position_idx: Optional[int] = None,
+    # --- WS fast-path (0-REST in critical window) ---
+    ws_public: Any = None,
+    ws_trade: Any = None,
+    ws_private: Any = None,
+    tick_raw: Optional[str] = None,
+    qty_step_raw: Optional[str] = None,
+    offset_ms: Optional[int] = None,
 ) -> Tuple[bool, Optional[float]]:
     """
     Закрытие позиции на Bybit частями: limit + IOC + reduceOnly.
@@ -483,6 +490,258 @@ async def _bybit_close_leg_partial_ioc(
         return True, None
 
     symbol = exchange_obj._normalize_symbol(coin)
+
+    # -----------------------------
+    # WS fast path (no HTTP orderbook / no HTTP order.create)
+    # -----------------------------
+    if ws_public is not None and ws_trade is not None and tick_raw and qty_step_raw:
+        try:
+            qty_step = float(qty_step_raw) if qty_step_raw else 0.0
+        except Exception:
+            qty_step = 0.0
+        try:
+            tick = float(tick_raw) if tick_raw else 0.0
+        except Exception:
+            tick = 0.0
+
+        if tick <= 0 or qty_step <= 0:
+            logger.error(f"❌ Bybit close(ws): invalid tick/qtyStep | tick={tick_raw!r} qtyStep={qty_step_raw!r}")
+            return False, None
+
+        side_close = "Sell" if pos_dir == "long" else "Buy"
+        price_side = "sell" if side_close == "Sell" else "buy"
+        use_position_idx: Optional[int] = position_idx
+
+        eps = max(1e-10, remaining * 1e-8)
+        total_notional = 0.0
+        total_filled = 0.0
+
+        # настройки эскалации (используем те же env, что и REST-ветка)
+        ESCALATE_EVERY = max(1, int(os.getenv("FUN_CLOSE_ESCALATE_EVERY", "3") or "3"))
+        ESCALATE_TICKS_STEP = max(0, int(os.getenv("FUN_CLOSE_ESCALATE_TICKS_STEP", "2") or "2"))
+        ESCALATE_TICKS_MAX = max(0, int(os.getenv("FUN_CLOSE_ESCALATE_TICKS_MAX", "50") or "50"))
+        MAX_TOTAL_SEC = float(os.getenv("FUN_CLOSE_MAX_TOTAL_SEC", "30.0") or "30.0")
+        RESYNC_EVERY_N = int(os.getenv("FUN_CLOSE_RESYNC_EVERY", "5") or "5")
+        RESYNC_ON_NOFILL = int(os.getenv("FUN_CLOSE_RESYNC_ON_NOFILL", "1") or "1")
+        RESYNC_MIN_INTERVAL_SEC = float(os.getenv("FUN_CLOSE_RESYNC_MIN_INTERVAL", "0.5") or "0.5")
+        CLOSE_FALLBACK_MARKET = int(os.getenv("FUN_CLOSE_FALLBACK_MARKET", "0") or "0")
+
+        start_ts = time.time()
+        last_resync_ts = 0.0
+
+        no_fill_streak = 0
+        escalate_ticks = 0
+
+        # базовая "агрессия" (тики), чтобы IOC был marketable от best_bid/best_ask
+        base_safety_ticks = max(1, int(os.getenv("FUN_CLOSE_WS_SAFETY_TICKS", "2") or "2"))
+
+        def _extract_order_id_from_ack(ack: Any) -> Optional[str]:
+            if not isinstance(ack, dict):
+                return None
+            for path in (
+                ("result", "orderId"),
+                ("data", "orderId"),
+                ("data", "result", "orderId"),
+                ("result", "list", 0, "orderId"),
+                ("data", "list", 0, "orderId"),
+            ):
+                cur: Any = ack
+                ok = True
+                for key in path:
+                    try:
+                        if isinstance(key, int):
+                            cur = cur[key]
+                        else:
+                            cur = cur.get(key)
+                    except Exception:
+                        ok = False
+                        break
+                    if cur is None:
+                        ok = False
+                        break
+                if ok:
+                    try:
+                        s = str(cur)
+                        if s:
+                            return s
+                    except Exception:
+                        pass
+            return None
+
+        def _pos_side_for_dir() -> str:
+            return "Buy" if pos_dir == "long" else "Sell"
+
+        def _pos_size_ws() -> Optional[float]:
+            if ws_private is None or not getattr(ws_private, "ready", False):
+                return None
+            side_pos = _pos_side_for_dir()
+            # hedge first (positionIdx=1/2), then one-way fallback (0)
+            if use_position_idx is not None:
+                v = ws_private.get_position_size(symbol=str(symbol), position_idx=int(use_position_idx), side=side_pos)
+                if v is not None:
+                    return float(v)
+            v0 = ws_private.get_position_size(symbol=str(symbol), position_idx=0, side=side_pos)
+            if v0 is not None:
+                return float(v0)
+            return None
+
+        max_orders_total = max(10, int(os.getenv("FUN_CLOSE_WS_MAX_ORDERS", "80") or "80"))
+
+        for order_n in range(1, max_orders_total + 1):
+            if time.time() - start_ts > MAX_TOTAL_SEC:
+                logger.error(f"❌ Bybit close(ws): timeout {MAX_TOTAL_SEC}s exceeded | remaining={_format_number(remaining)} {coin}")
+                avg_price = (total_notional / total_filled) if total_filled > 0 else None
+                return False, avg_price
+
+            # ресинк remaining по private WS (best-effort), чтобы не закрывать уже закрытое
+            now_ts = time.time()
+            should_resync = False
+            if order_n % max(1, RESYNC_EVERY_N) == 0:
+                should_resync = True
+            elif RESYNC_ON_NOFILL == 1 and no_fill_streak > 0 and (now_ts - last_resync_ts >= RESYNC_MIN_INTERVAL_SEC):
+                should_resync = True
+
+            if should_resync:
+                try:
+                    pos_sz = _pos_size_ws()
+                    if pos_sz is not None:
+                        last_resync_ts = now_ts
+                        if pos_sz <= eps:
+                            avg_price = (total_notional / total_filled) if total_filled > 0 else None
+                            logger.info("✅ Bybit close(ws): позиция уже 0 по Private WS position")
+                            return True, avg_price
+                        remaining = min(remaining, float(pos_sz))
+                except Exception:
+                    pass
+
+            if remaining <= eps:
+                avg_price = (total_notional / total_filled) if total_filled > 0 else None
+                return True, avg_price
+
+            snap = ws_public.snapshot() if hasattr(ws_public, "snapshot") else {}
+            try:
+                best_bid = float(snap.get("best_bid") or 0.0)
+            except Exception:
+                best_bid = 0.0
+            try:
+                best_ask = float(snap.get("best_ask") or 0.0)
+            except Exception:
+                best_ask = 0.0
+
+            if best_bid <= 0 or best_ask <= 0:
+                logger.warning(f"⚠️ Bybit close(ws): no bid/ask from Public WS | bid={best_bid} ask={best_ask}")
+                await asyncio.sleep(0)
+                continue
+
+            # вычисляем marketable цену от best bid/ask + эскалация
+            safety_ticks = int(base_safety_ticks) + int(escalate_ticks)
+            if side_close == "Buy":
+                px = best_ask + float(safety_ticks) * tick
+                px = _round_price_for_side(px, tick, "buy")
+            else:
+                px = best_bid - float(safety_ticks) * tick
+                px = _round_price_for_side(px, tick, "sell")
+
+            qty_send = remaining
+            qty_send = _floor_to_step(qty_send, qty_step)
+            if qty_send <= 0:
+                avg_price = (total_notional / total_filled) if total_filled > 0 else None
+                return True, avg_price
+
+            qty_str = _format_by_step(qty_send, qty_step_raw)
+            px_str = _format_by_step(px, tick_raw)
+
+            logger.info(
+                f"Bybit close(ws): ордер {order_n}/{max_orders_total} | side={side_close} qty={qty_str} "
+                f"| px={px_str} | remaining={_format_number(remaining)} | no_fill_streak={no_fill_streak} "
+                f"| escalate_ticks={escalate_ticks}"
+            )
+
+            server_ts_ms = int(time.time() * 1000) + int(offset_ms or 0)
+            order = {
+                "category": "linear",
+                "symbol": str(symbol),
+                "side": side_close,
+                "orderType": "Limit",
+                "qty": qty_str,
+                "price": px_str,
+                "timeInForce": "IOC",
+                "reduceOnly": True,
+            }
+            if use_position_idx is not None:
+                order["positionIdx"] = int(use_position_idx)
+
+            try:
+                ack = await ws_trade.create_order(order=order, server_ts_ms=server_ts_ms, timeout_sec=1.5)
+            except Exception as e:
+                logger.error(f"❌ Bybit close(ws): order.create failed: {type(e).__name__}: {e}")
+                return False, (total_notional / total_filled) if total_filled > 0 else None
+
+            order_id = _extract_order_id_from_ack(ack)
+
+            filled_now = 0.0
+            avg_now: Optional[float] = None
+
+            if order_id and ws_private is not None and getattr(ws_private, "ready", False):
+                try:
+                    final = await ws_private.wait_final(str(order_id), timeout=2.0)
+                    filled_now = float(final.filled_qty or 0.0)
+                    avg_now = final.avg_price
+                except asyncio.TimeoutError:
+                    # IOC может успеть "cancelled" без апдейта; ресинк по position поможет на следующем цикле
+                    filled_now = 0.0
+                    avg_now = None
+                except Exception:
+                    filled_now = 0.0
+                    avg_now = None
+
+            if filled_now > eps:
+                no_fill_streak = 0
+                try:
+                    px_use = float(avg_now) if avg_now is not None else float(px)
+                except Exception:
+                    px_use = float(px)
+                total_notional += float(filled_now) * float(px_use)
+                total_filled += float(filled_now)
+                remaining = max(0.0, float(remaining) - float(filled_now))
+            else:
+                no_fill_streak += 1
+                if (no_fill_streak % ESCALATE_EVERY) == 0:
+                    escalate_ticks = min(int(ESCALATE_TICKS_MAX), int(escalate_ticks) + int(ESCALATE_TICKS_STEP))
+
+            if remaining <= eps:
+                avg_price = (total_notional / total_filled) if total_filled > 0 else None
+                return True, avg_price
+
+            # fallback: market reduceOnly через Trade WS (без REST), если включено
+            if CLOSE_FALLBACK_MARKET == 1 and (time.time() - start_ts) > max(0.5, float(MAX_TOTAL_SEC) * 0.7):
+                try:
+                    qty_m = _floor_to_step(remaining, qty_step)
+                    if qty_m > 0:
+                        qty_m_str = _format_by_step(qty_m, qty_step_raw)
+                        order_m = {
+                            "category": "linear",
+                            "symbol": str(symbol),
+                            "side": side_close,
+                            "orderType": "Market",
+                            "qty": qty_m_str,
+                            "reduceOnly": True,
+                        }
+                        if use_position_idx is not None:
+                            order_m["positionIdx"] = int(use_position_idx)
+                        server_ts_ms2 = int(time.time() * 1000) + int(offset_ms or 0)
+                        await ws_trade.create_order(order=order_m, server_ts_ms=server_ts_ms2, timeout_sec=2.0)
+                except Exception:
+                    pass
+
+            await asyncio.sleep(0)
+
+        avg_price = (total_notional / total_filled) if total_filled > 0 else None
+        return False, avg_price
+
+    # -----------------------------
+    # REST path (legacy)
+    # -----------------------------
     f = await _bybit_fetch_instrument_filters(exchange_obj=exchange_obj, symbol=symbol)
 
     qty_step_raw = f.get("qtyStep")
