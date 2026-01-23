@@ -1,3 +1,4 @@
+# exchanges/bybit_ws_trade.py
 """
 Bybit WebSocket Trade (v5): place/amend/cancel orders via websocket.
 
@@ -23,11 +24,11 @@ logger = logging.getLogger(__name__)
 class BybitTradeWS:
     """
     Bybit WS Trade (v5): place/amend/cancel orders via websocket.
-    
+
     Endpoint: wss://stream.bybit.com/v5/trade  (mainnet)
     Docs: Websocket Trade Guideline.
     """
-    
+
     def __init__(
         self,
         *,
@@ -45,107 +46,147 @@ class BybitTradeWS:
         self.recv_window_ms = int(recv_window_ms)
         self.referer = referer
         self.ping_interval_sec = float(ping_interval_sec)
+
         self._ws = None
         self._reader_task: Optional[asyncio.Task] = None
         self._ping_task: Optional[asyncio.Task] = None
+
         self._ready = asyncio.Event()
+        self._auth_future: Optional[asyncio.Future] = None
         self._pending: Dict[str, asyncio.Future] = {}
+
         self._log = logger or logging.getLogger(__name__)
-    
+        self._start_lock = asyncio.Lock()
+        self._stop_lock = asyncio.Lock()
+
+    @property
+    def ready(self) -> bool:
+        return self._ready.is_set()
+
     def _log_info(self, msg: str) -> None:
-        if self._log:
+        try:
             self._log.info(msg)
-    
+        except Exception:
+            pass
+
     def _log_warn(self, msg: str) -> None:
-        if self._log:
+        try:
             self._log.warning(msg)
-    
+        except Exception:
+            pass
+
     def _log_err(self, msg: str) -> None:
-        if self._log:
+        try:
             self._log.error(msg)
-    
+        except Exception:
+            pass
+
     def _sign_ws_auth(self, expires_ms: int) -> str:
         """
         signature = HMAC_SHA256(secret, f"GET/realtime{expires}")
         """
         payload = f"GET/realtime{int(expires_ms)}".encode("utf-8")
         return hmac.new(self.api_secret.encode("utf-8"), payload, hashlib.sha256).hexdigest()
-    
+
     async def start(self) -> None:
         """Запускает Trade WS и выполняет аутентификацию."""
-        if self._ws is not None:
-            return
-        
-        self._ready.clear()
-        
-        try:
-            self._ws = await websockets.connect(self.url, ping_interval=None, max_queue=None)
-            self._log_info("Bybit Trade WS: подключено")
-        except Exception as e:
-            self._log_err(f"Bybit Trade WS: ошибка подключения: {e}")
-            raise
-        
-        self._reader_task = asyncio.create_task(self._reader_loop())
-        self._ping_task = asyncio.create_task(self._ping_loop())
-        
-        # --- AUTH ---
-        expires = int(time.time() * 1000) + 10_000
-        sig = self._sign_ws_auth(expires)
-        auth_msg = {"op": "auth", "args": [self.api_key, str(expires), sig]}
-        
-        try:
-            await self._ws.send(json.dumps(auth_msg))
-            self._log_info("Bybit Trade WS: отправлен auth запрос")
-        except Exception as e:
-            self._log_err(f"Bybit Trade WS: ошибка отправки auth: {e}")
+        async with self._start_lock:
+            if self._ws is not None and self._reader_task and not self._reader_task.done() and self.ready:
+                return
+
+            # reset state
+            self._ready.clear()
+            # close if half-open
             await self.stop()
-            raise
-        
-        # ждём подтверждения auth
-        try:
-            await asyncio.wait_for(self._ready.wait(), timeout=5.0)
-            self._log_info("Bybit Trade WS: authenticated")
-        except asyncio.TimeoutError:
-            self._log_err("Bybit Trade WS: timeout ожидания auth")
-            await self.stop()
-            raise RuntimeError("Trade WS auth timeout")
-    
+
+            loop = asyncio.get_running_loop()
+            self._auth_future = loop.create_future()
+
+            try:
+                self._ws = await websockets.connect(self.url, ping_interval=None, max_queue=None)
+                self._log_info("Bybit Trade WS: подключено")
+            except Exception as e:
+                self._log_err(f"Bybit Trade WS: ошибка подключения: {e}")
+                self._ws = None
+                raise
+
+            self._reader_task = asyncio.create_task(self._reader_loop())
+            self._ping_task = asyncio.create_task(self._ping_loop())
+
+            # --- AUTH ---
+            expires = int(time.time() * 1000) + 10_000
+            sig = self._sign_ws_auth(expires)
+            auth_msg = {"op": "auth", "args": [self.api_key, str(expires), sig]}
+
+            try:
+                await self._ws.send(json.dumps(auth_msg))
+                self._log_info("Bybit Trade WS: отправлен auth запрос")
+            except Exception as e:
+                self._log_err(f"Bybit Trade WS: ошибка отправки auth: {e}")
+                await self.stop()
+                raise
+
+            # wait for auth result (success or exception)
+            try:
+                await asyncio.wait_for(self._auth_future, timeout=5.0)
+                self._ready.set()
+                self._log_info("Bybit Trade WS: authenticated")
+            except asyncio.TimeoutError:
+                self._log_err("Bybit Trade WS: timeout ожидания auth")
+                await self.stop()
+                raise RuntimeError("Trade WS auth timeout")
+            except Exception as e:
+                self._log_err(f"Bybit Trade WS: auth failed: {e}")
+                await self.stop()
+                raise
+
     async def stop(self) -> None:
-        """Останавливает Trade WS."""
-        try:
-            if self._ping_task:
+        """Останавливает Trade WS (idempotent)."""
+        async with self._stop_lock:
+            # fail pending immediately
+            for _, fut in list(self._pending.items()):
+                if not fut.done():
+                    fut.set_exception(RuntimeError("WS stopped"))
+            self._pending.clear()
+
+            self._ready.clear()
+
+            # cancel tasks (avoid awaiting a task from inside itself)
+            cur = asyncio.current_task()
+
+            if self._ping_task and self._ping_task is not cur:
                 self._ping_task.cancel()
                 try:
                     await self._ping_task
                 except asyncio.CancelledError:
                     pass
-        except Exception:
-            pass
-        
-        try:
-            if self._reader_task:
+                except Exception:
+                    pass
+            self._ping_task = None
+
+            if self._reader_task and self._reader_task is not cur:
                 self._reader_task.cancel()
                 try:
                     await self._reader_task
                 except asyncio.CancelledError:
                     pass
-        except Exception:
-            pass
-        
-        # fail all pending
-        for k, fut in list(self._pending.items()):
-            if not fut.done():
-                fut.set_exception(RuntimeError("WS stopped"))
-        self._pending.clear()
-        
-        try:
-            if self._ws is not None:
-                await self._ws.close()
-        except Exception:
-            pass
-        finally:
+                except Exception:
+                    pass
+            self._reader_task = None
+
+            # close socket
+            try:
+                if self._ws is not None:
+                    await self._ws.close()
+            except Exception:
+                pass
             self._ws = None
-    
+
+            # auth future
+            if self._auth_future is not None and not self._auth_future.done():
+                self._auth_future.set_exception(RuntimeError("WS stopped"))
+            self._auth_future = None
+
     async def _ping_loop(self) -> None:
         """Отправляет ping для поддержания соединения."""
         try:
@@ -165,14 +206,14 @@ class BybitTradeWS:
                     return
         except asyncio.CancelledError:
             return
-    
+
     async def _reader_loop(self) -> None:
         """Читает сообщения из WebSocket."""
         try:
             while True:
                 if self._ws is None:
                     return
-                
+
                 try:
                     raw = await self._ws.recv()
                 except (ConnectionClosed, WebSocketException) as e:
@@ -183,25 +224,27 @@ class BybitTradeWS:
                     self._log_err(f"Bybit Trade WS: ошибка чтения: {e}")
                     await self.stop()
                     return
-                
+
                 try:
                     msg = json.loads(raw)
                 except json.JSONDecodeError:
-                    self._log_warn(f"Bybit Trade WS: невалидный JSON: {raw[:200]}")
+                    self._log_warn(f"Bybit Trade WS: невалидный JSON: {str(raw)[:200]}")
                     continue
-                
+
                 # auth response
                 if msg.get("op") == "auth":
-                    # Trade WS: success критерий = retCode == 0
-                    if msg.get("retCode") == 0:
-                        self._ready.set()
-                        self._log_info("Bybit Trade WS: authenticated")
-                    else:
-                        self._ready.set()
-                        raise RuntimeError(f"Bybit Trade WS auth failed: {msg}")
+                    if self._auth_future is not None and not self._auth_future.done():
+                        if msg.get("retCode") == 0:
+                            self._auth_future.set_result(True)
+                        else:
+                            self._auth_future.set_exception(RuntimeError(f"auth failed: {msg}"))
                     continue
-                
-                # match reqId
+
+                # pong / ping responses can be ignored
+                if msg.get("op") in ("pong", "ping"):
+                    continue
+
+                # match reqId for request-response ops (order.create/amend/cancel)
                 req_id = msg.get("reqId")
                 if req_id and req_id in self._pending:
                     fut = self._pending.pop(req_id)
@@ -211,12 +254,15 @@ class BybitTradeWS:
             return
         except Exception as e:
             self._log_err(f"Bybit Trade WS reader error: {type(e).__name__}: {e}")
-            # fail pending
-            for k, fut in list(self._pending.items()):
+            # fail all pending
+            for _, fut in list(self._pending.items()):
                 if not fut.done():
                     fut.set_exception(e)
             self._pending.clear()
-    
+            # fail auth if waiting
+            if self._auth_future is not None and not self._auth_future.done():
+                self._auth_future.set_exception(e)
+
     async def create_order(
         self,
         *,
@@ -228,17 +274,17 @@ class BybitTradeWS:
     ) -> Dict[str, Any]:
         """
         Sends WS 'order.create' and returns ACK response.
-        
-        Important: ACK != Filled. Use order-stream / position check later.
-        
+
+        Important: ACK != Filled. Use order-stream / executions later.
+
         Request example and header fields are from Bybit WS trade guideline.
         """
-        if self._ws is None:
-            raise RuntimeError("Trade WS not started")
-        
+        if self._ws is None or not self.ready:
+            raise RuntimeError("Trade WS not started/authenticated")
+
         rid = req_id or str(uuid.uuid4())
         rw = int(self.recv_window_ms if recv_window_ms is None else recv_window_ms)
-        
+
         msg = {
             "reqId": rid,
             "header": {
@@ -249,30 +295,29 @@ class BybitTradeWS:
             "op": "order.create",
             "args": [order],
         }
-        
+
         fut = asyncio.get_running_loop().create_future()
         self._pending[rid] = fut
-        
+
         try:
             await self._ws.send(json.dumps(msg))
         except Exception as e:
             self._pending.pop(rid, None)
             raise RuntimeError(f"Failed to send order.create: {e}")
-        
+
         try:
             resp = await asyncio.wait_for(fut, timeout=timeout_sec)
         except asyncio.TimeoutError:
             self._pending.pop(rid, None)
             raise RuntimeError(f"order.create timeout after {timeout_sec}s")
-        
+
         if not isinstance(resp, dict):
             raise RuntimeError(f"Bad WS response: {resp}")
-        
+
         if resp.get("retCode") != 0:
             raise RuntimeError(
                 f"order.create retCode={resp.get('retCode')} "
                 f"retMsg={resp.get('retMsg')} resp={resp}"
             )
-        
-        return resp
 
+        return resp

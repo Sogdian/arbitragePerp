@@ -1,4 +1,3 @@
-# fun.py
 import asyncio
 import logging
 import os
@@ -249,12 +248,12 @@ async def _sleep_until_server_ms(target_server_ms: int, offset_ms: int) -> None:
 def _extract_order_id_from_trade_ack(ack: dict) -> Optional[str]:
     """
     Извлекает order_id из ответа Trade WS create_order.
-    
+
     Bybit Trade WS ответы могут иметь разную структуру, поэтому проверяем несколько путей.
     """
     if not isinstance(ack, dict):
         return None
-    
+
     for path in (
         ("result", "orderId"),
         ("data", "orderId"),
@@ -280,7 +279,7 @@ def _extract_order_id_from_trade_ack(ack: dict) -> Optional[str]:
                     return s
             except Exception:
                 pass
-    
+
     return None
 
 
@@ -344,7 +343,7 @@ async def _bybit_place_limit(
     Place limit order via REST with automatic retry on positionIdx mismatch (retCode=10001).
     """
     symbol = exchange_obj._normalize_symbol(coin)
-    
+
     # Первая попытка с указанным position_idx
     body: Dict[str, Any] = {
         "category": "linear",
@@ -396,7 +395,7 @@ async def _bybit_place_limit(
         raise
     except Exception as e:
         raise RuntimeError(f"Bybit create order error: {e}")
-    
+
     order_id = (data.get("result") or {}).get("orderId") if isinstance(data.get("result"), dict) else None
     if not order_id:
         raise RuntimeError(f"Bybit create order: no orderId: {data}")
@@ -684,7 +683,7 @@ async def _bybit_get_short_qty_snapshot(
     coin: str,
     ws_private: Optional["BybitPrivateWS"] = None,
     symbol: Optional[str] = None,
-    position_idx: int = 2,
+    position_idx: int = 0,  # FIX: default to 0 (one-way) чтобы WS fast-path работал без REST
 ) -> float:
     """
     Snapshot total short size (Sell side) for symbol.
@@ -1151,7 +1150,7 @@ async def _bybit_test_orders(bot: PerpArbitrageBot, coin: str, qty_test: float) 
                     price_str=px_open_str,
                     tif="FOK",
                     reduce_only=None,
-                    position_idx=2,
+                    position_idx=0,  # FIX: default one-way
                 )
             except Exception:
                 short_order_id = await _bybit_place_limit(
@@ -1239,7 +1238,7 @@ async def _bybit_test_orders(bot: PerpArbitrageBot, coin: str, qty_test: float) 
                     price_str=px_close_str,
                     tif="IOC",
                     reduce_only=True,
-                    position_idx=2,
+                    position_idx=0,  # FIX: default one-way
                 )
             except Exception:
                 close_order_id = await _bybit_place_limit(
