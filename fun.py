@@ -1,11 +1,14 @@
 import asyncio
+import atexit
 import logging
 import os
+import queue as _queue
 import re
 import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from logging.handlers import QueueHandler, QueueListener
 from typing import Any, Dict, List, Optional, Tuple
 
 from bot import PerpArbitrageBot
@@ -51,16 +54,39 @@ load_dotenv(".env")
 LOG_LEVEL = os.getenv("FUN_LOG_LEVEL", "INFO").upper()
 LOG_FILE = os.getenv("FUN_LOG_FILE", "fun.log")
 
-logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL, logging.INFO),
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    handlers=[
-        logging.FileHandler(LOG_FILE, encoding="utf-8"),
-        logging.StreamHandler(sys.stdout),
-    ],
-    force=True,
-)
+def _setup_async_logging() -> QueueListener:
+    """
+    Async logging via QueueHandler/QueueListener to avoid blocking IO in critical windows.
+    Timestamps are preserved (LogRecord.created is set at emit time).
+    """
+    level = getattr(logging, LOG_LEVEL, logging.INFO)
+    fmt = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 
+    file_h = logging.FileHandler(LOG_FILE, encoding="utf-8")
+    file_h.setLevel(level)
+    file_h.setFormatter(logging.Formatter(fmt))
+
+    stream_h = logging.StreamHandler(sys.stdout)
+    stream_h.setLevel(level)
+    stream_h.setFormatter(logging.Formatter(fmt))
+
+    q: _queue.Queue = _queue.Queue(maxsize=20000)
+    qh = QueueHandler(q)
+    qh.setLevel(level)
+
+    root = logging.getLogger()
+    root.handlers = []
+    root.setLevel(level)
+    root.addHandler(qh)
+
+    listener = QueueListener(q, file_h, stream_h, respect_handler_level=True)
+    listener.daemon = True
+    listener.start()
+    atexit.register(lambda: listener.stop())
+    return listener
+
+
+_LOG_LISTENER = _setup_async_logging()
 logger = logging.getLogger("fun")
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("bot").setLevel(logging.CRITICAL)
@@ -114,6 +140,12 @@ OPEN_HARD_DOWN_BPS = float(os.getenv("FUN_OPEN_HARD_DOWN_BPS", "2500"))     # 25
 # open safety for Sell IOC (use fixed snapshot; no runtime orderbook calls)
 OPEN_SAFETY_BPS = float(os.getenv("FUN_OPEN_SAFETY_BPS", "10"))                 # 10 bps = 0.10%
 OPEN_SAFETY_MIN_TICKS = int(os.getenv("FUN_OPEN_SAFETY_MIN_TICKS", "3"))        # min ticks below best_bid_fix
+
+# Admission model (bps) for entry: widen limit to survive post-payout repricing
+OPEN_ENTRY_BPS_BASE = float(os.getenv("FUN_OPEN_ENTRY_BPS_BASE", "30"))
+OPEN_ENTRY_BPS_FUNDING_MULT = float(os.getenv("FUN_OPEN_ENTRY_BPS_FUNDING_MULT", "0.9"))
+OPEN_ENTRY_BPS_MIN = float(os.getenv("FUN_OPEN_ENTRY_BPS_MIN", "30"))
+OPEN_ENTRY_BPS_MAX = float(os.getenv("FUN_OPEN_ENTRY_BPS_MAX", str(OPEN_HARD_DOWN_BPS)))
 
 # open ladder (multiple IOC create attempts, no orderbook/status calls in critical window)
 OPEN_IOC_TRIES = int(os.getenv("FUN_OPEN_IOC_TRIES", "3"))
@@ -178,6 +210,27 @@ def _parse_pct(s: str) -> float:
     if not m:
         raise ValueError(f"bad percent: {s!r} (expected like -2% or -0.3%)")
     return float(m.group(1)) / 100.0
+
+
+def _compute_entry_bps(*, funding_pct: float, offset_pct: float) -> float:
+    """
+    Computes how wide we allow the market to move down from ref price for entry (in bps).
+    For post-payout: Sell IOC should be marketable even after immediate bid drop.
+    """
+    try:
+        fr_bps = abs(float(funding_pct)) * 10_000.0
+    except Exception:
+        fr_bps = 0.0
+
+    try:
+        user_down_bps = max(0.0, -float(offset_pct) * 10_000.0)
+    except Exception:
+        user_down_bps = 0.0
+
+    bps = float(OPEN_ENTRY_BPS_BASE) + float(OPEN_ENTRY_BPS_FUNDING_MULT) * fr_bps + user_down_bps
+    bps = max(float(OPEN_ENTRY_BPS_MIN), bps)
+    bps = min(float(OPEN_ENTRY_BPS_MAX), bps)
+    return float(bps)
 
 
 def _normalize_epoch_ms(x: Any) -> Optional[int]:
@@ -1529,6 +1582,12 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
         f"px_pre={_fmt(last_px_pre)} | notional~{_fmt(notional_pre, 3)} USDT | "
         f"est_funding~{_fmt(est_funding_usdt, 4)} USDT (sign included)"
     )
+    entry_bps_plan = _compute_entry_bps(funding_pct=float(p.funding_pct), offset_pct=float(p.offset_pct))
+    logger.info(
+        f"🧮 ENTRY PLAN (bps): entry_bps_plan={entry_bps_plan:.1f} | "
+        f"base={OPEN_ENTRY_BPS_BASE:.1f} mult={OPEN_ENTRY_BPS_FUNDING_MULT:.3f} "
+        f"min={OPEN_ENTRY_BPS_MIN:.1f} max={OPEN_ENTRY_BPS_MAX:.1f}"
+    )
     if p.next_funding_time_ms:
         logger.info(f"🕒 NEXT FUNDING (server ms): {int(p.next_funding_time_ms)}")
 
@@ -1549,6 +1608,22 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
     if now_server_est_ms > payout_server_ms + int(max(0, int(LATE_TOL_MS))):
         logger.error("❌ Скрипт запущен слишком поздно относительно времени выплаты (по server time Bybit)")
         return 2
+
+    # Baseline short BEFORE critical window (REST is acceptable here).
+    # В критическом окне (fix/open/close) не делаем REST/await для входа.
+    short_before = 0.0
+    try:
+        short_before = float(
+            await _bybit_get_short_position_qty(
+                exchange_obj=exchange_obj,
+                api_key=api_key,
+                api_secret=api_secret,
+                coin=p.coin,
+            )
+        )
+    except Exception:
+        short_before = 0.0
+    logger.info(f"📍 Baseline short BEFORE window: short_before={_fmt(short_before)} {p.coin}")
 
     # --- START WS EARLY (public + trade) ---
     symbol = exchange_obj._normalize_symbol(p.coin)
@@ -1750,10 +1825,18 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
     ref_px = float(close_price)
     if best_bid_fix is not None:
         ref_px = min(ref_px, float(best_bid_fix))
-    
-    # offset_pct можно учитывать как "толеранс" (если хочешь); если нет — оставь 0.
-    limit_px = ref_px * (1.0 + float(p.offset_pct))
-    limit_px = limit_px - float(OPEN_SAFETY_TICKS) * tick
+
+    # Entry price model (bps): делаем Sell IOC marketable даже при резком падении bid после payout.
+    down_mult = float(entry_bps_plan) / 10_000.0
+    limit_px = ref_px * (1.0 - down_mult)
+
+    # минимум N тиков ниже best_bid_fix (если вдруг bps-модель дала слишком "узко")
+    if best_bid_fix is not None:
+        px_from_ticks = float(best_bid_fix) - float(max(1, int(OPEN_SAFETY_MIN_TICKS))) * tick
+        limit_px = min(limit_px, px_from_ticks)
+
+    # доп. агрессия тиками
+    limit_px = limit_px - float(max(0, int(OPEN_SAFETY_TICKS))) * tick
     limit_px = po._floor_to_step(limit_px, tick)
     
     if limit_px <= 0:
@@ -1790,21 +1873,10 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
     
     logger.info(
         f"🧷 OPEN PREPARED: close_price={_fmt(close_price)} best_bid_fix={_fmt(best_bid_fix)} "
-        f"ref_px={_fmt(ref_px)} limit_px={px_str} qty={qty_str} (safety_ticks={OPEN_SAFETY_TICKS})"
+        f"ref_px={_fmt(ref_px)} entry_bps_plan={entry_bps_plan:.1f} "
+        f"limit_px={px_str} qty={qty_str} (safety_ticks={OPEN_SAFETY_TICKS}, min_ticks={OPEN_SAFETY_MIN_TICKS})"
     )
-    
-    # Snapshot existing short BEFORE open (если у тебя уже переведено на WS — ок)
-    short_before = await _bybit_get_short_qty_snapshot(
-        exchange_obj=exchange_obj,
-        api_key=api_key,
-        api_secret=api_secret,
-        coin=p.coin,
-        ws_private=ws_private,
-        symbol=symbol,
-        position_idx=int(position_idx),
-    )
-    logger.info(f"📍 Позиция до входа: short_before={_fmt(short_before)} {p.coin}")
-    
+
     # --- OPEN AT PAYOUT (minimal work) ---
     await _sleep_until_server_ms(open_server_ms, offset_ms)
     
@@ -1894,9 +1966,14 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
             order_id = None
     
     # Ждём финальный статус через Private WS (без REST polling)
+    open_filled_qty: Optional[float] = None
     if order_id and ws_private and ws_private.ready:
         try:
             final = await ws_private.wait_final(str(order_id), timeout=1.5)
+            try:
+                open_filled_qty = float(final.filled_qty or 0.0)
+            except Exception:
+                open_filled_qty = None
             qty_expected = float(p.coin_qty)
             if final.status.lower() == "filled" and final.filled_qty >= 0.999 * qty_expected:
                 logger.info(
@@ -1925,19 +2002,28 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
             "Проверяем позицию на случай, если ордер всё же был создан/исполнен"
         )
 
-    # Compute opened delta (check position at close-start, not immediately after open)
-    short_after_final = await _bybit_get_short_qty_snapshot(
-        exchange_obj=exchange_obj,
-        api_key=api_key,
-        api_secret=api_secret,
-        coin=p.coin,
-        ws_private=ws_private,
-        symbol=symbol,
-        position_idx=int(position_idx),
-    )
-    opened_qty = max(0.0, float(short_after_final) - float(short_before))
-
-    logger.info(f"📍 Позиция после входа: short_after={_fmt(short_after_final)} | opened_delta={_fmt(opened_qty)} {p.coin}")
+    # Закрытие — по факту исполнения OPEN (filled_qty из private WS), а не по дельте позиции.
+    opened_qty = 0.0
+    short_after_final: Optional[float] = None
+    if open_filled_qty is not None and float(open_filled_qty) > 1e-12:
+        opened_qty = float(open_filled_qty)
+        logger.info(f"📍 CLOSE PLAN: using open_filled_qty from private ws = {_fmt(opened_qty)} {p.coin}")
+    else:
+        # fallback: проверяем позицию уже ПОСЛЕ close_delay (не в критическом окне)
+        short_after_final = await _bybit_get_short_qty_snapshot(
+            exchange_obj=exchange_obj,
+            api_key=api_key,
+            api_secret=api_secret,
+            coin=p.coin,
+            ws_private=ws_private,
+            symbol=symbol,
+            position_idx=int(position_idx),
+        )
+        opened_qty = max(0.0, float(short_after_final) - float(short_before))
+        logger.info(
+            f"📍 Позиция после входа (fallback): short_after={_fmt(short_after_final)} "
+            f"| baseline_before={_fmt(short_before)} | opened_delta={_fmt(opened_qty)} {p.coin}"
+        )
 
     if opened_qty <= 0:
         if order_id is None:
