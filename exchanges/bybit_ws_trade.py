@@ -155,9 +155,13 @@ class BybitTradeWS:
                     return
                 try:
                     await self._ws.send(json.dumps({"op": "ping"}))
-                except (ConnectionClosed, WebSocketException):
+                except (ConnectionClosed, WebSocketException) as e:
+                    self._log_warn(f"Bybit Trade WS ping failed: {e}")
+                    await self.stop()
                     return
-                except Exception:
+                except Exception as e:
+                    self._log_warn(f"Bybit Trade WS ping error: {e}")
+                    await self.stop()
                     return
         except asyncio.CancelledError:
             return
@@ -173,10 +177,12 @@ class BybitTradeWS:
                     raw = await self._ws.recv()
                 except (ConnectionClosed, WebSocketException) as e:
                     self._log_warn(f"Bybit Trade WS: соединение закрыто: {e}")
-                    break
+                    await self.stop()
+                    return
                 except Exception as e:
                     self._log_err(f"Bybit Trade WS: ошибка чтения: {e}")
-                    break
+                    await self.stop()
+                    return
                 
                 try:
                     msg = json.loads(raw)
