@@ -54,69 +54,32 @@ load_dotenv(".env")
 LOG_LEVEL = os.getenv("FUN_LOG_LEVEL", "INFO").upper()
 LOG_FILE = os.getenv("FUN_LOG_FILE", "fun.log")
 
-_LOG_QUEUE: Optional[_queue.Queue] = None
-_LOG_LISTENER: Optional[QueueListener] = None
+# Queue-based logging to avoid I/O stalls in critical trading windows
+_LOG_LEVEL = getattr(logging, LOG_LEVEL, logging.INFO)
+_log_queue = _queue.SimpleQueue()
+_queue_handler = QueueHandler(_log_queue)
 
+# Root logger -> QueueHandler only (fast, non-blocking)
+_root = logging.getLogger()
+_root.setLevel(_LOG_LEVEL)
+for _h in list(_root.handlers):
+    _root.removeHandler(_h)
+_root.addHandler(_queue_handler)
 
-class NonBlockingQueueHandler(QueueHandler):
-    """
-    QueueHandler that never blocks: drops messages if queue is full.
-    Critical for trading code - logging must never delay order execution.
-    """
-    def emit(self, record: logging.LogRecord) -> None:
-        try:
-            # Use put_nowait to avoid blocking. If queue is full, drop the message.
-            self.queue.put_nowait(record)
-        except _queue.Full:
-            # Queue is full - drop the message silently to avoid blocking trading code
-            pass
-        except Exception:
-            # Any other error - also drop silently to avoid blocking trading code
-            pass
+# Real handlers (I/O) run in a separate listener thread
+_fmt_str = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+_formatter = logging.Formatter(_fmt_str)
 
+_file_h = logging.FileHandler(LOG_FILE, encoding="utf-8")
+_file_h.setFormatter(_formatter)
 
-def _setup_async_logging() -> Tuple[QueueListener, _queue.Queue]:
-    """
-    Async logging via QueueHandler/QueueListener to avoid blocking IO in critical windows.
-    Timestamps are preserved (LogRecord.created is set at emit time).
-    Uses NonBlockingQueueHandler to ensure logging never blocks order execution.
-    """
-    level = getattr(logging, LOG_LEVEL, logging.INFO)
-    fmt = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+_stream_h = logging.StreamHandler(sys.stdout)
+_stream_h.setFormatter(_formatter)
 
-    file_h = logging.FileHandler(LOG_FILE, encoding="utf-8")
-    file_h.setLevel(level)
-    file_h.setFormatter(logging.Formatter(fmt))
+_listener = QueueListener(_log_queue, _file_h, _stream_h, respect_handler_level=True)
+_listener.start()
+atexit.register(lambda: _listener.stop())
 
-    stream_h = logging.StreamHandler(sys.stdout)
-    stream_h.setLevel(level)
-    stream_h.setFormatter(logging.Formatter(fmt))
-
-    q: _queue.Queue = _queue.Queue(maxsize=20000)
-    qh = NonBlockingQueueHandler(q)  # Non-blocking: drops messages if queue full
-    qh.setLevel(level)
-
-    root = logging.getLogger()
-    root.handlers = []
-    root.setLevel(level)
-    root.addHandler(qh)
-
-    listener = QueueListener(q, file_h, stream_h, respect_handler_level=True)
-    listener.daemon = True
-    listener.start()
-
-    def _stop_listener_safely() -> None:
-        try:
-            listener.stop()
-        except Exception:
-            # On process exit the queue can be full (sentinel enqueue fails); ignore.
-            pass
-
-    atexit.register(_stop_listener_safely)
-    return listener, q
-
-
-_LOG_LISTENER, _LOG_QUEUE = _setup_async_logging()
 logger = logging.getLogger("fun")
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("bot").setLevel(logging.CRITICAL)
@@ -130,22 +93,17 @@ def _flush_logs() -> None:
     Flush async logging queue before blocking operations (like input()).
     Waits until queue is empty to ensure all logs are written.
     """
-    if _LOG_QUEUE is None:
-        return
-    # Give QueueListener time to process all pending logs
-    # QueueListener runs in a separate thread, so we just need to wait a bit
     import time
     for _ in range(50):  # max 500ms wait
-        if _LOG_QUEUE.empty():
+        if _log_queue.empty():
             break
         time.sleep(0.01)
     # Force flush handlers
-    if _LOG_LISTENER is not None:
-        for handler in _LOG_LISTENER.handlers:
-            try:
-                handler.flush()
-            except Exception:
-                pass
+    for handler in (_file_h, _stream_h):
+        try:
+            handler.flush()
+        except Exception:
+            pass
 
 
 # ----------------------------
@@ -179,6 +137,7 @@ FAST_SILENT_TRADING = int(os.getenv("FUN_FAST_SILENT_TRADING", "1"))            
 
 # open timing
 OPEN_AFTER_MS = int(os.getenv("FUN_OPEN_AFTER_MS", "0"))                       # открыть ПОСЛЕ payout (мс) - теперь 0 для WS
+OPEN_EARLY_MS = int(os.getenv("FUN_OPEN_EARLY_MS", "30"))                     # отправить ордер ДО payout на N мс (server-time)
 
 # WS strategy: "enter near close_price or abort"
 WS_FIX_LEAD_MS = int(os.getenv("FUN_WS_FIX_LEAD_MS", "30"))                 # за сколько мс до payout фиксируем ref
@@ -194,11 +153,13 @@ OPEN_HARD_DOWN_BPS = float(os.getenv("FUN_OPEN_HARD_DOWN_BPS", "2500"))     # 25
 OPEN_SAFETY_BPS = float(os.getenv("FUN_OPEN_SAFETY_BPS", "10"))                 # 10 bps = 0.10%
 OPEN_SAFETY_MIN_TICKS = int(os.getenv("FUN_OPEN_SAFETY_MIN_TICKS", "3"))        # min ticks below best_bid_fix
 
-# Admission model (bps) for entry: widen limit to survive post-payout repricing
-OPEN_ENTRY_BPS_BASE = float(os.getenv("FUN_OPEN_ENTRY_BPS_BASE", "30"))
-OPEN_ENTRY_BPS_FUNDING_MULT = float(os.getenv("FUN_OPEN_ENTRY_BPS_FUNDING_MULT", "0.9"))
-OPEN_ENTRY_BPS_MIN = float(os.getenv("FUN_OPEN_ENTRY_BPS_MIN", "30"))
-OPEN_ENTRY_BPS_MAX = float(os.getenv("FUN_OPEN_ENTRY_BPS_MAX", str(OPEN_HARD_DOWN_BPS)))
+# Entry admission plan (bps) based on funding magnitude: controls whether we SKIP trade when price already dumped
+ENTRY_BASE_BPS = float(os.getenv("FUN_ENTRY_BASE_BPS", "40"))
+ENTRY_FUNDING_MULT = float(os.getenv("FUN_ENTRY_FUNDING_MULT", "0.9"))
+ENTRY_MIN_BPS = float(os.getenv("FUN_ENTRY_MIN_BPS", "30"))
+ENTRY_MAX_BPS = float(os.getenv("FUN_ENTRY_MAX_BPS", "2500"))
+
+OPEN_LIMIT_TICKS = int(os.getenv("FUN_OPEN_LIMIT_TICKS", "1"))            # Sell limit = best_bid_open - N*tick (quality over fill)
 
 # open ladder (multiple IOC create attempts, no orderbook/status calls in critical window)
 OPEN_IOC_TRIES = int(os.getenv("FUN_OPEN_IOC_TRIES", "3"))
@@ -1637,11 +1598,19 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
         f"px_pre={_fmt(last_px_pre)} | notional~{_fmt(notional_pre, 3)} USDT | "
         f"est_funding~{_fmt(est_funding_usdt, 4)} USDT (sign included)"
     )
-    entry_bps_plan = _compute_entry_bps(funding_pct=float(p.funding_pct), offset_pct=float(p.offset_pct))
+    
+    # --- Entry admission plan (bps): skip trade if price already dumped too much vs pre-payout ref ---
+    try:
+        _funding_bps = abs(float(p.funding_pct or 0.0)) * 10000.0
+    except Exception:
+        _funding_bps = 0.0
+
+    entry_bps_plan = float(ENTRY_BASE_BPS) + float(ENTRY_FUNDING_MULT) * float(_funding_bps)
+    entry_bps_plan = max(float(ENTRY_MIN_BPS), min(float(ENTRY_MAX_BPS), float(entry_bps_plan)))
+
     logger.info(
-        f"🧮 ENTRY PLAN (bps): entry_bps_plan={entry_bps_plan:.1f} | "
-        f"base={OPEN_ENTRY_BPS_BASE:.1f} mult={OPEN_ENTRY_BPS_FUNDING_MULT:.3f} "
-        f"min={OPEN_ENTRY_BPS_MIN:.1f} max={OPEN_ENTRY_BPS_MAX:.1f}"
+        f"🧮 ENTRY PLAN (bps): entry_bps_plan={entry_bps_plan:.1f} | base={ENTRY_BASE_BPS:.1f} mult={ENTRY_FUNDING_MULT:.2f} | "
+        f"funding_bps={_funding_bps:.1f} | min={ENTRY_MIN_BPS:.1f} max={ENTRY_MAX_BPS:.1f}"
     )
     if p.next_funding_time_ms:
         logger.info(f"🕒 NEXT FUNDING (server ms): {int(p.next_funding_time_ms)}")
@@ -1844,14 +1813,20 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
     logger.info(f"💸 FUNDING (fixed pre-payout): rate={_fmt((p.funding_pct or 0.0)*100, 6)}%")
 
     # Plan times
-    open_server_ms = int(payout_server_ms + max(0, int(OPEN_AFTER_MS)))
+    # Open slightly BEFORE payout (server-time) to get earlier queue position, but keep price quality strict.
+    open_server_ms = int(payout_server_ms + max(0, int(OPEN_AFTER_MS)) - max(0, int(OPEN_EARLY_MS)))
     close_server_ms = int(payout_server_ms + int(max(0.0, float(FAST_CLOSE_DELAY_SEC)) * 1000))
     close_local_ms = int(close_server_ms - offset_ms)
 
-    # --- PREBUILD OPEN ORDER BEFORE PAYOUT ---
-    # Важно: мы НЕ используем best_bid_now после payout как условие входа.
-    # Мы пытаемся попасть в matching как можно раньше.
-    
+    # FIX reference for admission checks (do not use to price the order; pricing uses best_bid_open).
+    ref_px_fix = float(close_price)
+    if best_bid_fix is not None:
+        try:
+            ref_px_fix = min(ref_px_fix, float(best_bid_fix))
+        except Exception:
+            pass
+
+    # Prepare order template; 'price' is set at OPEN using best_bid_open.
     tick = float(tick_raw) if tick_raw else 0.0
     if tick <= 0:
         logger.error("❌ tickSize is invalid; cannot compute IOC price safely")
@@ -1873,70 +1848,20 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
     
     qty_str = po._format_by_step(p.coin_qty, qty_step_raw)
     
-    # Лимит "около close_price" с учётом best_bid_fix:
-    # Sell Limit исполняется, если bid >= limit.
-    # Базис: min(close_price, best_bid_fix) - защита от случая, когда last_trade пришёл "по аску"
-    # и оказался выше bid. Это улучшает качество входа и снижает риск "не заполнился".
-    ref_px = float(close_price)
-    if best_bid_fix is not None:
-        ref_px = min(ref_px, float(best_bid_fix))
-
-    # Entry price model (bps): делаем Sell IOC marketable даже при резком падении bid после payout.
-    down_mult = float(entry_bps_plan) / 10_000.0
-    limit_px = ref_px * (1.0 - down_mult)
-
-    # минимум N тиков ниже best_bid_fix (если вдруг bps-модель дала слишком "узко")
-    if best_bid_fix is not None:
-        px_from_ticks = float(best_bid_fix) - float(max(1, int(OPEN_SAFETY_MIN_TICKS))) * tick
-        limit_px = min(limit_px, px_from_ticks)
-
-    # доп. агрессия тиками
-    limit_px = limit_px - float(max(0, int(OPEN_SAFETY_TICKS))) * tick
-    limit_px = po._floor_to_step(limit_px, tick)
-    
-    if limit_px <= 0:
-        logger.error("❌ computed limit_px <= 0; abort")
-        try:
-            if ws_trade:
-                await ws_trade.stop()
-        except Exception:
-            pass
-        try:
-            if ws_private:
-                await ws_private.stop()
-        except Exception:
-            pass
-        try:
-            await ws_public.stop()
-        except Exception:
-            pass
-        return 0
-    
-    px_str = po._format_by_step(limit_px, tick_raw)
-    
-    # Сборка order заранее (до payout) — на границе менять только timestamp в header внутри create_order()
-    order = {
+    order_tmpl = {
         "category": "linear",
         "symbol": symbol,
         "side": "Sell",
         "orderType": "Limit",
         "qty": qty_str,
-        "price": px_str,
         "timeInForce": "IOC",
         "positionIdx": int(position_idx),
     }
-    
-    logger.info(
-        f"🧷 OPEN PREPARED: close_price={_fmt(close_price)} best_bid_fix={_fmt(best_bid_fix)} "
-        f"ref_px={_fmt(ref_px)} entry_bps_plan={entry_bps_plan:.1f} "
-        f"limit_px={px_str} qty={qty_str} (safety_ticks={OPEN_SAFETY_TICKS}, min_ticks={OPEN_SAFETY_MIN_TICKS})"
-    )
 
-    # --- OPEN AT PAYOUT (minimal work) ---
+    # --- OPEN NEAR PAYOUT (minimal work) ---
     await _sleep_until_server_ms(open_server_ms, offset_ms)
     
-    # Минимальный sanity-check: WS не должен быть "мертвым".
-    # Это НЕ проверка рынка, а только проверка "канал живой".
+    # Snapshot at the moment of sending (price quality comes from best_bid_open).
     snap_open = ws_public.snapshot()
     st_ms = float(snap_open.get("staleness_ms", 1e9))
     if st_ms > float(OPEN_MAX_STALENESS_MS):
@@ -1956,11 +1881,79 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
         except Exception:
             pass
         return 0
-    
+
+    best_bid_open = snap_open.get("best_bid")
+    if best_bid_open is None:
+        logger.warning("⛔ ABORT OPEN: best_bid_open not available from WS snapshot")
+        try:
+            if ws_trade:
+                await ws_trade.stop()
+        except Exception:
+            pass
+        try:
+            if ws_private:
+                await ws_private.stop()
+        except Exception:
+            pass
+        try:
+            await ws_public.stop()
+        except Exception:
+            pass
+        return 0
+
+    try:
+        best_bid_open = float(best_bid_open)
+    except Exception:
+        logger.warning("⛔ ABORT OPEN: best_bid_open is not numeric")
+        return 0
+    if best_bid_open <= 0:
+        logger.warning("⛔ ABORT OPEN: best_bid_open <= 0")
+        return 0
+
+    # Admission rule: skip if price already dumped too much vs FIX reference.
+    try:
+        down_bps = max(0.0, (float(ref_px_fix) - float(best_bid_open)) / float(ref_px_fix) * 10000.0)
+    except Exception:
+        down_bps = 0.0
+
+    if down_bps > float(entry_bps_plan):
+        logger.info(
+            f"⛔ SKIP OPEN: down_bps={down_bps:.1f} > entry_bps_plan={float(entry_bps_plan):.1f} "
+            f"| ref_px_fix={_fmt(ref_px_fix)} best_bid_open={_fmt(best_bid_open)}"
+        )
+        try:
+            if ws_trade:
+                await ws_trade.stop()
+        except Exception:
+            pass
+        try:
+            if ws_private:
+                await ws_private.stop()
+        except Exception:
+            pass
+        try:
+            await ws_public.stop()
+        except Exception:
+            pass
+        return 0
+
+    # Price the order close to current best_bid to preserve entry price quality (may miss fills).
+    entry_ticks = max(1, int(OPEN_LIMIT_TICKS), int(OPEN_SAFETY_TICKS), int(OPEN_SAFETY_MIN_TICKS))
+    limit_px = float(best_bid_open) - float(entry_ticks) * float(tick)
+    limit_px = po._floor_to_step(limit_px, float(tick))
+    if limit_px <= 0:
+        logger.warning("⛔ ABORT OPEN: computed limit_px <= 0")
+        return 0
+
+    px_str = po._format_by_step(limit_px, tick_raw)
+
+    order = dict(order_tmpl)
+    order["price"] = px_str
+
     logger.info(
-        f"🚀 OPEN SEND (Sell IOC): close_price={_fmt(close_price)} "
-        f"limit_px={px_str} qty={qty_str} staleness_ms={st_ms:.0f} "
-        f"| funding={_fmt((p.funding_pct or 0.0)*100, 6)}%"
+        f"🚀 OPEN SEND (Sell IOC): best_bid_open={_fmt(best_bid_open)} limit_px={px_str} qty={qty_str} "
+        f"staleness_ms={st_ms:.0f} down_bps={down_bps:.1f}/{float(entry_bps_plan):.1f} "
+        f"| open_early_ms={int(OPEN_EARLY_MS)} | funding={_fmt((p.funding_pct or 0.0)*100, 6)}%"
     )
     
     # Отправляем ордер через Trade WS (fast path) с retry на retCode=10001
@@ -1968,32 +1961,36 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
     open_submit_error = None
     
     if USE_TRADE_WS == 1 and ws_trade is not None:
-        try:
-            server_ts_ms = int(time.time() * 1000) + int(offset_ms)
-            ack = await ws_trade.create_order(order=order, server_ts_ms=server_ts_ms, timeout_sec=1.0)
-            order_id = _extract_order_id_from_trade_ack(ack)
+        server_ts_ms = int(time.time() * 1000) + int(offset_ms)
+        result = await ws_trade.create_order(order=order, server_ts_ms=server_ts_ms, timeout_sec=0.5)
+        
+        if result.get("ok") is True:
+            order_id = result.get("order_id")
             logger.info(f"✅ OPEN ACK (trade ws): order_id={order_id}")
-        except Exception as e:
-            open_submit_error = e
-            logger.error(f"❌ OPEN FAILED (trade ws): {type(e).__name__}: {e}")
+        else:
+            error_msg = result.get("error", "Unknown error")
+            logger.error(f"❌ OPEN FAILED (trade ws): {error_msg}")
+            open_submit_error = RuntimeError(error_msg)
             
-            # Retry once on positionIdx mismatch
-            if _is_bybit_position_idx_mode_mismatch(e) and isinstance(order, dict) and "positionIdx" in order:
+            # Retry once on positionIdx mismatch (check error message for retCode=10001)
+            raw_resp = result.get("raw", {})
+            ret_code = raw_resp.get("retCode") if isinstance(raw_resp, dict) else None
+            if ret_code == 10001 and isinstance(order, dict) and "positionIdx" in order:
                 prev = int(order.get("positionIdx", 0))
                 alt = _toggle_bybit_short_position_idx(prev)
                 logger.warning(f"🔁 OPEN retry due to position mode mismatch: positionIdx {prev} -> {alt}")
                 order["positionIdx"] = alt
-                try:
-                    server_ts_ms = int(time.time() * 1000) + int(offset_ms)
-                    ack = await ws_trade.create_order(order=order, server_ts_ms=server_ts_ms, timeout_sec=1.0)
-                    order_id = _extract_order_id_from_trade_ack(ack)
+                result_retry = await ws_trade.create_order(order=order, server_ts_ms=server_ts_ms, timeout_sec=0.5)
+                if result_retry.get("ok") is True:
+                    order_id = result_retry.get("order_id")
                     logger.info(f"✅ OPEN ACK (retry): order_id={order_id}")
                     open_submit_error = None
                     position_idx = alt  # важно: дальше все снапшоты/закрытие должны использовать этот idx
-                except Exception as e2:
-                    logger.error(f"❌ OPEN RETRY FAILED: {type(e2).__name__}: {e2}")
+                else:
+                    logger.error(f"❌ OPEN RETRY FAILED: {result_retry.get('error', 'Unknown error')}")
             
             # НИКАКОГО return: продолжаем, чтобы на close-window проверить opened_delta и закрыть если надо
+            order_id = None
     else:
         # fallback: REST (если вдруг выключишь FUN_USE_TRADE_WS)
         try:

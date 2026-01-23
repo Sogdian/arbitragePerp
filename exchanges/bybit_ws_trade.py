@@ -63,6 +63,11 @@ class BybitTradeWS:
     def ready(self) -> bool:
         return self._ready.is_set()
 
+    @property
+    def is_ready(self) -> bool:
+        """Alias for ready (Protocol compatibility)."""
+        return self._ready.is_set()
+
     def _log_info(self, msg: str) -> None:
         try:
             self._log.info(msg)
@@ -267,20 +272,41 @@ class BybitTradeWS:
         self,
         *,
         order: Dict[str, Any],
-        server_ts_ms: int,
+        server_ts_ms: Optional[int] = None,
         recv_window_ms: Optional[int] = None,
         req_id: Optional[str] = None,
-        timeout_sec: float = 2.0,
+        timeout_sec: float = 0.5,  # Default 500ms (200-800ms range per contract)
     ) -> Dict[str, Any]:
         """
-        Sends WS 'order.create' and returns ACK response.
+        Sends WS 'order.create' and returns standardized ACK response.
+
+        Contract-compliant format:
+          - Success: {"ok": True, "order_id": "...", "raw": {...}}
+          - Failure: {"ok": False, "error": "...", "raw": {...}}
 
         Important: ACK != Filled. Use order-stream / executions later.
 
-        Request example and header fields are from Bybit WS trade guideline.
+        Args:
+            order: Order dict (category, symbol, side, orderType, qty, price, timeInForce, positionIdx)
+            server_ts_ms: Server timestamp (defaults to current time + offset if not provided)
+            recv_window_ms: Receive window (defaults to self.recv_window_ms)
+            req_id: Request ID (auto-generated if not provided)
+            timeout_sec: Timeout for ACK (default 0.5s, range 200-800ms per contract)
+
+        Returns:
+            {"ok": True, "order_id": str, "raw": dict} on success
+            {"ok": False, "error": str, "raw": dict} on failure
         """
         if self._ws is None or not self.ready:
-            raise RuntimeError("Trade WS not started/authenticated")
+            return {
+                "ok": False,
+                "error": "Trade WS not started/authenticated",
+                "raw": {},
+            }
+
+        # Auto-generate server_ts_ms if not provided (best-effort)
+        if server_ts_ms is None:
+            server_ts_ms = int(time.time() * 1000)
 
         rid = req_id or str(uuid.uuid4())
         rw = int(self.recv_window_ms if recv_window_ms is None else recv_window_ms)
@@ -303,21 +329,82 @@ class BybitTradeWS:
             await self._ws.send(json.dumps(msg))
         except Exception as e:
             self._pending.pop(rid, None)
-            raise RuntimeError(f"Failed to send order.create: {e}")
+            return {
+                "ok": False,
+                "error": f"Failed to send order.create: {e}",
+                "raw": {},
+            }
 
         try:
             resp = await asyncio.wait_for(fut, timeout=timeout_sec)
         except asyncio.TimeoutError:
             self._pending.pop(rid, None)
-            raise RuntimeError(f"order.create timeout after {timeout_sec}s")
+            return {
+                "ok": False,
+                "error": f"order.create timeout after {timeout_sec}s",
+                "raw": {},
+            }
+        except Exception as e:
+            self._pending.pop(rid, None)
+            return {
+                "ok": False,
+                "error": f"order.create error: {type(e).__name__}: {e}",
+                "raw": {},
+            }
 
         if not isinstance(resp, dict):
-            raise RuntimeError(f"Bad WS response: {resp}")
+            return {
+                "ok": False,
+                "error": f"Bad WS response: {resp}",
+                "raw": resp if isinstance(resp, dict) else {},
+            }
 
-        if resp.get("retCode") != 0:
-            raise RuntimeError(
-                f"order.create retCode={resp.get('retCode')} "
-                f"retMsg={resp.get('retMsg')} resp={resp}"
-            )
+        ret_code = resp.get("retCode")
+        if ret_code != 0:
+            ret_msg = resp.get("retMsg", "Unknown error")
+            return {
+                "ok": False,
+                "error": f"order.create retCode={ret_code} retMsg={ret_msg}",
+                "raw": resp,
+            }
 
-        return resp
+        # Extract order_id from response (multiple possible paths)
+        order_id = None
+        for path in (
+            ("result", "orderId"),
+            ("data", "orderId"),
+            ("data", "result", "orderId"),
+            ("result", "list", 0, "orderId"),
+            ("data", "list", 0, "orderId"),
+        ):
+            cur = resp
+            ok = True
+            for key in path:
+                try:
+                    cur = cur[key] if isinstance(key, int) else cur.get(key)
+                except Exception:
+                    ok = False
+                    break
+                if cur is None:
+                    ok = False
+                    break
+            if ok:
+                try:
+                    order_id = str(cur)
+                    if order_id:
+                        break
+                except Exception:
+                    pass
+
+        if not order_id:
+            return {
+                "ok": False,
+                "error": f"order.create succeeded but no order_id in response: {resp}",
+                "raw": resp,
+            }
+
+        return {
+            "ok": True,
+            "order_id": order_id,
+            "raw": resp,
+        }
