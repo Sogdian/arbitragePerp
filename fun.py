@@ -54,10 +54,32 @@ load_dotenv(".env")
 LOG_LEVEL = os.getenv("FUN_LOG_LEVEL", "INFO").upper()
 LOG_FILE = os.getenv("FUN_LOG_FILE", "fun.log")
 
-def _setup_async_logging() -> QueueListener:
+_LOG_QUEUE: Optional[_queue.Queue] = None
+_LOG_LISTENER: Optional[QueueListener] = None
+
+
+class NonBlockingQueueHandler(QueueHandler):
+    """
+    QueueHandler that never blocks: drops messages if queue is full.
+    Critical for trading code - logging must never delay order execution.
+    """
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            # Use put_nowait to avoid blocking. If queue is full, drop the message.
+            self.queue.put_nowait(record)
+        except _queue.Full:
+            # Queue is full - drop the message silently to avoid blocking trading code
+            pass
+        except Exception:
+            # Any other error - also drop silently to avoid blocking trading code
+            pass
+
+
+def _setup_async_logging() -> Tuple[QueueListener, _queue.Queue]:
     """
     Async logging via QueueHandler/QueueListener to avoid blocking IO in critical windows.
     Timestamps are preserved (LogRecord.created is set at emit time).
+    Uses NonBlockingQueueHandler to ensure logging never blocks order execution.
     """
     level = getattr(logging, LOG_LEVEL, logging.INFO)
     fmt = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
@@ -71,7 +93,7 @@ def _setup_async_logging() -> QueueListener:
     stream_h.setFormatter(logging.Formatter(fmt))
 
     q: _queue.Queue = _queue.Queue(maxsize=20000)
-    qh = QueueHandler(q)
+    qh = NonBlockingQueueHandler(q)  # Non-blocking: drops messages if queue full
     qh.setLevel(level)
 
     root = logging.getLogger()
@@ -82,17 +104,48 @@ def _setup_async_logging() -> QueueListener:
     listener = QueueListener(q, file_h, stream_h, respect_handler_level=True)
     listener.daemon = True
     listener.start()
-    atexit.register(lambda: listener.stop())
-    return listener
+
+    def _stop_listener_safely() -> None:
+        try:
+            listener.stop()
+        except Exception:
+            # On process exit the queue can be full (sentinel enqueue fails); ignore.
+            pass
+
+    atexit.register(_stop_listener_safely)
+    return listener, q
 
 
-_LOG_LISTENER = _setup_async_logging()
+_LOG_LISTENER, _LOG_QUEUE = _setup_async_logging()
 logger = logging.getLogger("fun")
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("bot").setLevel(logging.CRITICAL)
 logging.getLogger("news_monitor").setLevel(logging.CRITICAL)
 logging.getLogger("announcements_monitor").setLevel(logging.CRITICAL)
 logging.getLogger("exchanges").setLevel(logging.CRITICAL)
+
+
+def _flush_logs() -> None:
+    """
+    Flush async logging queue before blocking operations (like input()).
+    Waits until queue is empty to ensure all logs are written.
+    """
+    if _LOG_QUEUE is None:
+        return
+    # Give QueueListener time to process all pending logs
+    # QueueListener runs in a separate thread, so we just need to wait a bit
+    import time
+    for _ in range(50):  # max 500ms wait
+        if _LOG_QUEUE.empty():
+            break
+        time.sleep(0.01)
+    # Force flush handlers
+    if _LOG_LISTENER is not None:
+        for handler in _LOG_LISTENER.handlers:
+            try:
+                handler.flush()
+            except Exception:
+                pass
 
 
 # ----------------------------
@@ -1546,6 +1599,7 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
     else:
         logger.info(f"✅ Security-новостей {coin_upper} ({exchange_cap}) за {NEWS_DAYS_BACK} дней не найдено")
 
+    _flush_logs()  # Ensure all logs are written before blocking input()
     ans = input("Совершить тестовые открытия шорт и лонг ? (Да/Нет): ").strip()
     if _is_yes(ans):
         logger.info("🧪 Тестовые ордера: запуск")
@@ -1562,6 +1616,7 @@ async def _run_bybit_trade(bot: PerpArbitrageBot, p: FunParams) -> int:
         logger.error(f"❌ Funding не отрицательный ({_fmt(p.funding_pct*100,6)}%). Этот режим рассчитан на отрицательный funding.")
         return 2
 
+    _flush_logs()  # Ensure all logs are written before blocking input()
     ans2 = input("Открывать БОЕВОЙ short после payout? (Да/Нет): ").strip()
     if not _is_yes(ans2):
         logger.info("Отклонено пользователем. Завершаем.")
