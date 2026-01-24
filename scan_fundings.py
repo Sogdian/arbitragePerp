@@ -73,17 +73,19 @@ FUNDING_EXCHANGES = ["bybit"]
 # ----------------------------
 LOG_LEVEL = os.getenv("SCAN_FUNDING_LOG_LEVEL", "INFO").upper()
 
-logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL, logging.INFO),
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-    ],
-)
-
+# Настраиваем именованный logger без propagation к root (чтобы не попадать в fun.log)
 logger = logging.getLogger("scan_fundings")
+logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
+logger.propagate = False  # Не распространять в root logger (fun.log)
+
+# Добавляем только StreamHandler (консоль)
+_formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+_stream_handler = logging.StreamHandler(sys.stdout)
+_stream_handler.setFormatter(_formatter)
+logger.addHandler(_stream_handler)
+
+# Отключаем verbose логи от библиотек
 logging.getLogger("httpx").setLevel(logging.WARNING)
-# В scan_fundings не печатаем "подробные" логи из bot/бирж
 logging.getLogger("bot").setLevel(logging.CRITICAL)
 logging.getLogger("exchanges").setLevel(logging.CRITICAL)
 
