@@ -399,11 +399,28 @@ def format_telegram_message(opportunity: Dict[str, Any]) -> str:
     
     minutes_str = f"{minutes_until} min" if minutes_until is not None else "N/A"
     
+    # Build exchange-specific URL
+    url = ""
+    if exchange.lower() == "bybit":
+        url = f"https://www.bybit.com/trade/usdt/{coin}USDT"
+    elif exchange.lower() == "binance":
+        url = f"https://www.binance.com/en/futures/{coin}USDT"
+    elif exchange.lower() == "okx":
+        url = f"https://www.okx.com/trade-swap/{coin.lower()}-usdt-swap"
+    elif exchange.lower() == "gate":
+        url = f"https://www.gate.io/futures/usdt/{coin}_USDT"
+    elif exchange.lower() == "bitget":
+        url = f"https://www.bitget.com/futures/usdt/{coin}USDT"
+    # Add more exchanges as needed
+    
     lines = [
         f"🔔💲 {exchange} {coin}",
         f"funding: {funding_rate_pct:.3f}%",
         f"time to pay: {minutes_str}",
     ]
+    
+    if url:
+        lines.append(url)
     
     return "\n".join(lines)
 
