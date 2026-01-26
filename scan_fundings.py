@@ -415,14 +415,16 @@ def format_telegram_message(opportunity: Dict[str, Any]) -> str:
         url = f"https://www.bitget.com/futures/usdt/{coin}USDT"
     # Add more exchanges as needed
     
+    # Embed link in exchange name if URL is available (HTML format for Telegram)
+    exchange_display = exchange
+    if url:
+        exchange_display = f'<a href="{url}">{exchange}</a>'
+    
     lines = [
-        f"🔔💲 {exchange} {coin}",
+        f"🔔💲 {exchange_display} {coin}",
         f"funding: {funding_rate_pct:.3f}%",
         f"time to pay: {minutes_str}",
     ]
-    
-    if url:
-        lines.append(url)
     
     return "\n".join(lines)
 
