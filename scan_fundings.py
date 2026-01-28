@@ -59,13 +59,14 @@ REQ_TIMEOUT_SEC = float(os.getenv("SCAN_FUNDING_REQ_TIMEOUT_SEC", "12"))  # та
 SCAN_FUNDING_MIN_TIME_TO_PAY = float(os.getenv("SCAN_FUNDING_MIN_TIME_TO_PAY", "0"))  # минимальное время до выплаты в минутах (если >= этого значения, не отправляем в Telegram)
 SCAN_COIN_INVEST = float(os.getenv("SCAN_COIN_INVEST", "50"))  # размер позиции (USDT) для расчета минимального количества монет
 EXCLUDE_EXCHANGES = {"lbank"}  # не использовать
+SCAN_FUNDING_NOTIFY_NEW_CYCLE = os.getenv("SCAN_FUNDING_NOTIFY_NEW_CYCLE", "1").strip() == "1"
 
 # Монеты для исключения из поиска фандингов (через запятую, например: EXCLUDE_COINS=FLOW,BTC)
 EXCLUDE_COINS_STR = os.getenv("EXCLUDE_COINS", "").strip()
 EXCLUDE_COINS = {coin.strip().upper() for coin in EXCLUDE_COINS_STR.split(",") if coin.strip()} if EXCLUDE_COINS_STR else set()
 
 # Биржи для сканирования фандингов
-FUNDING_EXCHANGES = ["bybit"]
+FUNDING_EXCHANGES = ["bybit", "gate", "okx", "binance"]
 
 
 # ----------------------------
@@ -104,8 +105,12 @@ def calculate_minutes_until_funding(next_funding_time: Optional[int], exchange: 
     Использует только данные из API, без хардкода расписания.
     
     Args:
-        next_funding_time: Timestamp следующей выплаты (в миллисекундах для Bybit)
-        exchange: Название биржи (только bybit)
+        next_funding_time: Timestamp следующей выплаты
+            - Bybit: в миллисекундах
+            - OKX: в миллисекундах
+            - Binance: в миллисекундах
+            - Gate: в секундах
+        exchange: Название биржи (bybit, gate, okx, binance)
         
     Returns:
         Количество минут до выплаты или None если невозможно вычислить
@@ -114,8 +119,12 @@ def calculate_minutes_until_funding(next_funding_time: Optional[int], exchange: 
         return None
     
     try:
-        # Bybit возвращает timestamp в миллисекундах
-        funding_timestamp = next_funding_time / 1000
+        # Bybit, OKX и Binance возвращают timestamp в миллисекундах, Gate - в секундах
+        if exchange.lower() in ("bybit", "okx", "binance"):
+            funding_timestamp = next_funding_time / 1000
+        else:
+            # Gate и другие биржи возвращают в секундах
+            funding_timestamp = float(next_funding_time)
         
         now_timestamp = time.time()
         seconds_until = funding_timestamp - now_timestamp
@@ -510,7 +519,14 @@ async def main():
                     logger.info(f"{ex}: {len(coins_by_exchange.get(ex, set()))} монет")
                 printed_stats = True
             
-            logger.info(f"🔄 Новый цикл поиска фандингов | exchanges={exchanges}")
+            cycle_msg = f"🔄 Новый цикл поиска фандингов | exchanges={exchanges}"
+            logger.info(cycle_msg)
+            if SCAN_FUNDING_NOTIFY_NEW_CYCLE and telegram.enabled:
+                # best-effort: уведомление не должно ломать цикл сканирования
+                try:
+                    await telegram.send_message(cycle_msg)
+                except Exception:
+                    logger.debug("Telegram: failed to send new-cycle notification", exc_info=True)
             t0 = time.perf_counter()
             
             await scan_once(bot, exchanges, coins_by_exchange, sem)
