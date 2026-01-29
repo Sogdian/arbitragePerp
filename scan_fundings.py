@@ -119,13 +119,13 @@ def calculate_minutes_until_funding(next_funding_time: Optional[int], exchange: 
         return None
     
     try:
-        # Bybit, OKX и Binance возвращают timestamp в миллисекундах, Gate - в секундах
-        if exchange.lower() in ("bybit", "okx", "binance"):
-            funding_timestamp = next_funding_time / 1000
-        else:
-            # Gate и другие биржи возвращают в секундах
+        # Эвристика: значение < 10**12 (10–11 цифр) — секунды; иначе миллисекунды.
+        # Gate всегда в секундах; Bybit/OKX/Binance обычно в мс, но OKX для части пар может отдавать секунды.
+        if next_funding_time < 10**12:
             funding_timestamp = float(next_funding_time)
-        
+        else:
+            funding_timestamp = next_funding_time / 1000
+
         now_timestamp = time.time()
         seconds_until = funding_timestamp - now_timestamp
         

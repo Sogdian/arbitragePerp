@@ -242,6 +242,8 @@ class AsyncOkxExchange(AsyncBaseExchange):
                             next_funding_time = int(float(next_funding_time_raw))
                         else:
                             next_funding_time = int(next_funding_time_raw)
+                        # Коррекция: API отдаёт время ~1 час вперёд относительно UI; вычитаем 1 ч (мс)
+                        next_funding_time = next_funding_time - 3600_000
                     except (TypeError, ValueError):
                         # Если не удалось распарсить, оставляем None
                         pass
