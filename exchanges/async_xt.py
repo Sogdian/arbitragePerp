@@ -192,8 +192,8 @@ class AsyncXtExchange(AsyncBaseExchange):
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug(f"XT funding data for {coin}: {result}")
             
-            # Пробуем найти время в разных полях
-            for field in ["nextFundingTime", "nextFundingTimeMs", "fundingTime", "nextFunding", "nextFundingTimeMs", "nextSettleTime", "settleTime", "nextSettleTimestamp", "settleTimestamp", "nextFundingTimestamp", "fundingTimestamp"]:
+            # XT API возвращает время следующей выплаты в поле nextCollectionTime (мс)
+            for field in ["nextCollectionTime", "nextFundingTime", "nextFundingTimeMs", "fundingTime", "nextFunding", "nextSettleTime", "settleTime", "nextSettleTimestamp", "settleTimestamp", "nextFundingTimestamp", "fundingTimestamp"]:
                 time_val = result.get(field)
                 if time_val is not None and time_val != "" and time_val != 0:
                     try:
@@ -215,8 +215,7 @@ class AsyncXtExchange(AsyncBaseExchange):
                         if isinstance(ticker_result, dict):
                             if logger.isEnabledFor(logging.DEBUG):
                                 logger.debug(f"XT ticker data for {coin}: {ticker_result}")
-                            # Проверяем поля в ticker
-                            for field in ["nextFundingTime", "nextFundingTimeMs", "fundingTime", "nextFunding", "nextSettleTime", "settleTime", "nextSettleTimestamp", "settleTimestamp", "nextSettleTimeMs", "nextFundingTimestamp", "fundingTimestamp"]:
+                            for field in ["nextCollectionTime", "nextFundingTime", "nextFundingTimeMs", "fundingTime", "nextFunding", "nextSettleTime", "settleTime", "nextSettleTimestamp", "settleTimestamp", "nextSettleTimeMs", "nextFundingTimestamp", "fundingTimestamp"]:
                                 time_val = ticker_result.get(field)
                                 if time_val is not None and time_val != "" and time_val != 0:
                                     try:

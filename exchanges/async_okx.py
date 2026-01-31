@@ -225,33 +225,41 @@ class AsyncOkxExchange(AsyncBaseExchange):
                 return None
 
             funding_rate_raw = funding_data.get("fundingRate")
+            # OKX: fundingTime = ближайшая выплата (то, что показывает UI), nextFundingTime = следующая за ней
+            funding_time_raw = funding_data.get("fundingTime")
             next_funding_time_raw = funding_data.get("nextFundingTime")
-            
-            # Логируем все поля для отладки
-            if logger.isEnabledFor(logging.DEBUG):
-                logger.debug(f"OKX funding data for {coin}: {funding_data}")
+            ts_raw = funding_data.get("ts")  # время сервера OKX в мс
 
             if funding_rate_raw is None:
                 msg = data.get("msg", "")
                 logger.warning(f"OKX: нет fundingRate в ответе для {coin} (instId={symbol}, msg={msg})")
                 return None
 
+            def _parse_ms(val) -> Optional[int]:
+                if val is None:
+                    return None
+                try:
+                    return int(float(val)) if isinstance(val, str) else int(val)
+                except (TypeError, ValueError):
+                    return None
+
             try:
                 funding_rate = float(funding_rate_raw)
+                funding_time_ms = _parse_ms(funding_time_raw)
+                next_funding_time_api_ms = _parse_ms(next_funding_time_raw)
+                now_ms = _parse_ms(ts_raw)
+                if now_ms is None:
+                    import time
+                    now_ms = int(time.time() * 1000)
+
+                # Ближайшая выплата: если fundingTime ещё в будущем — используем его, иначе nextFundingTime
                 next_funding_time = None
-                if next_funding_time_raw is not None:
-                    try:
-                        # OKX возвращает nextFundingTime в миллисекундах (строка или число)
-                        if isinstance(next_funding_time_raw, str):
-                            next_funding_time = int(float(next_funding_time_raw))
-                        else:
-                            next_funding_time = int(next_funding_time_raw)
-                        logger.debug(f"OKX found nextFundingTime for {coin}: {next_funding_time} (raw: {next_funding_time_raw})")
-                    except (TypeError, ValueError):
-                        # Если не удалось распарсить, оставляем None
-                        pass
-                
-                # Если не нашли в funding-rate, пробуем получить из ticker
+                if funding_time_ms is not None and funding_time_ms > now_ms:
+                    next_funding_time = funding_time_ms
+                elif next_funding_time_api_ms is not None:
+                    next_funding_time = next_funding_time_api_ms
+
+                # Fallback: если не выбрали время, пробуем ticker
                 if next_funding_time is None:
                     try:
                         ticker_url = "/api/v5/market/ticker"

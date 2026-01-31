@@ -5,6 +5,7 @@
 import asyncio
 import logging
 import os
+import random
 import sys
 import time
 from datetime import datetime, timezone
@@ -56,6 +57,8 @@ SCAN_INTERVAL_SEC = float(os.getenv("SCAN_FUNDING_INTERVAL_SEC", "60"))  # ка�
 MAX_CONCURRENCY = int(os.getenv("SCAN_FUNDING_MAX_CONCURRENCY", "20"))  # сколько одновременных http запросов
 COIN_BATCH_SIZE = int(os.getenv("SCAN_FUNDING_COIN_BATCH_SIZE", "50"))  # сколько монет обрабатывать за пачку
 REQ_TIMEOUT_SEC = float(os.getenv("SCAN_FUNDING_REQ_TIMEOUT_SEC", "12"))  # таймаут на запрос к бирже
+# MEXC часто отвечает медленно — отдельный таймаут (сек), по умолчанию 45 (2 запроса × 2 домена)
+MEXC_REQ_TIMEOUT_SEC = float(os.getenv("SCAN_FUNDING_MEXC_REQ_TIMEOUT_SEC", "45"))
 SCAN_FUNDING_MIN_TIME_TO_PAY = float(os.getenv("SCAN_FUNDING_MIN_TIME_TO_PAY", "0"))  # минимальное время до выплаты в минутах (если >= этого значения, не отправляем в Telegram)
 SCAN_COIN_INVEST = float(os.getenv("SCAN_COIN_INVEST", "50"))  # размер позиции (USDT) для расчета минимального количества монет
 EXCLUDE_EXCHANGES = {"lbank"}  # не использовать
@@ -233,15 +236,16 @@ async def fetch_funding_info(
     if not exchange:
         return None
 
+    timeout_sec = MEXC_REQ_TIMEOUT_SEC if exchange_name.lower() == "mexc" else REQ_TIMEOUT_SEC
     try:
         async with sem:
             funding_info = await asyncio.wait_for(
                 exchange.get_funding_info(coin),
-                timeout=REQ_TIMEOUT_SEC
+                timeout=timeout_sec
             )
         return funding_info
     except asyncio.TimeoutError:
-        logger.info(f"Timeout: {exchange_name} {coin} funding > {REQ_TIMEOUT_SEC:.1f}s")
+        logger.info(f"Timeout: {exchange_name} {coin} funding > {timeout_sec:.1f}s")
         return None
     except Exception as e:
         logger.info(f"Fetch error: {exchange_name} {coin} funding: {e}")
@@ -477,37 +481,36 @@ async def scan_once(
     """
     Один проход по всем монетам батчами.
     
-    Обрабатывает монеты параллельно батчами размера COIN_BATCH_SIZE.
+    Пары (биржа, монета) перемешиваются, чтобы запросы к медленным биржам (MEXC и др.)
+    шли параллельно с быстрыми — иначе все монеты MEXC обрабатывались бы в конце цикла.
     Уведомления в Telegram отправляются сразу после нахождения каждой возможности.
     """
-    # Инициализируем Telegram один раз для всех монет
     telegram = TelegramSender()
     channel_id = config.TEST_CHANNEL_ID if telegram.enabled else None
     
     opportunities: List[Dict[str, Any]] = []
     
+    # Один общий список пар (биржа, монета) и перемешивание — MEXC не «в хвосте»
+    pairs: List[tuple] = []
     for exchange_name in exchanges:
         coins = coins_by_exchange.get(exchange_name, set())
-        if not coins:
-            continue
-        
-        coins_list = sorted(list(coins))
-        total = len(coins_list)
-        
-        for i in range(0, total, COIN_BATCH_SIZE):
-            batch = coins_list[i:i + COIN_BATCH_SIZE]
-            results = await asyncio.gather(
-                *(process_coin(bot, exchange_name, coin, sem, telegram, channel_id) for coin in batch),
-                return_exceptions=True
-            )
-            
-            for result in results:
-                if isinstance(result, Exception):
-                    continue
-                if result is not None:
-                    opportunities.append(result)
-            
-            logger.debug(f"Progress {exchange_name}: {min(i + COIN_BATCH_SIZE, total)}/{total} coins processed")
+        for coin in sorted(coins):
+            pairs.append((exchange_name, coin))
+    random.shuffle(pairs)
+    
+    total = len(pairs)
+    for i in range(0, total, COIN_BATCH_SIZE):
+        batch = pairs[i:i + COIN_BATCH_SIZE]
+        results = await asyncio.gather(
+            *(process_coin(bot, ex, coin, sem, telegram, channel_id) for (ex, coin) in batch),
+            return_exceptions=True
+        )
+        for result in results:
+            if isinstance(result, Exception):
+                continue
+            if result is not None:
+                opportunities.append(result)
+        logger.debug(f"Progress: {min(i + COIN_BATCH_SIZE, total)}/{total} pairs processed")
 
 
 async def main():

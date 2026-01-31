@@ -197,8 +197,8 @@ class AsyncBitgetExchange(AsyncBaseExchange):
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug(f"Bitget funding data for {coin}: {d}")
             
-            # Проверяем все возможные поля, которые могут содержать время следующей выплаты
-            for field in ["nextFundingTime", "nextFundingTimeMs", "fundingTime", "nextFunding", "nextSettleTime", "settleTime", "nextSettleTimestamp", "settleTimestamp", "nextSettleTimeMs", "nextFundingTimestamp", "fundingTimestamp"]:
+            # Bitget API v2 current-fund-rate возвращает время в поле nextUpdate (мс)
+            for field in ["nextUpdate", "nextFundingTime", "nextFundingTimeMs", "fundingTime", "nextFunding", "nextSettleTime", "settleTime", "nextSettleTimestamp", "settleTimestamp", "nextSettleTimeMs", "nextFundingTimestamp", "fundingTimestamp"]:
                 time_val = d.get(field)
                 if time_val is not None and time_val != "" and time_val != 0:
                     try:
@@ -222,8 +222,7 @@ class AsyncBitgetExchange(AsyncBaseExchange):
                         if isinstance(ticker_d, dict):
                             if logger.isEnabledFor(logging.DEBUG):
                                 logger.debug(f"Bitget ticker data for {coin}: {ticker_d}")
-                            # Проверяем поля в ticker
-                            for field in ["nextFundingTime", "nextFundingTimeMs", "fundingTime", "nextFunding", "nextSettleTime", "settleTime", "nextSettleTimestamp", "settleTimestamp", "nextSettleTimeMs", "nextFundingTimestamp", "fundingTimestamp"]:
+                            for field in ["nextUpdate", "nextFundingTime", "nextFundingTimeMs", "fundingTime", "nextFunding", "nextSettleTime", "settleTime", "nextSettleTimestamp", "settleTimestamp", "nextSettleTimeMs", "nextFundingTimestamp", "fundingTimestamp"]:
                                 time_val = ticker_d.get(field)
                                 if time_val is not None and time_val != "" and time_val != 0:
                                     try:
@@ -250,8 +249,7 @@ class AsyncBitgetExchange(AsyncBaseExchange):
                                 if isinstance(contract, dict) and contract.get("symbol") == symbol:
                                     if logger.isEnabledFor(logging.DEBUG):
                                         logger.debug(f"Bitget contract data for {coin}: {contract}")
-                                    # Проверяем поля в contract
-                                    for field in ["nextFundingTime", "nextFundingTimeMs", "fundingTime", "nextFunding", "nextSettleTime", "settleTime", "nextSettleTimestamp", "settleTimestamp", "nextSettleTimeMs", "nextFundingTimestamp", "fundingTimestamp"]:
+                                    for field in ["nextUpdate", "nextFundingTime", "nextFundingTimeMs", "fundingTime", "nextFunding", "nextSettleTime", "settleTime", "nextSettleTimestamp", "settleTimestamp", "nextSettleTimeMs", "nextFundingTimestamp", "fundingTimestamp"]:
                                         time_val = contract.get(field)
                                         if time_val is not None and time_val != "" and time_val != 0:
                                             try:

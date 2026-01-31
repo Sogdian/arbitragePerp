@@ -46,6 +46,7 @@ class AsyncMexcExchange(AsyncBaseExchange):
         aliases = {
             "FUN": "SPORTFUN_USDT",      # UI FUNUSDT -> API SPORTFUN_USDT
             "FUNTOKEN": "FUN_USDT",      # UI FUNTOKENUSDT -> API FUN_USDT
+            "LUNA": "LUNANEW_USDT",      # UI LUNAUSDT -> API LUNANEW_USDT (основной бессрочный)
         }
         return aliases.get(c, f"{c}_USDT")
 
@@ -101,7 +102,7 @@ class AsyncMexcExchange(AsyncBaseExchange):
                         base_url=domain,
                         headers=headers,
                         limits=httpx.Limits(max_connections=10, max_keepalive_connections=10),
-                        timeout=httpx.Timeout(8.0, connect=3.0),
+                        timeout=httpx.Timeout(15.0, connect=5.0),  # MEXC часто отвечает медленно
                     ) as client:
                         resp = await client.request(method, url, params=params)
                         resp.raise_for_status()
