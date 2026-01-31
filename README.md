@@ -14,27 +14,6 @@ pip install -r requirements.txt
 ```
 
 2. Создайте файл `.env` (опционально):
-```
-LOG_FILE=arbitrage_perp_bot.log
-LOG_LEVEL=INFO
-FUN_LOG_FILE=fun.log
-FUN_LOG_LEVEL=INFO
-FUN_FAST_PREP_LEAD_SEC=2.0
-FUN_FAST_CLOSE_DELAY_SEC=1.0
-FUN_FAST_CLOSE_MAX_ATTEMPTS=15
-FUN_FAST_SILENT_TRADING=1
-FUN_FAST_OPEN_LEAD_MS=300
-FUN_FIX_PRICE_MODE=last
-FUN_SHORT_OPEN_FALLBACK_MARKET=0
-# Устойчивый вход в short около payout (Bybit funding scalp):
-FUN_OPEN_ENTRY_BPS_BASE=80
-FUN_OPEN_ENTRY_BPS_FUNDING_MULT=1.0
-FUN_OPEN_SAFETY_MIN_TICKS=3
-FUN_OPEN_SAFETY_TICKS=1
-# Для фиксации close_price в HH:MM:59 по умолчанию достаточно 1m (close последней 1m-свечи).
-# Важно: большие интервалы (например 60) могут вернуть "предыдущую закрытую свечу", что не равно цене в HH:MM:59.
-FUN_FIX_KLINE_INTERVAL=1
-```
 
 ## ⚠️ Важно: Работа с терминалом
 
@@ -57,7 +36,7 @@ python fun.py "LPT Bybit 10 -0.1%"
 ```bash
 python3 scan_spreads.py 
 python3 bot.py "CVC Long (bybit), Short (gate) 30" --no-monitor
-python3 bot.py "CVC Long (bybit), Shor
+python3 bot.py "CVC Long (bybit), Short (gate)"
 python3 scan_fundings.py
 ```
 

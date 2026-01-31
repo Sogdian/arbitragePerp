@@ -5,7 +5,6 @@
 import asyncio
 import logging
 import os
-import random
 import sys
 import time
 from datetime import datetime, timezone
@@ -481,8 +480,7 @@ async def scan_once(
     """
     Один проход по всем монетам батчами.
     
-    Пары (биржа, монета) перемешиваются, чтобы запросы к медленным биржам (MEXC и др.)
-    шли параллельно с быстрыми — иначе все монеты MEXC обрабатывались бы в конце цикла.
+    Сначала обрабатываются все монеты первой биржи, затем второй и т.д.
     Уведомления в Telegram отправляются сразу после нахождения каждой возможности.
     """
     telegram = TelegramSender()
@@ -490,13 +488,12 @@ async def scan_once(
     
     opportunities: List[Dict[str, Any]] = []
     
-    # Один общий список пар (биржа, монета) и перемешивание — MEXC не «в хвосте»
+    # Пары (биржа, монета) по биржам подряд: сначала все монеты биржи 1, потом биржи 2 и т.д.
     pairs: List[tuple] = []
     for exchange_name in exchanges:
         coins = coins_by_exchange.get(exchange_name, set())
         for coin in sorted(coins):
             pairs.append((exchange_name, coin))
-    random.shuffle(pairs)
     
     total = len(pairs)
     for i in range(0, total, COIN_BATCH_SIZE):
