@@ -152,6 +152,132 @@ class AsyncBitgetExchange(AsyncBaseExchange):
             logger.error(f"Bitget: ошибка при получении фандинга для {coin}: {e}", exc_info=True)
             return None
 
+    async def get_funding_info(self, coin: str) -> Optional[Dict]:
+        """
+        Получить информацию о фандинге (ставка и время до следующей выплаты)
+        
+        Args:
+            coin: Название монеты без /USDT (например, "CVC")
+            
+        Returns:
+            Словарь с данными:
+            {
+                "funding_rate": float,  # Ставка фандинга (например, 0.0001 = 0.01%)
+                "next_funding_time": int,  # Timestamp следующей выплаты (может быть None, если API не предоставляет)
+            }
+            или None если ошибка
+        """
+        try:
+            symbol = self._normalize_symbol(coin)
+            url = "/api/v2/mix/market/current-fund-rate"
+            params = {"symbol": symbol, "productType": self.PRODUCT_TYPE}
+
+            data = await self._request_json("GET", url, params=params)
+            if not data or self._is_api_error(data):
+                return None
+
+            d = data.get("data")
+            if isinstance(d, list) and d:
+                d = d[0]
+            if not isinstance(d, dict):
+                return None
+
+            funding_rate_raw = d.get("fundingRate")
+            if funding_rate_raw is None:
+                return None
+
+            funding_rate = float(funding_rate_raw)
+            
+            # Bitget API может не предоставлять время следующей выплаты в current-fund-rate эндпоинте
+            # Пробуем получить из ticker эндпоинта, который может содержать nextFundingTime
+            next_funding_time = None
+            
+            # Сначала проверяем поля в текущем ответе
+            # Логируем все ключи и значения для отладки (только на уровне DEBUG)
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(f"Bitget funding data for {coin}: {d}")
+            
+            # Проверяем все возможные поля, которые могут содержать время следующей выплаты
+            for field in ["nextFundingTime", "nextFundingTimeMs", "fundingTime", "nextFunding", "nextSettleTime", "settleTime", "nextSettleTimestamp", "settleTimestamp", "nextSettleTimeMs", "nextFundingTimestamp", "fundingTimestamp"]:
+                time_val = d.get(field)
+                if time_val is not None and time_val != "" and time_val != 0:
+                    try:
+                        next_funding_time = int(time_val)
+                        logger.debug(f"Bitget found next_funding_time in field '{field}': {next_funding_time} for {coin}")
+                        break
+                    except (TypeError, ValueError):
+                        continue
+            
+            # Если не нашли в current-fund-rate, пробуем получить из ticker
+            if next_funding_time is None:
+                try:
+                    ticker_url = "/api/v2/mix/market/ticker"
+                    ticker_params = {"symbol": symbol, "productType": self.PRODUCT_TYPE}
+                    ticker_data = await self._request_json("GET", ticker_url, params=ticker_params)
+                    
+                    if ticker_data and not self._is_api_error(ticker_data):
+                        ticker_d = ticker_data.get("data")
+                        if isinstance(ticker_d, list) and ticker_d:
+                            ticker_d = ticker_d[0]
+                        if isinstance(ticker_d, dict):
+                            if logger.isEnabledFor(logging.DEBUG):
+                                logger.debug(f"Bitget ticker data for {coin}: {ticker_d}")
+                            # Проверяем поля в ticker
+                            for field in ["nextFundingTime", "nextFundingTimeMs", "fundingTime", "nextFunding", "nextSettleTime", "settleTime", "nextSettleTimestamp", "settleTimestamp", "nextSettleTimeMs", "nextFundingTimestamp", "fundingTimestamp"]:
+                                time_val = ticker_d.get(field)
+                                if time_val is not None and time_val != "" and time_val != 0:
+                                    try:
+                                        next_funding_time = int(time_val)
+                                        logger.debug(f"Bitget found next_funding_time in ticker field '{field}': {next_funding_time} for {coin}")
+                                        break
+                                    except (TypeError, ValueError):
+                                        continue
+                except Exception as e:
+                    logger.debug(f"Bitget: error getting ticker for {coin}: {e}")
+                    pass
+            
+            # Пробуем получить из contract info эндпоинта
+            if next_funding_time is None:
+                try:
+                    contract_url = "/api/v2/mix/market/contracts"
+                    contract_params = {"productType": self.PRODUCT_TYPE}
+                    contract_data = await self._request_json("GET", contract_url, params=contract_params)
+                    
+                    if contract_data and not self._is_api_error(contract_data):
+                        contracts_list = contract_data.get("data")
+                        if isinstance(contracts_list, list):
+                            for contract in contracts_list:
+                                if isinstance(contract, dict) and contract.get("symbol") == symbol:
+                                    if logger.isEnabledFor(logging.DEBUG):
+                                        logger.debug(f"Bitget contract data for {coin}: {contract}")
+                                    # Проверяем поля в contract
+                                    for field in ["nextFundingTime", "nextFundingTimeMs", "fundingTime", "nextFunding", "nextSettleTime", "settleTime", "nextSettleTimestamp", "settleTimestamp", "nextSettleTimeMs", "nextFundingTimestamp", "fundingTimestamp"]:
+                                        time_val = contract.get(field)
+                                        if time_val is not None and time_val != "" and time_val != 0:
+                                            try:
+                                                next_funding_time = int(time_val)
+                                                logger.debug(f"Bitget found next_funding_time in contract field '{field}': {next_funding_time} for {coin}")
+                                                break
+                                            except (TypeError, ValueError):
+                                                continue
+                                    break
+                except Exception as e:
+                    logger.debug(f"Bitget: error getting contract info for {coin}: {e}")
+                    pass
+            
+            # Если API не предоставило время, возвращаем None (не вычисляем расписание)
+            if next_funding_time is None:
+                logger.debug(f"Bitget: API не предоставило next_funding_time для {coin}, возвращаем None")
+
+            return {
+                "funding_rate": funding_rate,
+                "next_funding_time": next_funding_time,
+            }
+
+        except Exception as e:
+            logger.error(f"Bitget: ошибка при получении funding info для {coin}: {e}", exc_info=True)
+            return None
+
     async def get_orderbook(self, coin: str, limit: int = 50) -> Optional[Dict]:
         """
         Получить книгу заявок (orderbook) для монеты

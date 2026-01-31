@@ -66,7 +66,7 @@ EXCLUDE_COINS_STR = os.getenv("EXCLUDE_COINS", "").strip()
 EXCLUDE_COINS = {coin.strip().upper() for coin in EXCLUDE_COINS_STR.split(",") if coin.strip()} if EXCLUDE_COINS_STR else set()
 
 # Биржи для сканирования фандингов
-FUNDING_EXCHANGES = ["bybit", "gate", "okx", "binance"]
+FUNDING_EXCHANGES = ["bybit", "gate", "okx", "binance", "mexc", "bingx", "bitget", "xt"]
 
 
 # ----------------------------
@@ -110,7 +110,11 @@ def calculate_minutes_until_funding(next_funding_time: Optional[int], exchange: 
             - OKX: в миллисекундах
             - Binance: в миллисекундах
             - Gate: в секундах
-        exchange: Название биржи (bybit, gate, okx, binance)
+            - MEXC: определяется автоматически (эвристика)
+            - BingX: определяется автоматически (эвристика)
+            - Bitget: определяется автоматически (эвристика)
+            - XT: определяется автоматически (эвристика)
+        exchange: Название биржи (bybit, gate, okx, binance, mexc, bingx, bitget, xt)
         
     Returns:
         Количество минут до выплаты или None если невозможно вычислить
@@ -121,7 +125,8 @@ def calculate_minutes_until_funding(next_funding_time: Optional[int], exchange: 
     try:
         # Эвристика: значение < 10**12 (10–11 цифр) — секунды; иначе миллисекунды.
         # Gate всегда в секундах; Bybit/OKX/Binance обычно в мс, но OKX для части пар может отдавать секунды.
-        if next_funding_time < 10**12:
+        is_seconds = next_funding_time < 10**12
+        if is_seconds:
             funding_timestamp = float(next_funding_time)
         else:
             funding_timestamp = next_funding_time / 1000
@@ -129,13 +134,32 @@ def calculate_minutes_until_funding(next_funding_time: Optional[int], exchange: 
         now_timestamp = time.time()
         seconds_until = funding_timestamp - now_timestamp
         
+        # Логирование для отладки (только на уровне DEBUG)
+        import logging
+        scan_logger = logging.getLogger("scan_fundings")
+        if scan_logger.isEnabledFor(logging.DEBUG):
+            from datetime import datetime, timezone
+            funding_dt = datetime.fromtimestamp(funding_timestamp, tz=timezone.utc)
+            now_dt = datetime.fromtimestamp(now_timestamp, tz=timezone.utc)
+            scan_logger.debug(
+                f"calculate_minutes_until_funding ({exchange}): "
+                f"next_funding_time={next_funding_time} ({'seconds' if is_seconds else 'milliseconds'}), "
+                f"funding_timestamp={funding_timestamp}, now_timestamp={now_timestamp}, "
+                f"seconds_until={seconds_until:.1f}, funding_dt={funding_dt}, now_dt={now_dt}"
+            )
+        
         if seconds_until < 0:
             # Если время уже прошло, возвращаем None (не вычисляем искусственно)
+            if scan_logger.isEnabledFor(logging.DEBUG):
+                scan_logger.debug(f"calculate_minutes_until_funding ({exchange}): time already passed (seconds_until={seconds_until:.1f})")
             return None
         
         minutes_until = int(seconds_until / 60)
         return minutes_until
-    except Exception:
+    except Exception as e:
+        import logging
+        scan_logger = logging.getLogger("scan_fundings")
+        scan_logger.debug(f"calculate_minutes_until_funding ({exchange}) error: {e}", exc_info=True)
         return None
 
 
@@ -422,6 +446,12 @@ def format_telegram_message(opportunity: Dict[str, Any]) -> str:
         url = f"https://www.gate.io/futures/usdt/{coin}_USDT"
     elif exchange.lower() == "bitget":
         url = f"https://www.bitget.com/futures/usdt/{coin}USDT"
+    elif exchange.lower() == "mexc":
+        url = f"https://futures.mexc.com/exchange/{coin}_USDT"
+    elif exchange.lower() == "bingx":
+        url = f"https://bingx.com/en-us/futures/{coin}USDT"
+    elif exchange.lower() == "xt":
+        url = f"https://www.xt.com/futures/{coin}USDT"
     # Add more exchanges as needed
     
     # Embed link in exchange name if URL is available (HTML format for Telegram)

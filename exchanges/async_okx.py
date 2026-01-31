@@ -226,6 +226,10 @@ class AsyncOkxExchange(AsyncBaseExchange):
 
             funding_rate_raw = funding_data.get("fundingRate")
             next_funding_time_raw = funding_data.get("nextFundingTime")
+            
+            # Логируем все поля для отладки
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(f"OKX funding data for {coin}: {funding_data}")
 
             if funding_rate_raw is None:
                 msg = data.get("msg", "")
@@ -242,11 +246,45 @@ class AsyncOkxExchange(AsyncBaseExchange):
                             next_funding_time = int(float(next_funding_time_raw))
                         else:
                             next_funding_time = int(next_funding_time_raw)
-                        # Коррекция: API отдаёт время ~1 час вперёд относительно UI; вычитаем 1 ч (мс)
-                        next_funding_time = next_funding_time - 3600_000
+                        logger.debug(f"OKX found nextFundingTime for {coin}: {next_funding_time} (raw: {next_funding_time_raw})")
                     except (TypeError, ValueError):
                         # Если не удалось распарсить, оставляем None
                         pass
+                
+                # Если не нашли в funding-rate, пробуем получить из ticker
+                if next_funding_time is None:
+                    try:
+                        ticker_url = "/api/v5/market/ticker"
+                        ticker_params = {"instId": symbol}
+                        ticker_data = await self._request_json("GET", ticker_url, params=ticker_params)
+                        
+                        if ticker_data and not self._is_api_error(ticker_data):
+                            ticker_list = ticker_data.get("data")
+                            if isinstance(ticker_list, list) and ticker_list:
+                                ticker_item = ticker_list[0]
+                                if isinstance(ticker_item, dict):
+                                    if logger.isEnabledFor(logging.DEBUG):
+                                        logger.debug(f"OKX ticker data for {coin}: {ticker_item}")
+                                    # Проверяем поля в ticker
+                                    for field in ["nextFundingTime", "nextFundingTimeMs", "fundingTime", "nextFunding", "nextSettleTime", "settleTime"]:
+                                        time_val = ticker_item.get(field)
+                                        if time_val is not None and time_val != "" and time_val != 0:
+                                            try:
+                                                if isinstance(time_val, str):
+                                                    next_funding_time = int(float(time_val))
+                                                else:
+                                                    next_funding_time = int(time_val)
+                                                logger.debug(f"OKX found next_funding_time in ticker field '{field}': {next_funding_time} for {coin}")
+                                                break
+                                            except (TypeError, ValueError):
+                                                continue
+                    except Exception as e:
+                        logger.debug(f"OKX: error getting ticker for {coin}: {e}")
+                        pass
+                
+                # Если API не предоставило время, возвращаем None (не вычисляем расписание)
+                if next_funding_time is None:
+                    logger.debug(f"OKX: API не предоставило next_funding_time для {coin}, возвращаем None")
                 
                 return {
                     "funding_rate": funding_rate,

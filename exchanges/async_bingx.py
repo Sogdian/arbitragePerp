@@ -209,6 +209,85 @@ class AsyncBingxExchange(AsyncBaseExchange):
             logger.error(f"BingX: ошибка при получении фандинга для {coin}: {e}", exc_info=True)
             return None
 
+    async def get_funding_info(self, coin: str) -> Optional[Dict]:
+        """
+        Получить информацию о фандинге (ставка и время до следующей выплаты)
+        
+        Args:
+            coin: Название монеты без /USDT (например, "CVC")
+            
+        Returns:
+            Словарь с данными:
+            {
+                "funding_rate": float,  # Ставка фандинга (например, 0.0001 = 0.01%)
+                "next_funding_time": int,  # Timestamp следующей выплаты (может быть None, если API не предоставляет)
+            }
+            или None если ошибка
+        """
+        try:
+            symbol = self._normalize_symbol(coin)
+            url = "/openApi/swap/v2/quote/premiumIndex"
+            params = {"symbol": symbol}
+
+            data = await self._request_json("GET", url, params=params)
+            if not data:
+                logger.warning(f"BingX: пустой ответ premiumIndex для {coin} (symbol={symbol})")
+                return None
+            
+            code_int = self._get_code_int(data)
+            if code_int is not None and code_int != 0:
+                msg = data.get("msg", "")
+                if code_int in _BINGX_NOT_FOUND_CODES or code_int in _BINGX_PAUSED_CODES:
+                    logger.debug(f"BingX: premiumIndex unavailable for {coin} (symbol={symbol}, code={code_int}, msg={msg})")
+                else:
+                    logger.warning(f"BingX: premiumIndex API error для {coin} (symbol={symbol}, code={code_int}, msg={msg})")
+                return None
+
+            # BingX возвращает данные в поле "data"
+            funding_data = data.get("data")
+            # Иногда BingX может вернуть data как list (редко, но бывает)
+            if isinstance(funding_data, list) and funding_data:
+                funding_data = funding_data[0]
+            if not isinstance(funding_data, dict):
+                return None
+
+            # BingX может возвращать funding rate в разных полях
+            funding_rate_raw = (
+                funding_data.get("lastFundingRate")
+                or funding_data.get("fundingRate")
+                or funding_data.get("fundingRateNext")
+                or funding_data.get("nextFundingRate")
+            )
+            if funding_rate_raw is None:
+                return None
+
+            try:
+                funding_rate = float(funding_rate_raw)
+            except (TypeError, ValueError):
+                return None
+            
+            # BingX API может не предоставлять время следующей выплаты в этом эндпоинте
+            # Проверяем возможные поля для времени
+            next_funding_time = None
+            # Пробуем найти время в разных полях
+            for field in ["nextFundingTime", "nextFundingTimeMs", "fundingTime", "nextFunding", "nextSettleTime", "settleTime", "nextFundingTimestamp"]:
+                time_val = funding_data.get(field)
+                if time_val is not None:
+                    try:
+                        next_funding_time = int(time_val)
+                        break
+                    except (TypeError, ValueError):
+                        continue
+
+            return {
+                "funding_rate": funding_rate,
+                "next_funding_time": next_funding_time,
+            }
+
+        except Exception as e:
+            logger.error(f"BingX: ошибка при получении funding info для {coin}: {e}", exc_info=True)
+            return None
+
     async def get_orderbook(self, coin: str, limit: int = 50) -> Optional[Dict[str, Any]]:
         """
         Получить книгу заявок (orderbook) для монеты
