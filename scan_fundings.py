@@ -56,16 +56,19 @@ SCAN_INTERVAL_SEC = float(os.getenv("SCAN_FUNDING_INTERVAL_SEC", "60"))  # ка�
 MAX_CONCURRENCY = int(os.getenv("SCAN_FUNDING_MAX_CONCURRENCY", "20"))  # сколько одновременных http запросов
 COIN_BATCH_SIZE = int(os.getenv("SCAN_FUNDING_COIN_BATCH_SIZE", "50"))  # сколько монет обрабатывать за пачку
 REQ_TIMEOUT_SEC = float(os.getenv("SCAN_FUNDING_REQ_TIMEOUT_SEC", "12"))  # таймаут на запрос к бирже
+# MEXC часто отвечает медленно — отдельный таймаут (сек), по умолчанию 45 (2 запроса × 2 домена)
+MEXC_REQ_TIMEOUT_SEC = float(os.getenv("SCAN_FUNDING_MEXC_REQ_TIMEOUT_SEC", "45"))
 SCAN_FUNDING_MIN_TIME_TO_PAY = float(os.getenv("SCAN_FUNDING_MIN_TIME_TO_PAY", "0"))  # минимальное время до выплаты в минутах (если >= этого значения, не отправляем в Telegram)
 SCAN_COIN_INVEST = float(os.getenv("SCAN_COIN_INVEST", "50"))  # размер позиции (USDT) для расчета минимального количества монет
 EXCLUDE_EXCHANGES = {"lbank"}  # не использовать
+SCAN_FUNDING_NOTIFY_NEW_CYCLE = os.getenv("SCAN_FUNDING_NOTIFY_NEW_CYCLE", "1").strip() == "1"
 
 # Монеты для исключения из поиска фандингов (через запятую, например: EXCLUDE_COINS=FLOW,BTC)
 EXCLUDE_COINS_STR = os.getenv("EXCLUDE_COINS", "").strip()
 EXCLUDE_COINS = {coin.strip().upper() for coin in EXCLUDE_COINS_STR.split(",") if coin.strip()} if EXCLUDE_COINS_STR else set()
 
 # Биржи для сканирования фандингов
-FUNDING_EXCHANGES = ["bybit"]
+FUNDING_EXCHANGES = ["bybit", "gate", "okx", "binance", "mexc", "bingx", "bitget", "xt"]
 
 
 # ----------------------------
@@ -73,17 +76,19 @@ FUNDING_EXCHANGES = ["bybit"]
 # ----------------------------
 LOG_LEVEL = os.getenv("SCAN_FUNDING_LOG_LEVEL", "INFO").upper()
 
-logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL, logging.INFO),
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-    ],
-)
-
+# Настраиваем именованный logger без propagation к root (чтобы не попадать в fun.log)
 logger = logging.getLogger("scan_fundings")
+logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
+logger.propagate = False  # Не распространять в root logger (fun.log)
+
+# Добавляем только StreamHandler (консоль)
+_formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+_stream_handler = logging.StreamHandler(sys.stdout)
+_stream_handler.setFormatter(_formatter)
+logger.addHandler(_stream_handler)
+
+# Отключаем verbose логи от библиотек
 logging.getLogger("httpx").setLevel(logging.WARNING)
-# В scan_fundings не печатаем "подробные" логи из bot/бирж
 logging.getLogger("bot").setLevel(logging.CRITICAL)
 logging.getLogger("exchanges").setLevel(logging.CRITICAL)
 
@@ -102,8 +107,16 @@ def calculate_minutes_until_funding(next_funding_time: Optional[int], exchange: 
     Использует только данные из API, без хардкода расписания.
     
     Args:
-        next_funding_time: Timestamp следующей выплаты (в миллисекундах для Bybit)
-        exchange: Название биржи (только bybit)
+        next_funding_time: Timestamp следующей выплаты
+            - Bybit: в миллисекундах
+            - OKX: в миллисекундах
+            - Binance: в миллисекундах
+            - Gate: в секундах
+            - MEXC: определяется автоматически (эвристика)
+            - BingX: определяется автоматически (эвристика)
+            - Bitget: определяется автоматически (эвристика)
+            - XT: определяется автоматически (эвристика)
+        exchange: Название биржи (bybit, gate, okx, binance, mexc, bingx, bitget, xt)
         
     Returns:
         Количество минут до выплаты или None если невозможно вычислить
@@ -112,19 +125,43 @@ def calculate_minutes_until_funding(next_funding_time: Optional[int], exchange: 
         return None
     
     try:
-        # Bybit возвращает timestamp в миллисекундах
-        funding_timestamp = next_funding_time / 1000
-        
+        # Эвристика: значение < 10**12 (10–11 цифр) — секунды; иначе миллисекунды.
+        # Gate всегда в секундах; Bybit/OKX/Binance обычно в мс, но OKX для части пар может отдавать секунды.
+        is_seconds = next_funding_time < 10**12
+        if is_seconds:
+            funding_timestamp = float(next_funding_time)
+        else:
+            funding_timestamp = next_funding_time / 1000
+
         now_timestamp = time.time()
         seconds_until = funding_timestamp - now_timestamp
         
+        # Логирование для отладки (только на уровне DEBUG)
+        import logging
+        scan_logger = logging.getLogger("scan_fundings")
+        if scan_logger.isEnabledFor(logging.DEBUG):
+            from datetime import datetime, timezone
+            funding_dt = datetime.fromtimestamp(funding_timestamp, tz=timezone.utc)
+            now_dt = datetime.fromtimestamp(now_timestamp, tz=timezone.utc)
+            scan_logger.debug(
+                f"calculate_minutes_until_funding ({exchange}): "
+                f"next_funding_time={next_funding_time} ({'seconds' if is_seconds else 'milliseconds'}), "
+                f"funding_timestamp={funding_timestamp}, now_timestamp={now_timestamp}, "
+                f"seconds_until={seconds_until:.1f}, funding_dt={funding_dt}, now_dt={now_dt}"
+            )
+        
         if seconds_until < 0:
             # Если время уже прошло, возвращаем None (не вычисляем искусственно)
+            if scan_logger.isEnabledFor(logging.DEBUG):
+                scan_logger.debug(f"calculate_minutes_until_funding ({exchange}): time already passed (seconds_until={seconds_until:.1f})")
             return None
         
         minutes_until = int(seconds_until / 60)
         return minutes_until
-    except Exception:
+    except Exception as e:
+        import logging
+        scan_logger = logging.getLogger("scan_fundings")
+        scan_logger.debug(f"calculate_minutes_until_funding ({exchange}) error: {e}", exc_info=True)
         return None
 
 
@@ -198,15 +235,16 @@ async def fetch_funding_info(
     if not exchange:
         return None
 
+    timeout_sec = MEXC_REQ_TIMEOUT_SEC if exchange_name.lower() == "mexc" else REQ_TIMEOUT_SEC
     try:
         async with sem:
             funding_info = await asyncio.wait_for(
                 exchange.get_funding_info(coin),
-                timeout=REQ_TIMEOUT_SEC
+                timeout=timeout_sec
             )
         return funding_info
     except asyncio.TimeoutError:
-        logger.info(f"Timeout: {exchange_name} {coin} funding > {REQ_TIMEOUT_SEC:.1f}s")
+        logger.info(f"Timeout: {exchange_name} {coin} funding > {timeout_sec:.1f}s")
         return None
     except Exception as e:
         logger.info(f"Fetch error: {exchange_name} {coin} funding: {e}")
@@ -399,8 +437,33 @@ def format_telegram_message(opportunity: Dict[str, Any]) -> str:
     
     minutes_str = f"{minutes_until} min" if minutes_until is not None else "N/A"
     
+    # Build exchange-specific URL
+    url = ""
+    if exchange.lower() == "bybit":
+        url = f"https://www.bybit.com/trade/usdt/{coin}USDT"
+    elif exchange.lower() == "binance":
+        url = f"https://www.binance.com/en/futures/{coin}USDT"
+    elif exchange.lower() == "okx":
+        url = f"https://www.okx.com/trade-swap/{coin.lower()}-usdt-swap"
+    elif exchange.lower() == "gate":
+        url = f"https://www.gate.io/futures/usdt/{coin}_USDT"
+    elif exchange.lower() == "bitget":
+        url = f"https://www.bitget.com/futures/usdt/{coin}USDT"
+    elif exchange.lower() == "mexc":
+        url = f"https://futures.mexc.com/exchange/{coin}_USDT"
+    elif exchange.lower() == "bingx":
+        url = f"https://bingx.com/en-us/futures/{coin}USDT"
+    elif exchange.lower() == "xt":
+        url = f"https://www.xt.com/futures/{coin}USDT"
+    # Add more exchanges as needed
+    
+    # Embed link in exchange name if URL is available (HTML format for Telegram)
+    exchange_display = exchange
+    if url:
+        exchange_display = f'<a href="{url}">{exchange}</a>'
+    
     lines = [
-        f"🔔💲 {exchange} {coin}",
+        f"🔔💲 {exchange_display} {coin}",
         f"funding: {funding_rate_pct:.3f}%",
         f"time to pay: {minutes_str}",
     ]
@@ -417,37 +480,34 @@ async def scan_once(
     """
     Один проход по всем монетам батчами.
     
-    Обрабатывает монеты параллельно батчами размера COIN_BATCH_SIZE.
+    Сначала обрабатываются все монеты первой биржи, затем второй и т.д.
     Уведомления в Telegram отправляются сразу после нахождения каждой возможности.
     """
-    # Инициализируем Telegram один раз для всех монет
     telegram = TelegramSender()
     channel_id = config.TEST_CHANNEL_ID if telegram.enabled else None
     
     opportunities: List[Dict[str, Any]] = []
     
+    # Пары (биржа, монета) по биржам подряд: сначала все монеты биржи 1, потом биржи 2 и т.д.
+    pairs: List[tuple] = []
     for exchange_name in exchanges:
         coins = coins_by_exchange.get(exchange_name, set())
-        if not coins:
-            continue
-        
-        coins_list = sorted(list(coins))
-        total = len(coins_list)
-        
-        for i in range(0, total, COIN_BATCH_SIZE):
-            batch = coins_list[i:i + COIN_BATCH_SIZE]
-            results = await asyncio.gather(
-                *(process_coin(bot, exchange_name, coin, sem, telegram, channel_id) for coin in batch),
-                return_exceptions=True
-            )
-            
-            for result in results:
-                if isinstance(result, Exception):
-                    continue
-                if result is not None:
-                    opportunities.append(result)
-            
-            logger.debug(f"Progress {exchange_name}: {min(i + COIN_BATCH_SIZE, total)}/{total} coins processed")
+        for coin in sorted(coins):
+            pairs.append((exchange_name, coin))
+    
+    total = len(pairs)
+    for i in range(0, total, COIN_BATCH_SIZE):
+        batch = pairs[i:i + COIN_BATCH_SIZE]
+        results = await asyncio.gather(
+            *(process_coin(bot, ex, coin, sem, telegram, channel_id) for (ex, coin) in batch),
+            return_exceptions=True
+        )
+        for result in results:
+            if isinstance(result, Exception):
+                continue
+            if result is not None:
+                opportunities.append(result)
+        logger.debug(f"Progress: {min(i + COIN_BATCH_SIZE, total)}/{total} pairs processed")
 
 
 async def main():
@@ -489,7 +549,14 @@ async def main():
                     logger.info(f"{ex}: {len(coins_by_exchange.get(ex, set()))} монет")
                 printed_stats = True
             
-            logger.info(f"🔄 Новый цикл поиска фандингов | exchanges={exchanges}")
+            cycle_msg = f"🔄 Новый цикл поиска фандингов | exchanges={exchanges}"
+            logger.info(cycle_msg)
+            if SCAN_FUNDING_NOTIFY_NEW_CYCLE and telegram.enabled:
+                # best-effort: уведомление не должно ломать цикл сканирования
+                try:
+                    await telegram.send_message(cycle_msg)
+                except Exception:
+                    logger.debug("Telegram: failed to send new-cycle notification", exc_info=True)
             t0 = time.perf_counter()
             
             await scan_once(bot, exchanges, coins_by_exchange, sem)

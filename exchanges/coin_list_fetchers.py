@@ -299,7 +299,20 @@ async def fetch_okx_coins(exchange) -> Set[str]:
         items = data.get("data") or []
         if not isinstance(items, list):
             return coins
-        
+
+        # --- Временное логирование для отладки SENT ---
+        found_sent = False
+        for it in items:
+            inst_id = it.get("instId")
+            state = it.get("state")
+            settle = it.get("settleCcy")
+            if inst_id and "SENT" in inst_id.upper():
+                logger.info(f"DEBUG OKX Instrument: instId={inst_id}, state={state}, settleCcy={settle}")
+                found_sent = True
+        if not found_sent:
+            logger.info("DEBUG OKX: SENT-USDT-SWAP не найден в списке инструментов SWAP от API.")
+        # --- Конец временного логирования ---
+
         for it in items:
             inst_id = it.get("instId")  # BTC-USDT-SWAP
             settle = it.get("settleCcy")
@@ -307,12 +320,12 @@ async def fetch_okx_coins(exchange) -> Set[str]:
                 continue
             if not isinstance(inst_id, str) or not inst_id.endswith("-USDT-SWAP"):
                 continue
-            
+
             # Фильтруем только активные инструменты (state == "live")
             state = it.get("state")
             if state and state != "live":
                 continue
-            
+
             coins.add(inst_id.split("-")[0].upper())
         
         return coins

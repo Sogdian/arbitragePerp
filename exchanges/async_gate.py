@@ -248,14 +248,52 @@ class AsyncGateExchange(AsyncBaseExchange):
             if r is None:
                 return None
 
-            # Gate возвращает funding_next_apply_time в секундах (Unix timestamp)
-            # Также может быть в других полях: funding_next_apply_time, next_funding_time, funding_time
+            # Gate контракт-эндпоинт может возвращать время следующей выплаты в разных полях.
+            # На практике встречается `funding_next_apply` (unix seconds), а не `funding_next_apply_time`.
+            # Также может быть в других полях: funding_next_apply_time, next_funding_time, funding_time, ...
+            # Проверяем все возможные поля для времени следующей выплаты
+            # Важно: проверяем не только на None, но и на 0/пустую строку
+            def _get_time_field(field_name):
+                val = data.get(field_name)
+                if val is None or val == "" or val == 0:
+                    return None
+                return val
+            
             next_funding_time_raw = (
-                data.get("funding_next_apply_time") or
-                data.get("next_funding_time") or
-                data.get("funding_time") or
-                data.get("next_funding_apply_time")
+                _get_time_field("funding_next_apply_time") or
+                _get_time_field("funding_next_apply") or
+                _get_time_field("next_funding_time") or
+                _get_time_field("funding_time") or
+                _get_time_field("next_funding_apply_time") or
+                _get_time_field("funding_next_time") or
+                _get_time_field("next_funding") or
+                _get_time_field("funding_apply_time")
             )
+            
+            # Если не нашли в contracts, пробуем получить из тикера (может содержать время следующей выплаты)
+            if next_funding_time_raw is None:
+                try:
+                    ticker_data = await self.get_futures_ticker(coin)
+                    # Тикер обычно не содержит время следующей выплаты, но проверим на всякий случай
+                    # (это маловероятно, но не помешает)
+                except Exception:
+                    pass
+            
+            # Логируем для диагностики, если время не найдено
+            if next_funding_time_raw is None:
+                # Логируем все поля, связанные с funding/time/next
+                available_keys = [k for k in data.keys() if "funding" in k.lower() or "time" in k.lower() or "next" in k.lower()]
+                # Также логируем все ключи для полной диагностики (первые 30)
+                all_keys = list(data.keys())[:30]
+                logger.warning(
+                    f"Gate: не найдено время следующей выплаты для {coin} (symbol={symbol}). "
+                    f"Релевантные поля: {available_keys if available_keys else 'нет'}. "
+                    f"Все поля (первые 30): {all_keys}"
+                )
+                # Логируем значения релевантных полей
+                if available_keys:
+                    relevant_values = {k: data.get(k) for k in available_keys[:10]}
+                    logger.warning(f"Gate: значения релевантных полей для {coin}: {relevant_values}")
 
             # Если не нашли в contracts, пробуем получить из истории фандингов
             if next_funding_time_raw is None:
@@ -267,22 +305,97 @@ class AsyncGateExchange(AsyncBaseExchange):
                     if isinstance(data_history, list) and data_history:
                         item = data_history[0]
                         # В истории может быть время следующей выплаты или время последней выплаты
-                        next_funding_time_raw = (
+                        # Проверяем все возможные поля
+                        last_funding_time_raw = (
                             item.get("t") or  # timestamp последней выплаты
                             item.get("time") or
-                            item.get("next_time")
+                            item.get("funding_time") or
+                            item.get("apply_time")
                         )
-                        # Если получили время последней выплаты, добавляем 8 часов (28800 секунд)
+                        
+                        # Также проверяем, может быть есть поле для следующей выплаты
+                        next_funding_time_raw = (
+                            item.get("next_time") or
+                            item.get("next_funding_time") or
+                            item.get("next_apply_time")
+                        )
+                        
+                        # Если нашли время следующей выплаты напрямую - используем его
                         if next_funding_time_raw is not None:
                             try:
-                                last_time = int(next_funding_time_raw)
+                                # Может быть в секундах или миллисекундах
+                                next_time = int(float(next_funding_time_raw))
+                                # Если значение очень большое (> 1e10), вероятно это миллисекунды
+                                if next_time > 1e10:
+                                    next_funding_time_raw = next_time // 1000
+                                else:
+                                    next_funding_time_raw = next_time
+                            except (TypeError, ValueError):
+                                next_funding_time_raw = None
+                        # Если получили время последней выплаты, добавляем 8 часов (28800 секунд)
+                        elif last_funding_time_raw is not None:
+                            try:
+                                last_time = int(float(last_funding_time_raw))
+                                # Если значение очень большое (> 1e10), вероятно это миллисекунды
+                                if last_time > 1e10:
+                                    last_time = last_time // 1000
                                 # Добавляем 8 часов для следующей выплаты
                                 next_funding_time_raw = last_time + 28800
                             except (TypeError, ValueError):
                                 next_funding_time_raw = None
-                except Exception:
+                except Exception as e:
                     # Если не удалось получить из истории, оставляем None
+                    logger.debug(f"Gate: ошибка при получении истории фандинга для {coin}: {e}")
                     pass
+            
+            # Если всё ещё не нашли время, вычисляем fallback-ом.
+            # ВАЖНО: НЕ хардкодим 8ч, потому что на Gate встречаются контракты с другим интервалом
+            # (например, 1 час: funding_interval=3600).
+            # Если время вычислено через fallback, логируем предупреждение.
+            fallback_used = False
+            if next_funding_time_raw is None:
+                from datetime import datetime, timezone, timedelta
+
+                now_utc = datetime.now(timezone.utc)
+                now_s = int(now_utc.timestamp())
+
+                # 1) Prefer contract-specified interval/offset if present
+                interval_raw = data.get("funding_interval")
+                offset_raw = data.get("funding_offset")
+                try:
+                    interval_s = int(float(interval_raw)) if interval_raw not in (None, "", 0) else 0
+                except Exception:
+                    interval_s = 0
+                try:
+                    offset_s = int(float(offset_raw)) if offset_raw not in (None, "", 0) else 0
+                except Exception:
+                    offset_s = 0
+
+                next_funding_dt = None
+                if interval_s > 0:
+                    # next = ceil((now - offset) / interval) * interval + offset
+                    k = (max(0, now_s - offset_s) // interval_s) + 1
+                    next_s = (k * interval_s) + offset_s
+                    next_funding_time_raw = int(next_s)
+                    next_funding_dt = datetime.fromtimestamp(next_s, tz=timezone.utc)
+                else:
+                    # 2) Ultimate fallback: 8 hours at 00:00, 08:00, 16:00 UTC
+                    current_hour = now_utc.hour
+                    if current_hour < 8:
+                        next_funding_dt = now_utc.replace(hour=8, minute=0, second=0, microsecond=0)
+                    elif current_hour < 16:
+                        next_funding_dt = now_utc.replace(hour=16, minute=0, second=0, microsecond=0)
+                    else:
+                        next_day = now_utc + timedelta(days=1)
+                        next_funding_dt = next_day.replace(hour=0, minute=0, second=0, microsecond=0)
+                    next_funding_time_raw = int(next_funding_dt.timestamp())
+
+                fallback_used = True
+                logger.warning(
+                    f"Gate: используем fallback для вычисления времени выплаты {coin} (symbol={symbol}). "
+                    f"Вычислено: {next_funding_dt.strftime('%Y-%m-%d %H:%M:%S UTC') if next_funding_dt else next_funding_time_raw}. "
+                    f"Поля: funding_next_apply/funding_next_apply_time отсутствуют; interval={data.get('funding_interval')} offset={data.get('funding_offset')}."
+                )
 
             try:
                 funding_rate = float(r)
@@ -291,11 +404,36 @@ class AsyncGateExchange(AsyncBaseExchange):
                     try:
                         # Может быть строка или число
                         if isinstance(next_funding_time_raw, str):
-                            next_funding_time = int(float(next_funding_time_raw))
+                            next_time_val = int(float(next_funding_time_raw))
                         else:
-                            next_funding_time = int(next_funding_time_raw)
-                    except (TypeError, ValueError):
+                            next_time_val = int(next_funding_time_raw)
+                        
+                        # Gate API возвращает время в секундах (Unix timestamp)
+                        # Но если значение очень большое (> 1e10), возможно это миллисекунды
+                        # Конвертируем в секунды, если нужно
+                        original_val = next_time_val
+                        if next_time_val > 1e10:
+                            next_funding_time = next_time_val // 1000
+                            logger.debug(f"Gate: конвертировали время из миллисекунд в секунды для {coin}: {original_val} -> {next_funding_time}")
+                        else:
+                            next_funding_time = next_time_val
+                        
+                        # Логируем для диагностики
+                        from datetime import datetime, timezone
+                        if next_funding_time:
+                            next_dt = datetime.fromtimestamp(next_funding_time, tz=timezone.utc)
+                            now_dt = datetime.now(timezone.utc)
+                            diff_seconds = next_funding_time - int(now_dt.timestamp())
+                            diff_minutes = diff_seconds // 60
+                            logger.debug(
+                                f"Gate: время следующей выплаты для {coin}: "
+                                f"raw={original_val}, seconds={next_funding_time}, "
+                                f"next_dt={next_dt.strftime('%Y-%m-%d %H:%M:%S UTC')}, "
+                                f"diff={diff_minutes} мин (fallback_used={fallback_used})"
+                            )
+                    except (TypeError, ValueError) as e:
                         # Если не удалось распарсить, оставляем None
+                        logger.debug(f"Gate: ошибка парсинга времени для {coin}: {e}")
                         pass
                 
                 return {

@@ -46,6 +46,7 @@ class AsyncMexcExchange(AsyncBaseExchange):
         aliases = {
             "FUN": "SPORTFUN_USDT",      # UI FUNUSDT -> API SPORTFUN_USDT
             "FUNTOKEN": "FUN_USDT",      # UI FUNTOKENUSDT -> API FUN_USDT
+            "LUNA": "LUNANEW_USDT",      # UI LUNAUSDT -> API LUNANEW_USDT (основной бессрочный)
         }
         return aliases.get(c, f"{c}_USDT")
 
@@ -101,7 +102,7 @@ class AsyncMexcExchange(AsyncBaseExchange):
                         base_url=domain,
                         headers=headers,
                         limits=httpx.Limits(max_connections=10, max_keepalive_connections=10),
-                        timeout=httpx.Timeout(8.0, connect=3.0),
+                        timeout=httpx.Timeout(15.0, connect=5.0),  # MEXC часто отвечает медленно
                     ) as client:
                         resp = await client.request(method, url, params=params)
                         resp.raise_for_status()
@@ -311,6 +312,92 @@ class AsyncMexcExchange(AsyncBaseExchange):
 
         except Exception as e:
             logger.error(f"MEXC: ошибка при получении фандинга для {coin}: {e}", exc_info=True)
+            return None
+
+    async def get_funding_info(self, coin: str) -> Optional[Dict]:
+        """
+        Получить информацию о фандинге (ставка и время до следующей выплаты)
+        
+        Args:
+            coin: Название монеты без /USDT (например, "CVC")
+            
+        Returns:
+            Словарь с данными:
+            {
+                "funding_rate": float,  # Ставка фандинга (например, 0.0001 = 0.01%)
+                "next_funding_time": int,  # Timestamp следующей выплаты (может быть None, если API не предоставляет)
+            }
+            или None если ошибка
+        """
+        try:
+            # 1) пробуем COIN_USDT (с учетом алиасов)
+            symbol1 = self._normalize_symbol(coin)
+            url1 = f"/api/v1/contract/funding_rate/{symbol1}"
+            data = await self._request_json_with_domain_fallback("GET", url1, params=None)
+
+            # 2) fallback COINUSDT
+            code_int = _to_int(data.get("code")) if isinstance(data, dict) else None
+            if not data or (code_int is not None and code_int != 0) or self._looks_empty_top(data):
+                symbol2 = symbol1.replace("_", "")
+                url2 = f"/api/v1/contract/funding_rate/{symbol2}"
+                data = await self._request_json_with_domain_fallback("GET", url2, params=None)
+
+            if not data:
+                logger.warning(f"MEXC: не удалось получить фандинг для {coin}")
+                return None
+
+            if isinstance(data, dict) and "code" in data:
+                code_int = _to_int(data.get("code"))
+                if code_int in _MEXC_NOT_FOUND_CODES:
+                    logger.debug(f"MEXC: funding not found for {coin}: code={code_int} msg={data.get('msg')}")
+                    return None
+                if code_int is not None and code_int != 0:
+                    logger.warning(f"MEXC: funding API error {coin}: code={data.get('code')} msg={data.get('msg')}")
+                    return None
+
+            # данные могут лежать в data/result или быть прямым dict
+            item = None
+            if isinstance(data, dict):
+                item = data.get("data") if data.get("data") is not None else data.get("result")
+                if item is None:
+                    item = data
+                if isinstance(item, list) and item:
+                    item = item[0]
+            elif isinstance(data, list) and data:
+                item = data[0]
+
+            if not isinstance(item, dict):
+                logger.warning(f"MEXC: funding для {coin} не найден/не dict")
+                return None
+
+            funding_rate_raw = item.get("fundingRate") or item.get("rate") or item.get("r")
+
+            if funding_rate_raw is None:
+                logger.warning(f"MEXC: нет поля fundingRate/rate/r для {coin}: {item}")
+                return None
+
+            funding_rate = float(funding_rate_raw)
+            
+            # MEXC API может не предоставлять время следующей выплаты в этом эндпоинте
+            # Проверяем возможные поля для времени
+            next_funding_time = None
+            # Пробуем найти время в разных полях
+            for field in ["nextFundingTime", "nextFundingTimeMs", "fundingTime", "nextFunding", "nextSettleTime", "settleTime", "nextFundingTimestamp", "settleTimestamp"]:
+                time_val = item.get(field)
+                if time_val is not None:
+                    try:
+                        next_funding_time = int(time_val)
+                        break
+                    except (TypeError, ValueError):
+                        continue
+
+            return {
+                "funding_rate": funding_rate,
+                "next_funding_time": next_funding_time,
+            }
+
+        except Exception as e:
+            logger.error(f"MEXC: ошибка при получении funding info для {coin}: {e}", exc_info=True)
             return None
 
     async def get_orderbook(self, coin: str, limit: int = 50) -> Optional[Dict]:

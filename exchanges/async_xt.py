@@ -142,6 +142,105 @@ class AsyncXtExchange(AsyncBaseExchange):
             logger.error(f"XT: ошибка при получении фандинга для {coin}: {e}", exc_info=True)
             return None
 
+    async def get_funding_info(self, coin: str) -> Optional[Dict]:
+        """
+        Получить информацию о фандинге (ставка и время до следующей выплаты)
+        
+        Args:
+            coin: Название монеты без /USDT (например, "CVC")
+            
+        Returns:
+            Словарь с данными:
+            {
+                "funding_rate": float,  # Ставка фандинга (например, 0.0001 = 0.01%)
+                "next_funding_time": int,  # Timestamp следующей выплаты (может быть None, если API не предоставляет)
+            }
+            или None если ошибка
+        """
+        try:
+            symbol = self._normalize_symbol(coin)
+            url = "/future/market/v1/public/q/funding-rate"
+            params = {"symbol": symbol}
+            
+            data = await self._request_json("GET", url, params=params)
+            if not data:
+                logger.warning(f"XT: не удалось получить ответ для фандинга {coin} (символ: {symbol})")
+                return None
+            
+            return_code = data.get("returnCode")
+            if return_code != 0:
+                msg = data.get("msgInfo", "Unknown error")
+                logger.warning(f"XT: API вернул ошибку для фандинга {coin} (символ: {symbol}): returnCode={return_code}, msg={msg}")
+                return None
+            
+            result = data.get("result")
+            if not result or not isinstance(result, dict):
+                logger.warning(f"XT: фандинг для {coin} не найден (символ: {symbol}, result пустой или не словарь)")
+                return None
+            
+            funding_rate_raw = result.get("fundingRate")
+            if funding_rate_raw is None:
+                return None
+            
+            funding_rate = float(funding_rate_raw)
+            
+            # XT API может не предоставлять время следующей выплаты в этом эндпоинте
+            # Проверяем возможные поля для времени
+            next_funding_time = None
+            
+            # Логируем все поля для отладки (только на уровне DEBUG)
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(f"XT funding data for {coin}: {result}")
+            
+            # XT API возвращает время следующей выплаты в поле nextCollectionTime (мс)
+            for field in ["nextCollectionTime", "nextFundingTime", "nextFundingTimeMs", "fundingTime", "nextFunding", "nextSettleTime", "settleTime", "nextSettleTimestamp", "settleTimestamp", "nextFundingTimestamp", "fundingTimestamp"]:
+                time_val = result.get(field)
+                if time_val is not None and time_val != "" and time_val != 0:
+                    try:
+                        next_funding_time = int(time_val)
+                        logger.debug(f"XT found next_funding_time in field '{field}': {next_funding_time} for {coin}")
+                        break
+                    except (TypeError, ValueError):
+                        continue
+            
+            # Пробуем получить из ticker эндпоинта
+            if next_funding_time is None:
+                try:
+                    ticker_url = "/future/market/v1/public/q/ticker"
+                    ticker_params = {"symbol": symbol}
+                    ticker_data = await self._request_json("GET", ticker_url, params=ticker_params)
+                    
+                    if ticker_data and ticker_data.get("returnCode") == 0:
+                        ticker_result = ticker_data.get("result")
+                        if isinstance(ticker_result, dict):
+                            if logger.isEnabledFor(logging.DEBUG):
+                                logger.debug(f"XT ticker data for {coin}: {ticker_result}")
+                            for field in ["nextCollectionTime", "nextFundingTime", "nextFundingTimeMs", "fundingTime", "nextFunding", "nextSettleTime", "settleTime", "nextSettleTimestamp", "settleTimestamp", "nextSettleTimeMs", "nextFundingTimestamp", "fundingTimestamp"]:
+                                time_val = ticker_result.get(field)
+                                if time_val is not None and time_val != "" and time_val != 0:
+                                    try:
+                                        next_funding_time = int(time_val)
+                                        logger.debug(f"XT found next_funding_time in ticker field '{field}': {next_funding_time} for {coin}")
+                                        break
+                                    except (TypeError, ValueError):
+                                        continue
+                except Exception as e:
+                    logger.debug(f"XT: error getting ticker for {coin}: {e}")
+                    pass
+            
+            # Если API не предоставило время, возвращаем None (не вычисляем расписание)
+            if next_funding_time is None:
+                logger.debug(f"XT: API не предоставило next_funding_time для {coin}, возвращаем None")
+            
+            return {
+                "funding_rate": funding_rate,
+                "next_funding_time": next_funding_time,
+            }
+                
+        except Exception as e:
+            logger.error(f"XT: ошибка при получении funding info для {coin}: {e}", exc_info=True)
+            return None
+
     async def get_orderbook(self, coin: str, limit: int = 50) -> Optional[Dict]:
         """
         XT Futures orderbook (cg API)
