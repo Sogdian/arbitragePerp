@@ -25,11 +25,12 @@ pip install -r requirements.txt
 
 **Windows/Linux:**
 ```bash
-python scan_spreads.py (тут SCAN_COIN_INVEST)
-python one_coin_bot.py CLO (тут SCAN_COIN_INVEST)
-python bot.py "STO Long (mexc), Short (bybit) 30" --no-monitor (30 = количество монет CVC)
-python scan_fundings.py
-python fun.py "LPT Bybit 10 -0.1%"
+python scan_spreads.py (тут SCAN_COIN_INVEST) - спред цен
+python one_coin_bot.py CLO (тут SCAN_COIN_INVEST) - спред цен по одной монете
+python bot.py "STO Long (mexc), Short (bybit) 30" --no-monitor (30 = количество монет CVC) - открытие и закрытие ордеров
+python scan_fundings.py - поиск фанлингов
+python fun.py "LPT Bybit 10 -0.1%" - скальпинг фандингов
+python scan_fundings_spreads.py - скан спреда фандингов
 ```
 
 **macOS:**
@@ -38,6 +39,7 @@ python3 scan_spreads.py
 python3 bot.py "CVC Long (bybit), Short (gate) 30" --no-monitor
 python3 bot.py "CVC Long (bybit), Short (gate)"
 python3 scan_fundings.py
+python3 scan_fundings_spreads.py
 ```
 
 ### Способ 2: Интерактивный ввод
