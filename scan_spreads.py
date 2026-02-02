@@ -467,7 +467,7 @@ def _get_exchange_url(exchange: str, coin: str) -> str:
         return f"https://www.binance.com/ru/futures/{symbol}"
     elif exchange_lower == "bitget":
         symbol = f"{coin_upper}USDT"
-        return f"https://www.bitget.com/ru/futures/{symbol}"
+        return f"https://www.bitget.com/ru/futures/usdt/{symbol}"
     elif exchange_lower == "bingx":
         symbol = f"{coin_upper}-USDT"
         return f"https://bingx.com/ru-ru/perpetual/{symbol}"

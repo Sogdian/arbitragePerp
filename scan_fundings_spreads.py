@@ -420,7 +420,7 @@ def _get_exchange_url(exchange: str, coin: str) -> str:
     if ex_l == "binance":
         return f"https://www.binance.com/ru/futures/{coin_u}USDT"
     if ex_l == "bitget":
-        return f"https://www.bitget.com/ru/futures/{coin_u}USDT"
+        return f"https://www.bitget.com/ru/futures/usdt/{coin_u}USDT"
     if ex_l == "bingx":
         return f"https://bingx.com/ru-ru/perpetual/{coin_u}-USDT"
     if ex_l == "mexc":

@@ -448,7 +448,7 @@ def format_telegram_message(opportunity: Dict[str, Any]) -> str:
     elif exchange.lower() == "gate":
         url = f"https://www.gate.io/futures/usdt/{coin}_USDT"
     elif exchange.lower() == "bitget":
-        url = f"https://www.bitget.com/futures/usdt/{coin}USDT"
+        url = f"https://www.bitget.com/ru/futures/usdt/{coin}USDT"
     elif exchange.lower() == "mexc":
         url = f"https://futures.mexc.com/exchange/{coin}_USDT"
     elif exchange.lower() == "bingx":
