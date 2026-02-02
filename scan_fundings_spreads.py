@@ -113,10 +113,14 @@ def calc_open_spread_pct(ask_long: Optional[float], bid_short: Optional[float]) 
 
 
 def funding_spread_pct(funding_long: Optional[float], funding_short: Optional[float]) -> Optional[float]:
-    """Спред фандинга: получаем на Long (-rate_long), платим на Short (rate_short). Long -2%, Short +0.5% -> 1.5%."""
+    """Спред фандинга: получаем на Long (|rate_long| при отрицательном), платим на Short (|rate_short|). Фанд = получаем - платим. Long -2%, Short -0.23% -> 2.00% - 0.23% = 1.77%."""
     if funding_long is None or funding_short is None:
         return None
-    return (-funding_long - funding_short) * 100.0
+    # Получаем на лонг: при отрицательном rate мы получаем |rate|
+    receive_long = (-funding_long) if funding_long < 0 else 0.0
+    # Платим на шорт: всегда считаем платёж как |rate| (в стратегии на шорте платим до ~0.5%)
+    pay_short = abs(funding_short)
+    return (receive_long - pay_short) * 100.0
 
 
 # ----------------------------
@@ -300,7 +304,8 @@ async def _analyze_and_log_opportunity(
             m_long = calculate_minutes_until_funding(long_data["next_funding_time"], long_ex)
         if short_data and short_data.get("next_funding_time") is not None:
             m_short = calculate_minutes_until_funding(short_data["next_funding_time"], short_ex)
-        minutes_until = min(m_long, m_short) if (m_long is not None and m_short is not None) else (m_long if m_short is None else m_short)
+        # Для Telegram и отсечки: главная биржа — лонг; нам нужна выплата на лонг бирже в ближайшее время
+        minutes_until = m_long
         funding_long_pct = (long_data["funding_rate"] * 100) if (long_data and long_data.get("funding_rate") is not None) else None
         funding_short_pct = (short_data["funding_rate"] * 100) if (short_data and short_data.get("funding_rate") is not None) else None
 
@@ -319,11 +324,12 @@ async def _analyze_and_log_opportunity(
                 f"фандинг {funding_spread_val:.3f}% < {MIN_FUNDING_SPREAD}%",
             )
             return None
-        if minutes_until is not None and minutes_until >= SCAN_FUNDING_MIN_TIME_TO_PAY:
+        # Вердикт по времени: нужна выплата на лонг бирже в ближайшее время; если до выплаты на Long >= порога — не арбит
+        if m_long is not None and m_long >= SCAN_FUNDING_MIN_TIME_TO_PAY:
             _early_reject_and_log(
                 coin, long_ex, short_ex, open_spread_pct, funding_spread_val, m_long, m_short,
                 funding_long_pct, funding_short_pct,
-                f"время выпл. {minutes_until} мин >= {SCAN_FUNDING_MIN_TIME_TO_PAY:.0f} мин",
+                f"время выпл. на Long {m_long} мин >= {SCAN_FUNDING_MIN_TIME_TO_PAY:.0f} мин",
             )
             return None
 
