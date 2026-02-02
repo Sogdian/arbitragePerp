@@ -74,7 +74,7 @@ logger = logging.getLogger("scan_fundings_spreads")
 logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
 logger.propagate = False
 _handler = logging.StreamHandler(sys.stdout)
-_handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
+_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
 logger.addHandler(_handler)
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -243,6 +243,29 @@ async def fetch(
     return out
 
 
+def _early_reject_and_log(
+    coin: str,
+    long_ex: str,
+    short_ex: str,
+    open_spread_pct: float,
+    funding_spread_val: float,
+    m_long: Optional[int],
+    m_short: Optional[int],
+    reason: str,
+) -> None:
+    """Лог одной строкой при отсечке по критериям без проверки ликвидности/новостей."""
+    total_spread = open_spread_pct + funding_spread_val
+    l_str = f"{m_long} мин" if m_long is not None else "N/A"
+    s_str = f"{m_short} мин" if m_short is not None else "N/A"
+    time_str = f" (L: {l_str} | S: {s_str})"
+    log_message = (
+        f"{coin} Long ({long_ex}), Short ({short_ex}) "
+        f"Спред цены: {open_spread_pct:.3f}% | Фандинга: {funding_spread_val:.3f}%{time_str} | "
+        f"Общий: {total_spread:.3f}% ❌ не арбит. ({reason})"
+    )
+    logger.info(log_message)
+
+
 async def _analyze_and_log_opportunity(
     bot: PerpArbitrageBot,
     coin: str,
@@ -254,8 +277,37 @@ async def _analyze_and_log_opportunity(
     long_data: Optional[Dict[str, Any]] = None,
     short_data: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
-    """Ликвидность + новости, одна строка в лог, вердикт ✅/❌. Funding spread = (-long - short)*100."""
+    """Сначала проверка критериев (спред цены, фандинг, время выпл.); при несоответствии — лог и выход без ликвидности/новостей. Иначе ликвидность + новости, вердикт ✅/❌."""
     async with analysis_sem:
+        # Время до выплаты — считаем сразу для ранней отсечки и для лога
+        m_long: Optional[int] = None
+        m_short: Optional[int] = None
+        if long_data and long_data.get("next_funding_time") is not None:
+            m_long = calculate_minutes_until_funding(long_data["next_funding_time"], long_ex)
+        if short_data and short_data.get("next_funding_time") is not None:
+            m_short = calculate_minutes_until_funding(short_data["next_funding_time"], short_ex)
+        minutes_until = min(m_long, m_short) if (m_long is not None and m_short is not None) else (m_long if m_short is None else m_short)
+
+        # Ранняя отсечка: не тратим ресурсы на ликвидность и новости
+        if abs(open_spread_pct) > MAX_PRICE_SPREAD:
+            _early_reject_and_log(
+                coin, long_ex, short_ex, open_spread_pct, funding_spread_val, m_long, m_short,
+                f"спред цены |{open_spread_pct:.3f}%| > {MAX_PRICE_SPREAD}%",
+            )
+            return None
+        if funding_spread_val < MIN_FUNDING_SPREAD:
+            _early_reject_and_log(
+                coin, long_ex, short_ex, open_spread_pct, funding_spread_val, m_long, m_short,
+                f"фандинг {funding_spread_val:.3f}% < {MIN_FUNDING_SPREAD}%",
+            )
+            return None
+        if minutes_until is not None and minutes_until >= SCAN_FUNDING_MIN_TIME_TO_PAY:
+            _early_reject_and_log(
+                coin, long_ex, short_ex, open_spread_pct, funding_spread_val, m_long, m_short,
+                f"время выпл. {minutes_until} мин >= {SCAN_FUNDING_MIN_TIME_TO_PAY:.0f} мин",
+            )
+            return None
+
         ok = False
         long_liq = None
         short_liq = None
@@ -288,7 +340,7 @@ async def _analyze_and_log_opportunity(
             ok = False
 
         total_spread = open_spread_pct + funding_spread_val
-        verdict = "✅ арбитражить" if ok else "❌ не арбитражить"
+        verdict = "✅ арбит." if ok else "❌ не арбит."
         price_long = long_data.get("ask") if long_data else None
         price_short = short_data.get("bid") if short_data else None
         coins_info = ""
@@ -311,19 +363,17 @@ async def _analyze_and_log_opportunity(
             if security_news:
                 reasons_parts.append("безопасность")
         reasons_str = f" ({'; '.join(reasons_parts)})" if reasons_parts else ""
+        l_str = f"{m_long} мин" if m_long is not None else "N/A"
+        s_str = f"{m_short} мин" if m_short is not None else "N/A"
+        time_str = f" (L: {l_str} | S: {s_str})"
         log_message = (
             f"{coin} Long ({long_ex}), Short ({short_ex}) "
-            f"Спред на цену: {open_spread_pct:.3f}% | Фандинг: {funding_spread_val:.3f}% | "
-            f"Спред общий: {total_spread:.3f}% {verdict}{coins_info}{reasons_str}"
+            f"Спред цены: {open_spread_pct:.3f}% | Фандинга: {funding_spread_val:.3f}%{time_str} | "
+            f"Общий: {total_spread:.3f}% {verdict}{coins_info}{reasons_str}"
         )
         logger.info(log_message)
 
         if ok:
-            minutes_until = None
-            if long_data and long_data.get("next_funding_time") is not None:
-                minutes_until = calculate_minutes_until_funding(
-                    long_data["next_funding_time"], long_ex,
-                )
             return {
                 "coin": coin,
                 "long_ex": long_ex,
