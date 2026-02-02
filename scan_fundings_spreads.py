@@ -243,6 +243,18 @@ async def fetch(
     return out
 
 
+def _format_funding_time(
+    funding_pct: Optional[float],
+    m: Optional[int],
+) -> str:
+    """Формат для L/S: '-2% 8 мин' или '8 мин' или 'N/A'."""
+    if m is None:
+        return "N/A"
+    if funding_pct is not None:
+        return f"{funding_pct:.2f}% {m} мин"
+    return f"{m} мин"
+
+
 def _early_reject_and_log(
     coin: str,
     long_ex: str,
@@ -251,16 +263,18 @@ def _early_reject_and_log(
     funding_spread_val: float,
     m_long: Optional[int],
     m_short: Optional[int],
+    funding_long_pct: Optional[float],
+    funding_short_pct: Optional[float],
     reason: str,
 ) -> None:
     """Лог одной строкой при отсечке по критериям без проверки ликвидности/новостей."""
     total_spread = open_spread_pct + funding_spread_val
-    l_str = f"{m_long} мин" if m_long is not None else "N/A"
-    s_str = f"{m_short} мин" if m_short is not None else "N/A"
+    l_str = _format_funding_time(funding_long_pct, m_long)
+    s_str = _format_funding_time(funding_short_pct, m_short)
     time_str = f" (L: {l_str} | S: {s_str})"
     log_message = (
         f"{coin} Long ({long_ex}), Short ({short_ex}) "
-        f"Спред цены: {open_spread_pct:.3f}% | Фандинга: {funding_spread_val:.3f}%{time_str} | "
+        f"Спред цен: {open_spread_pct:.3f}% | Фанд: {funding_spread_val:.3f}%{time_str} | "
         f"Общий: {total_spread:.3f}% ❌ не арбит. ({reason})"
     )
     logger.info(log_message)
@@ -279,7 +293,7 @@ async def _analyze_and_log_opportunity(
 ) -> Optional[Dict[str, Any]]:
     """Сначала проверка критериев (спред цены, фандинг, время выпл.); при несоответствии — лог и выход без ликвидности/новостей. Иначе ликвидность + новости, вердикт ✅/❌."""
     async with analysis_sem:
-        # Время до выплаты — считаем сразу для ранней отсечки и для лога
+        # Время до выплаты и фандинг в % — для ранней отсечки и для лога
         m_long: Optional[int] = None
         m_short: Optional[int] = None
         if long_data and long_data.get("next_funding_time") is not None:
@@ -287,23 +301,28 @@ async def _analyze_and_log_opportunity(
         if short_data and short_data.get("next_funding_time") is not None:
             m_short = calculate_minutes_until_funding(short_data["next_funding_time"], short_ex)
         minutes_until = min(m_long, m_short) if (m_long is not None and m_short is not None) else (m_long if m_short is None else m_short)
+        funding_long_pct = (long_data["funding_rate"] * 100) if (long_data and long_data.get("funding_rate") is not None) else None
+        funding_short_pct = (short_data["funding_rate"] * 100) if (short_data and short_data.get("funding_rate") is not None) else None
 
         # Ранняя отсечка: не тратим ресурсы на ликвидность и новости
         if abs(open_spread_pct) > MAX_PRICE_SPREAD:
             _early_reject_and_log(
                 coin, long_ex, short_ex, open_spread_pct, funding_spread_val, m_long, m_short,
+                funding_long_pct, funding_short_pct,
                 f"спред цены |{open_spread_pct:.3f}%| > {MAX_PRICE_SPREAD}%",
             )
             return None
         if funding_spread_val < MIN_FUNDING_SPREAD:
             _early_reject_and_log(
                 coin, long_ex, short_ex, open_spread_pct, funding_spread_val, m_long, m_short,
+                funding_long_pct, funding_short_pct,
                 f"фандинг {funding_spread_val:.3f}% < {MIN_FUNDING_SPREAD}%",
             )
             return None
         if minutes_until is not None and minutes_until >= SCAN_FUNDING_MIN_TIME_TO_PAY:
             _early_reject_and_log(
                 coin, long_ex, short_ex, open_spread_pct, funding_spread_val, m_long, m_short,
+                funding_long_pct, funding_short_pct,
                 f"время выпл. {minutes_until} мин >= {SCAN_FUNDING_MIN_TIME_TO_PAY:.0f} мин",
             )
             return None
@@ -363,12 +382,12 @@ async def _analyze_and_log_opportunity(
             if security_news:
                 reasons_parts.append("безопасность")
         reasons_str = f" ({'; '.join(reasons_parts)})" if reasons_parts else ""
-        l_str = f"{m_long} мин" if m_long is not None else "N/A"
-        s_str = f"{m_short} мин" if m_short is not None else "N/A"
+        l_str = _format_funding_time(funding_long_pct, m_long)
+        s_str = _format_funding_time(funding_short_pct, m_short)
         time_str = f" (L: {l_str} | S: {s_str})"
         log_message = (
             f"{coin} Long ({long_ex}), Short ({short_ex}) "
-            f"Спред цены: {open_spread_pct:.3f}% | Фандинга: {funding_spread_val:.3f}%{time_str} | "
+            f"Спред цен: {open_spread_pct:.3f}% | Фанд: {funding_spread_val:.3f}%{time_str} | "
             f"Общий: {total_spread:.3f}% {verdict}{coins_info}{reasons_str}"
         )
         logger.info(log_message)
