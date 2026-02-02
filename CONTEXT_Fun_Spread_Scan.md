@@ -45,7 +45,7 @@
   - `spread_funding = (-funding_long - funding_short) * 100` (в %).  
     Условие: `spread_funding >= MIN_FUNDING_SPREAD`.
   - `spread_price = (bid_short - ask_long) / ask_long * 100` (спред входа в %).  
-    Условие: `spread_price <= MAX_PRICE_SPREAD`.
+    Условие: `|spread_price| <= MAX_PRICE_SPREAD` (по модулю — чтобы отсекать и большие отрицательные спреды).
 
 - Аналогично проверяется пара **Long на ex2, Short на ex1**.
 
@@ -80,7 +80,7 @@
 | Переменная | Смысл | Пример |
 |------------|--------|--------|
 | **MIN_FUNDING_SPREAD** | Минимальный спред фандинга (%), чтобы считать возможность интересной | 1.5, 2 |
-| **MAX_PRICE_SPREAD** | Максимальный допустимый спред цен (%) между биржами | 1.5, 2 |
+| **MAX_PRICE_SPREAD** | Максимальный допустимый спред цен по модулю (%) между биржами | 0.5, 1.5, 2 |
 | **SCAN_FUNDING_MIN_TIME_TO_PAY** | Порог минут до выплаты: в Telegram шлём только если до выплаты < этого значения | 60 |
 | **SCAN_FUNDING_INTERVAL_SEC** | Интервал сканирования (сек) | 60 |
 | **SCAN_FUNDING_MAX_CONCURRENCY** | Параллелизм HTTP-запросов | 20 |

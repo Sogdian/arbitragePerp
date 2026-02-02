@@ -1,7 +1,7 @@
 """
 Бот scan_fundings_spreads: поиск пар бирж и монет по стратегии фандинг-арбитража.
 Условия: спред фандинга (получаем на Long, платим на Short) >= MIN_FUNDING_SPREAD,
-спред цен между биржами <= MAX_PRICE_SPREAD. Лог в консоль, Telegram — как в scan_spreads (картинка + caption).
+спред цен по модулю между биржами <= MAX_PRICE_SPREAD. Лог в консоль, Telegram — как в scan_spreads (картинка + caption).
 """
 import asyncio
 import io
@@ -50,7 +50,7 @@ def load_dotenv(path: str = ".env") -> None:
 load_dotenv(".env")
 
 MIN_FUNDING_SPREAD = float(os.getenv("MIN_FUNDING_SPREAD", "1.5"))  # спред фандинга >= (Long получаем, Short платим), %
-MAX_PRICE_SPREAD = float(os.getenv("MAX_PRICE_SPREAD", "2"))  # спред цен <= %, для минимального проскальзывания
+MAX_PRICE_SPREAD = float(os.getenv("MAX_PRICE_SPREAD", "2"))  # |спред цен| <= %, для минимального проскальзывания
 SCAN_INTERVAL_SEC = float(os.getenv("SCAN_FUNDING_INTERVAL_SEC", "60"))
 MAX_CONCURRENCY = int(os.getenv("SCAN_FUNDING_MAX_CONCURRENCY", "20"))
 COIN_BATCH_SIZE = int(os.getenv("SCAN_FUNDING_COIN_BATCH_SIZE", "50"))
@@ -368,7 +368,7 @@ def _format_combined_telegram_message(
     opportunities: List[Dict[str, Any]],
 ) -> str:
     """Текст для Telegram: как в scan_spreads, funding spread = (-long - short)*100."""
-    lines = [f'🔔 💰<b>Сигнал: {coin}</b> (ликв.: {SCAN_COIN_INVEST:.1f} USDT)']
+    lines = [f'🔔 💰<b>Спред фандингов: монета {coin}</b> (для ликв.: {SCAN_COIN_INVEST:.1f} USDT)']
     lines.append("")
     for opp in opportunities:
         long_ex = opp["long_ex"]
@@ -539,13 +539,13 @@ async def process_coin(
         spread_price = calc_open_spread_pct(d1["ask"], d2["bid"])
         spread_funding = funding_spread_pct(fl1, fl2)
         if spread_price is not None and spread_funding is not None:
-            if spread_funding >= MIN_FUNDING_SPREAD and spread_price <= MAX_PRICE_SPREAD:
+            if spread_funding >= MIN_FUNDING_SPREAD and abs(spread_price) <= MAX_PRICE_SPREAD:
                 per_coin_found.append((ex1, ex2, spread_price, spread_funding))
         # Long ex2, Short ex1
         spread_price2 = calc_open_spread_pct(d2["ask"], d1["bid"])
         spread_funding2 = funding_spread_pct(fl2, fl1)
         if spread_price2 is not None and spread_funding2 is not None:
-            if spread_funding2 >= MIN_FUNDING_SPREAD and spread_price2 <= MAX_PRICE_SPREAD:
+            if spread_funding2 >= MIN_FUNDING_SPREAD and abs(spread_price2) <= MAX_PRICE_SPREAD:
                 per_coin_found.append((ex2, ex1, spread_price2, spread_funding2))
 
     if not per_coin_found:
@@ -582,16 +582,16 @@ async def process_coin(
         if PIL_AVAILABLE:
             table_image = _generate_arbitrage_table_image(coin, to_send)
             if table_image:
-                max_total = max((o["open_spread_pct"] + o.get("funding_spread_pct", 0)) for o in to_send)
+                max_fr_spread = max((o.get("funding_spread_pct") or 0) for o in to_send)
                 max_opp = max(to_send, key=lambda o: o["open_spread_pct"] + o.get("funding_spread_pct", 0))
                 long_ex = max_opp["long_ex"]
                 short_ex = max_opp["short_ex"]
                 long_url = _get_exchange_url(long_ex, coin)
                 short_url = _get_exchange_url(short_ex, coin)
                 caption = (
-                    f'🔔 💰Сигнал: {coin} (ликв.: {SCAN_COIN_INVEST:.1f} USDT)\n'
+                    f'🔔 💰Спред фандингов: монета {coin} (для ликв.: {SCAN_COIN_INVEST:.1f} USDT)\n'
                     f'{coin} Лонг (<a href="{long_url}">{long_ex.capitalize()}</a>), '
-                    f'Шорт (<a href="{short_url}">{short_ex.capitalize()}</a>) макс. общий спред: {max_total:.3f}%'
+                    f'Шорт (<a href="{short_url}">{short_ex.capitalize()}</a>) макс. спред фандингов: {max_fr_spread:.3f}%'
                 )
                 success = await telegram.send_photo(table_image, caption=caption, channel_id=channel_id)
                 if success:
