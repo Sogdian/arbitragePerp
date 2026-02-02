@@ -347,7 +347,7 @@ def _get_exchange_url(exchange: str, coin: str) -> str:
     if ex_l == "gate":
         return f"https://www.gate.com/ru/futures/USDT/{coin_u}_USDT"
     if ex_l == "okx":
-        return f"https://www.okx.com/ru/trade/futures/{coin_u}-USDT-SWAP"
+        return f"https://www.okx.com/ru/trade-swap/{coin.lower()}-usdt-swap"
     if ex_l == "binance":
         return f"https://www.binance.com/ru/futures/{coin_u}USDT"
     if ex_l == "bitget":
