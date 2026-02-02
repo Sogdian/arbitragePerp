@@ -463,9 +463,9 @@ def format_telegram_message(opportunity: Dict[str, Any]) -> str:
         exchange_display = f'<a href="{url}">{exchange}</a>'
     
     lines = [
-        f"🔔💲 {exchange_display} {coin}",
-        f"funding: {funding_rate_pct:.3f}%",
-        f"time to pay: {minutes_str}",
+        f"🔔💲 {exchange_display} монета {coin}",
+        f"Фандинг: {funding_rate_pct:.3f}%",
+        f"Минут до выплаты: {minutes_str}",
     ]
     
     return "\n".join(lines)

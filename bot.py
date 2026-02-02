@@ -188,37 +188,19 @@ class PerpArbitrageBot:
     
     def calculate_funding_spread(self, funding_long: Optional[float], funding_short: Optional[float]) -> Optional[float]:
         """
-        Вычислить чистый эффект по фандингу для арбитража (Long и Short позиции)
-        
-        Экономическая логика funding:
-        - Если funding > 0: Long платит, Short получает
-        - Если funding < 0: Long получает, Short платит
-        
-        PnL для позиций:
-        - PnL Long = -funding_long (если funding положительный, платим; если отрицательный, получаем)
-        - PnL Short = +funding_short (если funding положительный, получаем; если отрицательный, платим)
-        
-        Формула: Net funding = PnL_long + PnL_short = (-funding_long) + (+funding_short) = funding_short - funding_long
-        
+        Спред фандинга: разница ставок Long − Short (в процентах).
+        Long 0.005%, Short 0.001% → 0.004%.
+
         Args:
-            funding_long: Ставка фандинга на бирже Long (в десятичном формате, например, -0.02 = -2%)
-            funding_short: Ставка фандинга на бирже Short (в десятичном формате, например, -0.025 = -2.5%)
-            
+            funding_long: Ставка фандинга на бирже Long (в десятичном формате, например 0.00005 = 0.005%)
+            funding_short: Ставка фандинга на бирже Short (в десятичном формате)
+
         Returns:
-            Чистый эффект по фандингу в процентах или None если невозможно вычислить
-            Положительное значение = прибыль, отрицательное значение = убыток
-            Пример: -0.5% означает, что за один funding-период будет убыток 0.5%
+            (funding_long - funding_short) * 100, в процентах
         """
         if funding_long is None or funding_short is None:
             return None
-        
-        # Конвертируем в проценты (funding rate обычно в формате 0.0001 = 0.01%)
-        funding_long_pct = funding_long * 100
-        funding_short_pct = funding_short * 100
-        
-        # Net funding PnL: funding_short - funding_long
-        net_funding = funding_short_pct - funding_long_pct
-        return net_funding
+        return (funding_long - funding_short) * 100.0
     
     async def process_input(self, input_text: str):
         """
@@ -281,18 +263,13 @@ class PerpArbitrageBot:
         if long_data:
             price_long = long_data.get("price")
             funding_long = long_data.get("funding_rate")
-            
             if price_long is not None:
                 notional_long = coin_amount * price_long
-                logger.info(f"(Long {long_exchange}) ({coin}) Цена: {price_long:.3f} (qty: {coin_amount:.3f} {coin} | ~{notional_long:.3f} USDT)")
+                price_str_long = f"Цена: {price_long:.5f} (qty: {coin_amount:.3f} {coin} | ~{notional_long:.3f} USDT)"
             else:
-                logger.info(f"(Long {long_exchange}) ({coin}) Цена: недоступно")
-            
-            if funding_long is not None:
-                funding_long_pct = funding_long * 100
-                logger.info(f"(Long {long_exchange}) ({coin}) Фандинг: {funding_long_pct:.3f}%")
-            else:
-                logger.info(f"(Long {long_exchange}) ({coin}) Фандинг: недоступно")
+                price_str_long = "Цена: недоступно"
+            funding_str_long = f"Фандинг: {funding_long * 100:.3f}%" if funding_long is not None else "Фандинг: недоступно"
+            logger.info(f"(Long {long_exchange}) ({coin}) {price_str_long} {funding_str_long}")
         else:
             logger.error(f"Не удалось получить данные с {long_exchange}")
             price_long = None
@@ -302,18 +279,13 @@ class PerpArbitrageBot:
         if short_data:
             price_short = short_data.get("price")
             funding_short = short_data.get("funding_rate")
-            
             if price_short is not None:
                 notional_short = coin_amount * price_short
-                logger.info(f"(Short {short_exchange}) ({coin}) Цена: {price_short:.3f} (qty: {coin_amount:.3f} {coin} | ~{notional_short:.3f} USDT)")
+                price_str_short = f"Цена: {price_short:.5f} (qty: {coin_amount:.3f} {coin} | ~{notional_short:.3f} USDT)"
             else:
-                logger.info(f"(Short {short_exchange}) ({coin}) Цена: недоступно")
-            
-            if funding_short is not None:
-                funding_short_pct = funding_short * 100
-                logger.info(f"(Short {short_exchange}) ({coin}) Фандинг: {funding_short_pct:.3f}%")
-            else:
-                logger.info(f"(Short {short_exchange}) ({coin}) Фандинг: недоступно")
+                price_str_short = "Цена: недоступно"
+            funding_str_short = f"Фандинг: {funding_short * 100:.3f}%" if funding_short is not None else "Фандинг: недоступно"
+            logger.info(f"(Short {short_exchange}) ({coin}) {price_str_short} {funding_str_short}")
         else:
             logger.error(f"Не удалось получить данные с {short_exchange}")
             price_short = None
@@ -335,7 +307,7 @@ class PerpArbitrageBot:
         if funding_long is not None and funding_short is not None:
             funding_spread = self.calculate_funding_spread(funding_long, funding_short)
             if funding_spread is not None:
-                logger.info(f"({long_exchange} и {short_exchange}) Спред на фандинги: {funding_spread:.3f}% (откр: ≥0.18%, закр: ≤0.05%)")
+                logger.info(f"({long_exchange} и {short_exchange}) Спред на фандинги: {funding_spread:.3f}%")
             else:
                 logger.info(f"({long_exchange} и {short_exchange}) Спред на фандинги: невозможно вычислить")
                 funding_spread = None
