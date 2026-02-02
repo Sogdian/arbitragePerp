@@ -588,10 +588,10 @@ async def process_coin(
     sem: asyncio.Semaphore,
     coins_by_exchange: Dict[str, Set[str]],
     analysis_sem: asyncio.Semaphore,
-) -> None:
+) -> int:
     ex_list = [ex for ex in exchanges if coin in coins_by_exchange.get(ex, set())]
     if len(ex_list) < 2:
-        return
+        return 0
     tasks = {ex: asyncio.create_task(fetch(bot, ex, coin, sem)) for ex in ex_list}
     results = await asyncio.gather(*tasks.values(), return_exceptions=True)
     ex_data: Dict[str, Optional[Dict[str, Any]]] = {}
@@ -602,7 +602,7 @@ async def process_coin(
         if d and d.get("bid") is not None and d.get("ask") is not None
     }
     if len(available) < 2:
-        return
+        return 0
 
     per_coin_found: List[Tuple[str, str, float, float]] = []
     for ex1, ex2 in combinations(available.keys(), 2):
@@ -624,7 +624,7 @@ async def process_coin(
                 per_coin_found.append((ex2, ex1, spread_price2, spread_funding2))
 
     if not per_coin_found:
-        return
+        return 0
 
     results = await asyncio.gather(
         *(
@@ -645,7 +645,7 @@ async def process_coin(
         if o.get("minutes_until") is not None and o["minutes_until"] < SCAN_FUNDING_MIN_TIME_TO_PAY
     ]
     if not to_send:
-        return
+        return len(per_coin_found)
     try:
         telegram = TelegramSender()
         if not telegram.enabled:
@@ -685,6 +685,7 @@ async def process_coin(
             )
     except Exception as e:
         logger.warning(f"Ошибка отправки в Telegram для {coin}: {e}", exc_info=True)
+    return len(per_coin_found)
 
 
 async def scan_once(
@@ -695,13 +696,23 @@ async def scan_once(
     coins_by_exchange: Dict[str, Set[str]],
     analysis_sem: asyncio.Semaphore,
 ) -> None:
+    total_pairs_analyzed = 0
     for i in range(0, len(coins), COIN_BATCH_SIZE):
         batch = coins[i : i + COIN_BATCH_SIZE]
-        await asyncio.gather(
+        results = await asyncio.gather(
             *(process_coin(bot, exchanges, coin, sem, coins_by_exchange, analysis_sem) for coin in batch),
             return_exceptions=True,
         )
+        for r in results:
+            if isinstance(r, int):
+                total_pairs_analyzed += r
         logger.info(f"Progress: {min(i + COIN_BATCH_SIZE, len(coins))}/{len(coins)} coins processed")
+    if total_pairs_analyzed == 0:
+        logger.info(
+            f"Цикл: пар на анализ 0 (ни одна пара не прошла фильтр: фандинг ≥ {MIN_FUNDING_SPREAD}% и |спред цен| ≤ {MAX_PRICE_SPREAD}%)"
+        )
+    else:
+        logger.info(f"Цикл: пар на анализ (с вердиктами): {total_pairs_analyzed}")
 
 
 async def main():
@@ -727,6 +738,11 @@ async def main():
                     logger.info(f"{ex}: {len(coins_by_exchange.get(ex, set()))} монет")
                 printed_stats = True
             logger.info(f"🔄 Новый цикл | coins={len(coins)}")
+            if telegram.enabled and config.TEST_CHANNEL_ID:
+                try:
+                    await telegram.send_message("🔄 Новый цикл поиска спреда фандингов", channel_id=config.TEST_CHANNEL_ID)
+                except Exception as e:
+                    logger.debug(f"Telegram: не удалось отправить сообщение о цикле: {e}")
             t0 = time.perf_counter()
             if coins:
                 await scan_once(bot, exchanges, coins, sem, coins_by_exchange, analysis_sem)

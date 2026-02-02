@@ -549,7 +549,7 @@ async def main():
                     logger.info(f"{ex}: {len(coins_by_exchange.get(ex, set()))} монет")
                 printed_stats = True
             
-            cycle_msg = f"🔄 Новый цикл поиска фандингов | exchanges={exchanges}"
+            cycle_msg = "🔄 Новый цикл поиска фандингов"
             logger.info(cycle_msg)
             if SCAN_FUNDING_NOTIFY_NEW_CYCLE and telegram.enabled:
                 # best-effort: уведомление не должно ломать цикл сканирования
