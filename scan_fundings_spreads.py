@@ -50,7 +50,7 @@ def load_dotenv(path: str = ".env") -> None:
 load_dotenv(".env")
 
 MIN_FUNDING_SPREAD = float(os.getenv("MIN_FUNDING_SPREAD", "1.5"))  # спред фандинга >= (Long получаем, Short платим), %
-MAX_PRICE_SPREAD = float(os.getenv("MAX_PRICE_SPREAD", "2"))  # |спред цен| <= %, для минимального проскальзывания
+MAX_PRICE_SPREAD = float(os.getenv("MAX_PRICE_SPREAD", "0.5"))  # |спред цен| <= %, для минимального проскальзывания
 SCAN_INTERVAL_SEC = float(os.getenv("SCAN_FUNDING_INTERVAL_SEC", "60"))
 MAX_CONCURRENCY = int(os.getenv("SCAN_FUNDING_MAX_CONCURRENCY", "20"))
 COIN_BATCH_SIZE = int(os.getenv("SCAN_FUNDING_COIN_BATCH_SIZE", "50"))
