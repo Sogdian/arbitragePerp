@@ -74,7 +74,7 @@ logger = logging.getLogger("scan_fundings_spreads")
 logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
 logger.propagate = False
 _handler = logging.StreamHandler(sys.stdout)
-_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+_handler.setFormatter(logging.Formatter("%(asctime)s - %(message)s"))
 logger.addHandler(_handler)
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
