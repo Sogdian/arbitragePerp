@@ -22,6 +22,28 @@ def _to_int(x) -> Optional[int]:
         return None
 
 
+def _mexc_coin_from_contract(it: dict) -> tuple:
+    """Как в scripts/mexc_alias_check.py: (coin для списка, API symbol)."""
+    sym = it.get("symbol") or ""
+    if not isinstance(sym, str) or not sym.endswith("_USDT"):
+        return ("", "")
+    sym_u = sym.upper()
+    if sym_u == "FUN_USDT":
+        return ("FUN", sym)
+    if sym_u == "SPORTFUN_USDT":
+        return ("SPORTFUN", sym)
+    disp = it.get("displayName") or it.get("display_name") or it.get("displayNameEn") or it.get("display_name_en")
+    coin_from_disp = None
+    if isinstance(disp, str):
+        up = disp.upper()
+        idx = up.find("_USDT")
+        if idx > 0:
+            coin_from_disp = up[:idx].strip()
+            coin_from_disp = "".join(ch for ch in coin_from_disp if ch.isalnum())
+    coin = (coin_from_disp or sym.replace("_USDT", "")).upper()
+    return (coin, sym)
+
+
 class AsyncMexcExchange(AsyncBaseExchange):
     # Основной домен
     BASE_URL = "https://contract.mexc.com"
@@ -30,6 +52,45 @@ class AsyncMexcExchange(AsyncBaseExchange):
 
     def __init__(self, pool_limit: int = 100):
         super().__init__("MEXC", pool_limit)
+        self._mexc_dynamic_aliases: Optional[Dict[str, str]] = None
+
+    async def _ensure_mexc_aliases_loaded(self) -> None:
+        """Один раз загрузить алиасы из API contract/detail (логика как в scripts/mexc_alias_check.py)."""
+        if self._mexc_dynamic_aliases is not None:
+            return
+        try:
+            data = await self._request_json_with_domain_fallback(
+                "GET", "/api/v1/contract/detail", params={},
+                retries_per_domain=1, backoff_s=0.25,
+            )
+            if not isinstance(data, dict) or data.get("code") != 0:
+                self._mexc_dynamic_aliases = {}
+                return
+            items = data.get("data") or []
+            if not isinstance(items, list):
+                self._mexc_dynamic_aliases = {}
+                return
+            aliases: Dict[str, str] = {}
+            for it in items:
+                if not isinstance(it, dict):
+                    continue
+                sym = it.get("symbol") or ""
+                if not sym.endswith("_USDT"):
+                    continue
+                settle = (it.get("settleCoin") or "").upper()
+                if settle != "USDT":
+                    continue
+                state = str(it.get("state", ""))
+                if state in ("3", "4", "5"):
+                    continue
+                coin, symbol = _mexc_coin_from_contract(it)
+                if coin and symbol:
+                    aliases[coin] = symbol
+            self._mexc_dynamic_aliases = aliases
+            logger.debug(f"MEXC: загружено {len(aliases)} алиасов из contract/detail")
+        except Exception as e:
+            logger.debug(f"MEXC: не удалось загрузить алиасы: {e}")
+            self._mexc_dynamic_aliases = {}
 
     def _normalize_symbol(self, coin: str) -> str:
         """
@@ -130,6 +191,9 @@ class AsyncMexcExchange(AsyncBaseExchange):
             "\u6211\u8e0f\u9a6c\u6765\u4e86": "WOTAMALAILE_USDT",  # 我踏马来了
             "\u5e01\u5b89\u4eba\u751f": "BIANRENSHENG_USDT",       # 币安人生
         }
+        # Сначала алиасы из API (contract/detail), затем статический словарь
+        if self._mexc_dynamic_aliases is not None and c in self._mexc_dynamic_aliases:
+            return self._mexc_dynamic_aliases[c]
         return aliases.get(c, f"{c}_USDT")
 
     def _canon(self, sym: str) -> str:
@@ -257,6 +321,7 @@ class AsyncMexcExchange(AsyncBaseExchange):
         Тикер: GET /api/v1/contract/ticker?symbol=...
         """
         try:
+            await self._ensure_mexc_aliases_loaded()
             url = "/api/v1/contract/ticker"
 
             # 1) основной формат COIN_USDT (с учетом алиасов)
@@ -344,6 +409,7 @@ class AsyncMexcExchange(AsyncBaseExchange):
         GET /api/v1/contract/funding_rate/{symbol}
         """
         try:
+            await self._ensure_mexc_aliases_loaded()
             # 1) пробуем COIN_USDT (с учетом алиасов)
             symbol1 = self._normalize_symbol(coin)
             url1 = f"/api/v1/contract/funding_rate/{symbol1}"
@@ -412,6 +478,7 @@ class AsyncMexcExchange(AsyncBaseExchange):
             или None если ошибка
         """
         try:
+            await self._ensure_mexc_aliases_loaded()
             # 1) пробуем COIN_USDT (с учетом алиасов)
             symbol1 = self._normalize_symbol(coin)
             url1 = f"/api/v1/contract/funding_rate/{symbol1}"
@@ -488,6 +555,7 @@ class AsyncMexcExchange(AsyncBaseExchange):
         GET /api/v1/contract/depth/{symbol}?limit=...
         """
         try:
+            await self._ensure_mexc_aliases_loaded()
             limit_i = max(1, min(int(limit), 200))
 
             # 1) COIN_USDT (с учетом алиасов)
