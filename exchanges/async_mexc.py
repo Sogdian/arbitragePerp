@@ -42,11 +42,93 @@ class AsyncMexcExchange(AsyncBaseExchange):
         - При этом API symbol FUN_USDT — это другой контракт (FUNTOKEN_USDT) с другой ценой (~0.002)
         """
         c = coin.upper()
-        # Хардкод алиасов для известных коллизий/переименований на MEXC
+        # Алиасы: coin (из списка монет / displayName) -> API symbol. Только бессрочные USDT.
+        # Источник: scripts/mexc_alias_check.py (contract/detail, settleCoin=USDT, coin != symbol_base)
         aliases = {
-            "FUN": "SPORTFUN_USDT",      # UI FUNUSDT -> API SPORTFUN_USDT
-            "FUNTOKEN": "FUN_USDT",      # UI FUNTOKENUSDT -> API FUN_USDT
-            "LUNA": "LUNANEW_USDT",      # UI LUNAUSDT -> API LUNANEW_USDT (основной бессрочный)
+            "AAPL": "AAPLSTOCK_USDT",
+            "ACN": "ACNSTOCK_USDT",
+            "ADBE": "ADBESTOCK_USDT",
+            "AMAT": "AMATSTOCK_USDT",
+            "AMD": "AMDSTOCK_USDT",
+            "AMZN": "AMZNSTOCK_USDT",
+            "APE": "APE_USDT",
+            "APECOIN": "APE_USDT",
+            "AIOZ": "AIOZ_USDT",
+            "IRYS": "IRYS_USDT",
+            "ARM": "ARMSTOCK_USDT",
+            "ASML": "ASMLSTOCK_USDT",
+            "AVGO": "AVGOSTOCK_USDT",
+            "BA": "BASTOCK_USDT",
+            "BABA": "BABASTOCK_USDT",
+            "BAC": "BACSTOCK_USDT",
+            "BOB": "BUILDONBOB_USDT",
+            "CAT": "CATSTOCK_USDT",
+            "COIN": "COINBASE_USDT",
+            "COPPERXCU": "COPPER_USDT",
+            "COST": "COSTSTOCK_USDT",
+            "CRCL": "CRCLSTOCK_USDT",
+            "CRM": "CRMSTOCK_USDT",
+            "CSCO": "CSCOSTOCK_USDT",
+            "FIG": "FIGSTOCK_USDT",
+            "FIL": "FILECOIN_USDT",
+            "FUN": "SPORTFUN_USDT",
+            "FUNTOKEN": "FUN_USDT",
+            "FUTU": "FUTUSTOCK_USDT",
+            "GE": "GESTOCK_USDT",
+            "GOLDPAXG": "PAXG_USDT",
+            "GOLDXAUT": "XAUT_USDT",
+            "GOOGL": "GOOGLSTOCK_USDT",
+            "GS": "GSSTOCK_USDT",
+            "HOOD": "ROBINHOOD_USDT",
+            "IBM": "IBMSTOCK_USDT",
+            "INTC": "INTCSTOCK_USDT",
+            "JD": "JDSTOCK_USDT",
+            "JNJ": "JNJSTOCK_USDT",
+            "JPM": "JPMSTOCK_USDT",
+            "LLY": "LLYSTOCK_USDT",
+            "LRCX": "LRCXSTOCK_USDT",
+            "LUNA": "LUNANEW_USDT",
+            "MA": "MASTOCK_USDT",
+            "MCD": "MCDSTOCK_USDT",
+            "META": "METASTOCK_USDT",
+            "MON": "MONAD_USDT",
+            "MRVL": "MRVLSTOCK_USDT",
+            "MSFT": "MSFTSTOCK_USDT",
+            "MSTR": "MSTRSTOCK_USDT",
+            "MU": "MUSTOCK_USDT",
+            "NFLX": "NFLXSTOCK_USDT",
+            "NKE": "NKESTOCK_USDT",
+            "NOW": "NOWSTOCK_USDT",
+            "NVDA": "NVIDIA_USDT",
+            "OPEN": "OPENLEDGER_USDT",
+            "ORCL": "ORCLSTOCK_USDT",
+            "PALLADIUMXPD": "XPD_USDT",
+            "PEP": "PEPSTOCK_USDT",
+            "PLATINUMXPT": "XPT_USDT",
+            "PLTR": "PLTRSTOCK_USDT",
+            "PUMP": "PUMPFUN_USDT",
+            "QCOM": "QCOMSTOCK_USDT",
+            "QQQ": "QQQSTOCK_USDT",
+            "RDDT": "RDDTSTOCK_USDT",
+            "SILVERXAG": "SILVER_USDT",
+            "SLEEPLESSAI": "AI_USDT",
+            "SOON": "SOONNETWORK_USDT",
+            "SP500": "SPX500_USDT",
+            "TON": "TONCOIN_USDT",
+            "TRUMP": "TRUMPOFFICIAL_USDT",
+            "TSLA": "TESLA_USDT",
+            "UBER": "UBERSTOCK_USDT",
+            "UNH": "UNHSTOCK_USDT",
+            "V": "VSTOCK_USDT",
+            "WMT": "WMTSTOCK_USDT",
+            "XEMPIRE": "X_USDT",
+            "XOM": "XOMSTOCK_USDT",
+            "ZK": "ZKSYNC_USDT",
+            # displayName в API (латиница в symbol)
+            "\u8001\u5b50": "LAOZI_USDT",           # 老子
+            "\u9ed1\u9a6c": "HEIMA_USDT",           # 黑马
+            "\u6211\u8e0f\u9a6c\u6765\u4e86": "WOTAMALAILE_USDT",  # 我踏马来了
+            "\u5e01\u5b89\u4eba\u751f": "BIANRENSHENG_USDT",       # 币安人生
         }
         return aliases.get(c, f"{c}_USDT")
 
