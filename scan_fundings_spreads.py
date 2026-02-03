@@ -321,13 +321,16 @@ async def _analyze_and_log_opportunity(
                 "спред цен: нет данных",
             )
             return None
-        if abs(open_spread_pct) > MAX_PRICE_SPREAD:
-            _early_reject_and_log(
-                coin, long_ex, short_ex, open_spread_pct, funding_spread_val, m_long, m_short,
-                funding_long_pct, funding_short_pct,
-                f"спред цены |{open_spread_pct:.3f}%| > {MAX_PRICE_SPREAD}%",
-            )
-            return None
+        # Правило: на лонг бирже цена должна быть ниже чем на шорт (ask_long < bid_short)
+        # ask_long = long_data.get("ask") if long_data else None
+        # bid_short = short_data.get("bid") if short_data else None
+        # if ask_long is not None and bid_short is not None and ask_long >= bid_short:
+        #     _early_reject_and_log(
+        #         coin, long_ex, short_ex, open_spread_pct, funding_spread_val, m_long, m_short,
+        #         funding_long_pct, funding_short_pct,
+        #         "цена на Long выше чем на Short",
+        #     )
+        #     return None
         if funding_spread_val is None:
             _early_reject_and_log(
                 coin, long_ex, short_ex, open_spread_pct, funding_spread_val, m_long, m_short,
