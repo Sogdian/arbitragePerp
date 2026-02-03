@@ -50,6 +50,7 @@ def load_dotenv(path: str = ".env") -> None:
 load_dotenv(".env")
 
 MIN_FUNDING_SPREAD = float(os.getenv("MIN_FUNDING_SPREAD", "1.5"))  # спред фандинга >= (Long получаем, Short платим), %
+MIN_FUNDING_LONG_FILTER_FOR_LOG = float(os.getenv("MIN_FUNDING_LONG_FILTER_FOR_LOG", "-0.5"))  # в лог только связки, где фандинг на Long (в %) <= этого значения (напр. -0.5: проходят -1, -1.5, -0.6; не проходят -0.4, 0, +1)
 MAX_PRICE_SPREAD = float(os.getenv("MAX_PRICE_SPREAD", "0.5"))  # |спред цен| <= %, для минимального проскальзывания
 SCAN_INTERVAL_SEC = float(os.getenv("SCAN_FUNDING_INTERVAL_SEC", "60"))
 MAX_CONCURRENCY = int(os.getenv("SCAN_FUNDING_MAX_CONCURRENCY", "20"))
@@ -259,12 +260,16 @@ def _format_funding_time(
     return f"{m} мин"
 
 
+def _fmt_pct(v: Optional[float]) -> str:
+    return f"{v:.3f}%" if v is not None else "N/A"
+
+
 def _early_reject_and_log(
     coin: str,
     long_ex: str,
     short_ex: str,
-    open_spread_pct: float,
-    funding_spread_val: float,
+    open_spread_pct: Optional[float],
+    funding_spread_val: Optional[float],
     m_long: Optional[int],
     m_short: Optional[int],
     funding_long_pct: Optional[float],
@@ -272,14 +277,15 @@ def _early_reject_and_log(
     reason: str,
 ) -> None:
     """Лог одной строкой при отсечке по критериям без проверки ликвидности/новостей."""
-    total_spread = open_spread_pct + funding_spread_val
+    total_spread = (open_spread_pct + funding_spread_val) if (open_spread_pct is not None and funding_spread_val is not None) else None
+    total_str = f"{total_spread:.3f}%" if total_spread is not None else "N/A"
     l_str = _format_funding_time(funding_long_pct, m_long)
     s_str = _format_funding_time(funding_short_pct, m_short)
     time_str = f" (L: {l_str} | S: {s_str})"
     log_message = (
         f"{coin} Long ({long_ex}), Short ({short_ex}) "
-        f"Спред цен: {open_spread_pct:.3f}% | Фанд: {funding_spread_val:.3f}%{time_str} | "
-        f"Общий: {total_spread:.3f}% ❌ не арбит. ({reason})"
+        f"Спред цен: {_fmt_pct(open_spread_pct)} | Фанд: {_fmt_pct(funding_spread_val)}{time_str} | "
+        f"Общий: {total_str} ❌ не арбит. ({reason})"
     )
     logger.info(log_message)
 
@@ -289,32 +295,44 @@ async def _analyze_and_log_opportunity(
     coin: str,
     long_ex: str,
     short_ex: str,
-    open_spread_pct: float,
-    funding_spread_val: float,
+    open_spread_pct: Optional[float],
+    funding_spread_val: Optional[float],
     analysis_sem: asyncio.Semaphore,
     long_data: Optional[Dict[str, Any]] = None,
     short_data: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
     """Сначала проверка критериев (спред цены, фандинг, время выпл.); при несоответствии — лог и выход без ликвидности/новостей. Иначе ликвидность + новости, вердикт ✅/❌."""
     async with analysis_sem:
-        # Время до выплаты и фандинг в % — для ранней отсечки и для лога
         m_long: Optional[int] = None
         m_short: Optional[int] = None
         if long_data and long_data.get("next_funding_time") is not None:
             m_long = calculate_minutes_until_funding(long_data["next_funding_time"], long_ex)
         if short_data and short_data.get("next_funding_time") is not None:
             m_short = calculate_minutes_until_funding(short_data["next_funding_time"], short_ex)
-        # Для Telegram и отсечки: главная биржа — лонг; нам нужна выплата на лонг бирже в ближайшее время
         minutes_until = m_long
         funding_long_pct = (long_data["funding_rate"] * 100) if (long_data and long_data.get("funding_rate") is not None) else None
         funding_short_pct = (short_data["funding_rate"] * 100) if (short_data and short_data.get("funding_rate") is not None) else None
 
-        # Ранняя отсечка: не тратим ресурсы на ликвидность и новости
+        # Ранняя отсечка с логом (в т.ч. при отсутствии данных)
+        if open_spread_pct is None:
+            _early_reject_and_log(
+                coin, long_ex, short_ex, open_spread_pct, funding_spread_val, m_long, m_short,
+                funding_long_pct, funding_short_pct,
+                "спред цен: нет данных",
+            )
+            return None
         if abs(open_spread_pct) > MAX_PRICE_SPREAD:
             _early_reject_and_log(
                 coin, long_ex, short_ex, open_spread_pct, funding_spread_val, m_long, m_short,
                 funding_long_pct, funding_short_pct,
                 f"спред цены |{open_spread_pct:.3f}%| > {MAX_PRICE_SPREAD}%",
+            )
+            return None
+        if funding_spread_val is None:
+            _early_reject_and_log(
+                coin, long_ex, short_ex, open_spread_pct, funding_spread_val, m_long, m_short,
+                funding_long_pct, funding_short_pct,
+                "фандинг: нет данных",
             )
             return None
         if funding_spread_val < MIN_FUNDING_SPREAD:
@@ -324,7 +342,6 @@ async def _analyze_and_log_opportunity(
                 f"фандинг {funding_spread_val:.3f}% < {MIN_FUNDING_SPREAD}%",
             )
             return None
-        # Вердикт по времени: нужна выплата на лонг бирже в ближайшее время; если до выплаты на Long >= порога — не арбит
         if m_long is not None and m_long >= SCAN_FUNDING_MIN_TIME_TO_PAY:
             _early_reject_and_log(
                 coin, long_ex, short_ex, open_spread_pct, funding_spread_val, m_long, m_short,
@@ -601,27 +618,29 @@ async def process_coin(
         ex: d for ex, d in ex_data.items()
         if d and d.get("bid") is not None and d.get("ask") is not None
     }
+    for ex in ex_list:
+        if ex not in available:
+            logger.info(
+                f"Биржа {ex} по монете {coin}: нет валидных данных (таймаут, ошибка или нет bid/ask)."
+            )
     if len(available) < 2:
         return 0
 
-    per_coin_found: List[Tuple[str, str, float, float]] = []
+    per_coin_found: List[Tuple[str, str, Optional[float], Optional[float]]] = []
     for ex1, ex2 in combinations(available.keys(), 2):
         d1, d2 = available[ex1], available[ex2]
         fl1, fl2 = d1.get("funding_rate"), d2.get("funding_rate")
-        if fl1 is None or fl2 is None:
-            continue
-        # Long ex1, Short ex2
+        # Первичная фильтрация: в лог только связки, где фандинг на Long (в %) <= MIN_FUNDING_LONG_FILTER_FOR_LOG
+        fl1_pct = (fl1 * 100.0) if fl1 is not None else None
+        fl2_pct = (fl2 * 100.0) if fl2 is not None else None
         spread_price = calc_open_spread_pct(d1["ask"], d2["bid"])
-        spread_funding = funding_spread_pct(fl1, fl2)
-        if spread_price is not None and spread_funding is not None:
-            if spread_funding >= MIN_FUNDING_SPREAD and abs(spread_price) <= MAX_PRICE_SPREAD:
-                per_coin_found.append((ex1, ex2, spread_price, spread_funding))
-        # Long ex2, Short ex1
+        spread_funding = funding_spread_pct(fl1, fl2) if (fl1 is not None and fl2 is not None) else None
+        if fl1_pct is not None and fl1_pct <= MIN_FUNDING_LONG_FILTER_FOR_LOG:
+            per_coin_found.append((ex1, ex2, spread_price, spread_funding))
         spread_price2 = calc_open_spread_pct(d2["ask"], d1["bid"])
-        spread_funding2 = funding_spread_pct(fl2, fl1)
-        if spread_price2 is not None and spread_funding2 is not None:
-            if spread_funding2 >= MIN_FUNDING_SPREAD and abs(spread_price2) <= MAX_PRICE_SPREAD:
-                per_coin_found.append((ex2, ex1, spread_price2, spread_funding2))
+        spread_funding2 = funding_spread_pct(fl2, fl1) if (fl1 is not None and fl2 is not None) else None
+        if fl2_pct is not None and fl2_pct <= MIN_FUNDING_LONG_FILTER_FOR_LOG:
+            per_coin_found.append((ex2, ex1, spread_price2, spread_funding2))
 
     if not per_coin_found:
         return 0
