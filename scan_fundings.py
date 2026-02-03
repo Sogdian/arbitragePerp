@@ -1,6 +1,6 @@
 """
 Скрипт для поиска фандингов на монеты на бирже Bybit.
-Ищет фандинги >= MIN_FUNDING_SPREAD и отправляет уведомления в Telegram.
+Ищет фандинги >= MIN_FUNDING и отправляет уведомления в Telegram.
 """
 import asyncio
 import logging
@@ -51,7 +51,7 @@ def load_dotenv(path: str = ".env") -> None:
 # ----------------------------
 load_dotenv(".env")
 
-MIN_FUNDING_SPREAD = float(os.getenv("MIN_FUNDING_SPREAD", "-1"))  # в процентах, например -1
+MIN_FUNDING = float(os.getenv("MIN_FUNDING", "-1"))  # в процентах, например -1
 SCAN_INTERVAL_SEC = float(os.getenv("SCAN_FUNDING_INTERVAL_SEC", "60"))  # каждые N секунд
 MAX_CONCURRENCY = int(os.getenv("SCAN_FUNDING_MAX_CONCURRENCY", "20"))  # сколько одновременных http запросов
 COIN_BATCH_SIZE = int(os.getenv("SCAN_FUNDING_COIN_BATCH_SIZE", "50"))  # сколько монет обрабатывать за пачку
@@ -336,22 +336,22 @@ async def process_coin(
         logger.debug(f"💲 {coin} {exchange_name} | Фандинг: N/A (funding_rate is None)")
         return None
     
-    # Проверяем условие: фандинг >= MIN_FUNDING_SPREAD
-    # MIN_FUNDING_SPREAD обычно отрицательный (например, -1)
-    # Если MIN_FUNDING_SPREAD = -1, то ищем фандинги <= -1 (т.е. -1.1, -1.2 и т.д.)
-    # Это означает, что мы ищем фандинги, которые более отрицательные или равны MIN_FUNDING_SPREAD
+    # Проверяем условие: фандинг >= MIN_FUNDING
+    # MIN_FUNDING обычно отрицательный (например, -1)
+    # Если MIN_FUNDING = -1, то ищем фандинги <= -1 (т.е. -1.1, -1.2 и т.д.)
+    # Это означает, что мы ищем фандинги, которые более отрицательные или равны MIN_FUNDING
     funding_rate_pct = funding_rate * 100  # Конвертируем в проценты
     
-    # Если MIN_FUNDING_SPREAD отрицательный, ищем фандинги <= MIN_FUNDING_SPREAD (более отрицательные)
-    # Например, если MIN_FUNDING_SPREAD = -1, то ищем фандинги <= -1 (т.е. -1.1, -1.2 и т.д.)
-    # Если MIN_FUNDING_SPREAD положительный, ищем фандинги >= MIN_FUNDING_SPREAD
-    if MIN_FUNDING_SPREAD < 0:
-        # Для отрицательных порогов: ищем фандинги <= MIN_FUNDING_SPREAD (более отрицательные)
-        if funding_rate_pct > MIN_FUNDING_SPREAD:
+    # Если MIN_FUNDING отрицательный, ищем фандинги <= MIN_FUNDING (более отрицательные)
+    # Например, если MIN_FUNDING = -1, то ищем фандинги <= -1 (т.е. -1.1, -1.2 и т.д.)
+    # Если MIN_FUNDING положительный, ищем фандинги >= MIN_FUNDING
+    if MIN_FUNDING < 0:
+        # Для отрицательных порогов: ищем фандинги <= MIN_FUNDING (более отрицательные)
+        if funding_rate_pct > MIN_FUNDING:
             return None
     else:
-        # Для положительных порогов: ищем фандинги >= MIN_FUNDING_SPREAD
-        if funding_rate_pct < MIN_FUNDING_SPREAD:
+        # Для положительных порогов: ищем фандинги >= MIN_FUNDING
+        if funding_rate_pct < MIN_FUNDING:
             return None
     
     # Вычисляем время до следующей выплаты
@@ -529,7 +529,7 @@ async def main():
         
         exclude_coins_info = f"exclude_coins={sorted(EXCLUDE_COINS)}" if EXCLUDE_COINS else "exclude_coins=none"
         logger.info(
-            f"scan_fundings started | mode={config.ENV_MODE} | MIN_FUNDING_SPREAD={MIN_FUNDING_SPREAD:.2f}% | "
+            f"scan_fundings started | mode={config.ENV_MODE} | MIN_FUNDING={MIN_FUNDING:.2f}% | "
             f"MIN_TIME_TO_PAY={SCAN_FUNDING_MIN_TIME_TO_PAY:.0f} мин | "
             f"interval={SCAN_INTERVAL_SEC}s | exchanges={exchanges} | "
             f"max_concurrency={MAX_CONCURRENCY} | timeout={REQ_TIMEOUT_SEC:.1f}s | "
