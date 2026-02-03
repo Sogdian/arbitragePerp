@@ -558,12 +558,13 @@ def _generate_arbitrage_table_image(
             except Exception:
                 font = ImageFont.load_default()
                 font_bold = font
-        headers = ["coin", "pr_long", "pr_short", "funding_long", "funding_short", "pr_spread", "fr_spread", "total_spread", "ex_spread"]
+        headers = ["coin", "pr_long", "funding_long", "pr_short", "funding_short", "pr_spread", "fr_spread", "total_spread", "ex_spread"]
+        header_labels = ["coin", "Long цена", "Long фанд", "Short цена", "Shor фанд", "Спред цен", "Спред фанд", "Общ спред", "Связка бирж"]
         x, y = border_width, border_width
         draw.rectangle([x, y, total_width - border_width, y + header_height], fill="#e0e0e0", outline="#000000", width=border_width)
-        for h in headers:
+        for i, h in enumerate(headers):
             w = col_widths[h]
-            draw.text((x + cell_padding, y + (header_height - 20) // 2), h, fill="black", font=font_bold)
+            draw.text((x + cell_padding, y + (header_height - 20) // 2), header_labels[i], fill="black", font=font_bold)
             x += w
         y = border_width + header_height
         for row_idx, row in enumerate(rows):
