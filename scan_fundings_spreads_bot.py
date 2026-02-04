@@ -361,8 +361,8 @@ async def _monitor_until_close(
                 # Фандинг в PNL: только после закрытия часа. Для теоретических сделок — ставку фиксируем в последнюю минуту часа.
                 # Накопленный фандинг по биржам в USDT: L и S — отрицательный = уплата, положительный = получение (на обеих биржах ставка может быть и отрицательной). None = нет данных.
                 funding_impact_usdt: Optional[float] = None
-                funding_long_usdt: Optional[float] = 0.0
-                funding_short_usdt: Optional[float] = 0.0
+                funding_long_usdt: Optional[float] = None
+                funding_short_usdt: Optional[float] = None
                 if open_time is not None and frozen_ask_long_open is not None and frozen_bid_short_open is not None:
                     elapsed_sec = time.time() - open_time
                     notional_long = frozen_ask_long_open * coin_amount
@@ -390,13 +390,24 @@ async def _monitor_until_close(
                                 funding_rates_by_hour[hour_ix] = (funding_long, funding_short)
                         num_completed_hours = int(elapsed_sec / FUNDING_INTERVAL_SEC)
                         total_funding = 0.0
+                        funding_long_total = 0.0
+                        funding_short_total = 0.0
+                        has_funding_data = False
                         for j in range(num_completed_hours):
                             if j in funding_rates_by_hour:
                                 fl, fs = funding_rates_by_hour[j]
-                                funding_long_usdt += -fl * notional_long
-                                funding_short_usdt += fs * notional_short
+                                funding_long_total += -fl * notional_long
+                                funding_short_total += fs * notional_short
                                 total_funding += -fl * notional_long + fs * notional_short
-                        funding_impact_usdt = total_funding if total_funding != 0.0 else None
+                                has_funding_data = True
+                        if has_funding_data:
+                            funding_long_usdt = funding_long_total
+                            funding_short_usdt = funding_short_total
+                            funding_impact_usdt = total_funding if total_funding != 0.0 else None
+                        else:
+                            funding_long_usdt = None
+                            funding_short_usdt = None
+                            funding_impact_usdt = None
 
                 # Расчет PNL: цены открытия фиксированные + комиссии + фандинг за прошедшие периоды
                 pnl_usdt = _calculate_pnl_usdt(
