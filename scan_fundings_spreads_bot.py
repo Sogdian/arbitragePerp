@@ -50,15 +50,19 @@ async def _monitor_until_close(
     long_exchange: str,
     short_exchange: str,
     coin_amount: float,
-    close_threshold_pct: float,
+    close_threshold_pct: Optional[float] = None,
     close_positions_on_trigger: bool = True,
 ):
     """
     Мониторинг каждую секунду. При |Спред закр| ≤ close_threshold_pct:
     отправка в Telegram (FREE_CHANNEL_ID); если close_positions_on_trigger — также закрытие позиций; выход.
+    Если close_threshold_pct=None, мониторинг работает без порога закрытия.
     """
     logger.info("=" * 60)
-    logger.info(f"Начало мониторинга для {coin} | порог закрытия |спред закр| ≤ {close_threshold_pct}%")
+    if close_threshold_pct is not None:
+        logger.info(f"Начало мониторинга для {coin} | порог закрытия |спред закр| ≤ {close_threshold_pct}%")
+    else:
+        logger.info(f"Начало мониторинга для {coin} | без порога закрытия")
     if not close_positions_on_trigger:
         logger.info("Позиции не открыты — при срабатывании порога только отправка в Telegram")
     logger.info("=" * 60)
@@ -125,8 +129,8 @@ async def _monitor_until_close(
                 )
                 logger.info(log_line)
 
-                # Условие: |Спред закр| ≤ X%
-                if closing_spread is not None and abs(closing_spread) <= close_threshold_pct:
+                # Условие: |Спред закр| ≤ X% (только если порог задан)
+                if close_threshold_pct is not None and closing_spread is not None and abs(closing_spread) <= close_threshold_pct:
                     logger.info(f"Порог достигнут: |{closing_spread:.3f}%| ≤ {close_threshold_pct}%")
                     try:
                         telegram = TelegramSender()
@@ -259,13 +263,14 @@ async def main():
 
         match2 = re.search(r"([-]?\d+(?:\.\d+)?)", answer2)
         if not match2:
-            logger.warning("Не найден порог закрытия в ответе, мониторинг без уведомлений (введите число для порога)")
-            return
-        try:
-            close_threshold_pct = float(match2.group(1))
-        except ValueError:
-            logger.warning("Не удалось распарсить порог закрытия, мониторинг без уведомлений")
-            return
+            logger.warning("Не найден порог закрытия в ответе, мониторинг без порога закрытия")
+            close_threshold_pct = None
+        else:
+            try:
+                close_threshold_pct = float(match2.group(1))
+            except ValueError:
+                logger.warning("Не удалось распарсить порог закрытия, мониторинг без порога закрытия")
+                close_threshold_pct = None
 
         await _monitor_until_close(
             bot=bot,
