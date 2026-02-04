@@ -286,8 +286,8 @@ async def open_long_short_positions(
             spread_open = (short_px - long_px) / long_px * 100.0
         spread_str = f"{spread_open:.3f}%" if spread_open is not None else "N/A"
         logger.info(
-            f"Биржа лонг: {long_exchange}, Цена входа Long: {long_px:.5f}, "
-            f"Биржа шорт: {short_exchange}, Цена входа Short: {short_px:.5f}, "
+            f"Биржа лонг: {long_exchange}, Цена входа Long: {long_px:.8f}, "
+            f"Биржа шорт: {short_exchange}, Цена входа Short: {short_px:.8f}, "
             f"Количество монет: {_format_number(coin_amount)}, Спред открытия: {spread_str}"
         )
         logger.info(f"✅ Позиции открыты: {coin} | Long {long_exchange} | Short {short_exchange}")
@@ -373,12 +373,11 @@ async def close_long_short_positions(
             closing_spread = ((long_price - short_price) / short_price) * 100.0
 
         closing_spread_str = _format_number(closing_spread) + "%" if closing_spread is not None else "N/A"
-        long_price_str = _format_number(long_price, precision=5) if long_price is not None else "N/A"
-        short_price_str = _format_number(short_price, precision=5) if short_price is not None else "N/A"
+        long_price_str = f"{long_price:.8f}" if long_price is not None else "N/A"
+        short_price_str = f"{short_price:.8f}" if short_price is not None else "N/A"
 
         logger.info(
-            f"✅ Позиции закрыты: {coin} | Long {long_exchange} + Short {short_exchange} | "
-            f"Цена выхода Long: {long_price_str}, Цена выхода Short: {short_price_str}, "
+            f"✅ Позиции закрыты: Цена выхода Long: {long_price_str}, Цена выхода Short: {short_price_str}, "
             f"Спред закрытия: {closing_spread_str}, Количество монет: {_format_number(coin_amount_f)}"
         )
     else:
@@ -2181,6 +2180,55 @@ async def _binance_private_request(
         return resp.json()
     except Exception:
         return {"_error": "bad json", "_body": resp.text[:400]}
+
+
+async def get_binance_fees_from_trades(
+    *,
+    exchange_obj: Any,
+    api_key: str,
+    api_secret: str,
+    coin: str,
+    direction: str,
+    start_ms: int,
+    end_ms: int,
+) -> Optional[float]:
+    """
+    Сумма комиссий в USDT по сделкам Binance Futures за период [start_ms, end_ms].
+    direction: "long" → только BUY, "short" → только SELL.
+    Возвращает None при ошибке API или если комиссий в USDT нет.
+    """
+    symbol = exchange_obj._normalize_symbol(coin)
+    want_side = "BUY" if (direction or "").lower().strip() == "long" else "SELL"
+    data = await _binance_private_request(
+        exchange_obj=exchange_obj,
+        api_key=api_key,
+        api_secret=api_secret,
+        method="GET",
+        path="/fapi/v1/userTrades",
+        params={"symbol": symbol, "startTime": start_ms, "endTime": end_ms, "limit": 1000},
+    )
+    if isinstance(data, dict) and data.get("_error"):
+        logger.warning(
+            "Binance userTrades: ошибка запроса | %s",
+            data.get("_error") or data.get("msg") or data.get("code") or str(data)[:200],
+        )
+        return None
+    if not isinstance(data, list):
+        logger.warning("Binance userTrades: неожиданный ответ (не список)")
+        return None
+    total = 0.0
+    for t in data:
+        if not isinstance(t, dict):
+            continue
+        if str(t.get("side") or "").upper() != want_side:
+            continue
+        if str(t.get("commissionAsset") or "").upper() != "USDT":
+            continue
+        try:
+            total += abs(float(t.get("commission") or 0))
+        except (TypeError, ValueError):
+            pass
+    return total if total > 0 else None
 
 
 async def _binance_wait_full_fill(*, planned: Dict[str, Any], order_id: str) -> Tuple[bool, float]:

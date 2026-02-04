@@ -33,7 +33,7 @@ def _windows_ctrl_z_listener() -> None:
 import config
 from bot import PerpArbitrageBot, format_number
 from input_parser import parse_input
-from position_opener import open_long_short_positions, close_long_short_positions
+from position_opener import open_long_short_positions, close_long_short_positions, get_binance_fees_from_trades
 from telegram_sender import TelegramSender
 from fun import _bybit_fetch_executions, _bybit_fetch_funding_from_transaction_log
 
@@ -159,8 +159,21 @@ async def _get_real_fees_from_executions(
             
             return fee_total if fee_total > 0 else None
         
-        # Для других бирж пока возвращаем None (можно расширить позже)
-        # TODO: Реализовать получение комиссий для Gate, Binance, MEXC, Bitget, BingX
+        if exchange_name.lower() == "binance":
+            end_ms = int(time.time() * 1000)
+            start_ms = end_ms - (time_window_sec * 1000)
+            fee_total = await get_binance_fees_from_trades(
+                exchange_obj=exchange_obj,
+                api_key=api_key,
+                api_secret=api_secret,
+                coin=coin,
+                direction=direction,
+                start_ms=start_ms,
+                end_ms=end_ms,
+            )
+            return fee_total
+        
+        # TODO: Реализовать получение комиссий для Gate, MEXC, Bitget, BingX
         return None
         
     except Exception as e:
@@ -602,13 +615,6 @@ async def _monitor_until_close(
                     ok_closed = False
                 if ok_closed:
                     if frozen_ask_long_open is not None and frozen_bid_short_open is not None:
-                        closing_info = []
-                        if bid_long_close is not None:
-                            closing_info.append(f"Цена закрытия Long: {bid_long_close:.5f}")
-                        if ask_short_close is not None:
-                            closing_info.append(f"Цена закрытия Short: {ask_short_close:.5f}")
-                        if closing_info:
-                            logger.info(" | ".join(closing_info))
                         await asyncio.sleep(1.5)
                         fee_long_close = await _get_real_fees_from_executions(
                             bot, long_exchange, coin, "short", time_window_sec=15
@@ -631,9 +637,13 @@ async def _monitor_until_close(
                         logger.info(f"L доход: {income_l_str} | S доход: {income_s_str}")
                         fee_l_close_str = format_number(fee_long_close) if fee_long_close is not None else "N/A"
                         fee_s_close_str = format_number(fee_short_close) if fee_short_close is not None else "N/A"
-                        logger.info(f"L комиссия закр: {fee_l_close_str} | S комиссия закр: {fee_s_close_str}")
                         fee_long_total = fee_l_open + fee_l_close
                         fee_short_total = fee_s_open + fee_s_close
+                        fee_total_str = format_number(fee_long_total + fee_short_total)
+                        logger.info(
+                            f"L комиссия закр: {fee_l_close_str} | S комиссия закр: {fee_s_close_str} | "
+                            f"L комиссия общая: {format_number(fee_long_total)} | S комиссия общая: {format_number(fee_short_total)} | Итоговая комиссия: {fee_total_str}"
+                        )
                         final_pnl = _calculate_pnl_usdt(
                             coin_amount=coin_amount,
                             ask_long_open=frozen_ask_long_open,
