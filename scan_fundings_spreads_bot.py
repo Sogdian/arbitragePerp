@@ -9,6 +9,7 @@ import os
 import re
 import sys
 import time
+from datetime import datetime
 from typing import Optional
 
 import config
@@ -16,7 +17,7 @@ from bot import PerpArbitrageBot, format_number
 from input_parser import parse_input
 from position_opener import open_long_short_positions, close_long_short_positions
 from telegram_sender import TelegramSender
-from fun import _bybit_fetch_executions
+from fun import _bybit_fetch_executions, _bybit_fetch_funding_from_transaction_log
 
 # ----------------------------
 # Logging - используем настройки из bot.py
@@ -149,20 +150,68 @@ async def _get_real_fees_from_executions(
         return None
 
 
+async def _get_real_funding_usdt(
+    bot: PerpArbitrageBot,
+    exchange_name: str,
+    coin: str,
+    open_time: float,
+) -> Optional[float]:
+    """
+    Запрос к бирже: сумма полученного/уплаченного фандинга (USDT) с момента open_time.
+    Положительное = получено, отрицательное = уплачено. None при ошибке или неподдерживаемой бирже.
+    """
+    try:
+        exchange_obj = bot.exchanges.get(exchange_name)
+        if not exchange_obj:
+            return None
+        api_key_env_map = {
+            "bybit": ("BYBIT_API_KEY", "BYBIT_API_SECRET"),
+            "gate": ("GATEIO_API_KEY", "GATEIO_API_SECRET"),
+            "binance": ("BINANCE_API_KEY", "BINANCE_API_SECRET"),
+            "mexc": ("MEXC_API_KEY", "MEXC_API_SECRET"),
+            "bitget": ("BITGET_API_KEY", "BITGET_API_SECRET", "BITGET_API_PASSPHRASE"),
+            "bingx": ("BINGX_API_KEY", "BINGX_API_SECRET"),
+            "okx": ("OKX_API_KEY", "OKX_API_SECRET"),
+        }
+        env_keys = api_key_env_map.get(exchange_name.lower())
+        if not env_keys:
+            return None
+        api_key = os.getenv(env_keys[0])
+        api_secret = os.getenv(env_keys[1])
+        if not api_key or not api_secret:
+            return None
+        start_ms = int(open_time * 1000)
+        end_ms = int(time.time() * 1000)
+        if exchange_name.lower() == "bybit":
+            return await _bybit_fetch_funding_from_transaction_log(
+                exchange_obj=exchange_obj,
+                api_key=api_key,
+                api_secret=api_secret,
+                coin=coin,
+                start_ms=start_ms,
+                end_ms=end_ms,
+            )
+        # TODO: Gate, OKX, Bingx и др. — добавить запрос истории фандинга по API
+        return None
+    except Exception as e:
+        logger.debug(f"Ошибка при получении фандинга с {exchange_name}: {e}")
+        return None
+
+
 def _calculate_pnl_usdt(
     coin_amount: float,
     ask_long_open: Optional[float],
     bid_long_current: Optional[float],
     bid_short_open: Optional[float],
     ask_short_current: Optional[float],
-    fee_long: float = 0.05,
-    fee_short: float = 0.05,
+    fee_long: Optional[float] = 0.05,
+    fee_short: Optional[float] = 0.05,
     funding_impact_usdt: Optional[float] = None,
 ) -> Optional[float]:
     """
     Рассчитывает PNL в USDT для арбитража Long/Short.
 
-    Учитывает: разницу цен открытия/закрытия, комиссии, опционально — начисленный фандинг.
+    Учитывает: разницу цен открытия/закрытия, комиссии (при None комиссия не вычитается), опционально — начисленный фандинг.
     Фандинг: Long платит при rate > 0, Short получает; funding_impact_usdt — суммарный эффект в USDT
     (положительный = мы получили, отрицательный = мы заплатили).
     """
@@ -173,11 +222,13 @@ def _calculate_pnl_usdt(
     if coin_amount <= 0 or ask_long_open <= 0 or ask_short_current <= 0:
         return None
 
-    # Long: покупаем по ask_long_open, продаем по bid_long_current
-    pnl_long = (bid_long_current - ask_long_open) * coin_amount - fee_long
+    # Long: покупаем по ask_long_open, продаем по bid_long_current; при fee_long=None комиссию не считаем
+    fee_l = fee_long if fee_long is not None else 0.0
+    fee_s = fee_short if fee_short is not None else 0.0
+    pnl_long = (bid_long_current - ask_long_open) * coin_amount - fee_l
 
     # Short: продаем по bid_short_open, покупаем по ask_short_current
-    pnl_short = (bid_short_open - ask_short_current) * coin_amount - fee_short
+    pnl_short = (bid_short_open - ask_short_current) * coin_amount - fee_s
 
     total = pnl_long + pnl_short
     if funding_impact_usdt is not None:
@@ -195,8 +246,8 @@ async def _monitor_until_close(
     close_positions_on_trigger: bool = True,
     ask_long_open: Optional[float] = None,
     bid_short_open: Optional[float] = None,
-    fee_long: float = 0.05,
-    fee_short: float = 0.05,
+    fee_long: Optional[float] = 0.05,
+    fee_short: Optional[float] = 0.05,
 ):
     """
     Мониторинг каждую секунду. При |Спред закр| ≤ close_threshold_pct:
@@ -294,12 +345,12 @@ async def _monitor_until_close(
                 
                 # Форматируем фандинги и минуты как в scan_fundings_spreads.py
                 def _format_funding_time(funding_pct: Optional[float], m: Optional[int]) -> str:
-                    """Формат для L/S: '-2% 8 мин' или '8 мин' или 'N/A'."""
+                    """Формат для L/S: '-2% 8 м' или '8 м' или 'N/A'."""
                     if m is None:
                         return "N/A"
                     if funding_pct is not None:
-                        return f"{funding_pct:.2f}% {m} мин"
-                    return f"{m} мин"
+                        return f"{funding_pct:.2f}% {m} м"
+                    return f"{m} м"
                 
                 funding_long_pct = (funding_long * 100) if funding_long is not None else None
                 funding_short_pct = (funding_short * 100) if funding_short is not None else None
@@ -308,32 +359,42 @@ async def _monitor_until_close(
                 time_str = f" (L: {l_str} | S: {s_str})"
                 
                 # Фандинг в PNL: только после закрытия часа. Для теоретических сделок — ставку фиксируем в последнюю минуту часа.
+                # Накопленный фандинг по биржам в USDT: L и S — отрицательный = уплата, положительный = получение (на обеих биржах ставка может быть и отрицательной). None = нет данных.
                 funding_impact_usdt: Optional[float] = None
+                funding_long_usdt: Optional[float] = 0.0
+                funding_short_usdt: Optional[float] = 0.0
                 if open_time is not None and frozen_ask_long_open is not None and frozen_bid_short_open is not None:
                     elapsed_sec = time.time() - open_time
                     notional_long = frozen_ask_long_open * coin_amount
                     notional_short = frozen_bid_short_open * coin_amount
                     if close_positions_on_trigger:
-                        # Реальные позиции: считаем фандинг по текущим ставкам за каждый закрытый час.
-                        num_periods = int(elapsed_sec / FUNDING_INTERVAL_SEC)
-                        if num_periods > 0:
-                            fl = funding_long if funding_long is not None else 0.0
-                            fs = funding_short if funding_short is not None else 0.0
-                            funding_impact_usdt = num_periods * (-fl * notional_long + fs * notional_short)
+                        # Реальные позиции: только фактические данные с бирж. Если нет по обеим сторонам — в лог N/A, в PNL фандинг не включаем.
+                        real_funding_long = await _get_real_funding_usdt(bot, long_exchange, coin, open_time)
+                        real_funding_short = await _get_real_funding_usdt(bot, short_exchange, coin, open_time)
+                        if real_funding_long is not None and real_funding_short is not None:
+                            funding_long_usdt = real_funding_long
+                            funding_short_usdt = real_funding_short
+                            funding_impact_usdt = funding_long_usdt + funding_short_usdt
+                        else:
+                            funding_long_usdt = None
+                            funding_short_usdt = None
+                            funding_impact_usdt = None
                     else:
                         # Теоретические: ставки нет в середине часа; в последнюю минуту часа запрашиваем и сохраняем ставку.
                         # В PNL учитываем фандинг только по уже закрытым часам, по сохранённым ставкам.
                         sec_in_hour = elapsed_sec % FUNDING_INTERVAL_SEC
+                        # Сохраняем ставку только если обе биржи вернули данные; при None — не подставляем 0, в логе будет N/A.
                         if sec_in_hour >= 3540:  # последняя минута часа (59 мин 0 сек — 59 мин 59 сек)
                             hour_ix = int(elapsed_sec // FUNDING_INTERVAL_SEC)
-                            fl = funding_long if funding_long is not None else 0.0
-                            fs = funding_short if funding_short is not None else 0.0
-                            funding_rates_by_hour[hour_ix] = (fl, fs)
+                            if funding_long is not None and funding_short is not None:
+                                funding_rates_by_hour[hour_ix] = (funding_long, funding_short)
                         num_completed_hours = int(elapsed_sec / FUNDING_INTERVAL_SEC)
                         total_funding = 0.0
                         for j in range(num_completed_hours):
                             if j in funding_rates_by_hour:
                                 fl, fs = funding_rates_by_hour[j]
+                                funding_long_usdt += -fl * notional_long
+                                funding_short_usdt += fs * notional_short
                                 total_funding += -fl * notional_long + fs * notional_short
                         funding_impact_usdt = total_funding if total_funding != 0.0 else None
 
@@ -349,27 +410,37 @@ async def _monitor_until_close(
                     funding_impact_usdt=funding_impact_usdt,
                 )
                 pnl_str = f"💲 PNL: {format_number(pnl_usdt)} USDT" if pnl_usdt is not None else "💲 PNL: N/A"
+                # Отдельный лог: сколько фандинга получено и сколько уплачено (только когда есть данные).
+                if funding_impact_usdt is not None and funding_long_usdt is not None and funding_short_usdt is not None:
+                    received = max(0.0, funding_long_usdt) + max(0.0, funding_short_usdt)
+                    paid = abs(min(0.0, funding_long_usdt)) + abs(min(0.0, funding_short_usdt))
+                    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S,%f")[:-3]
+                    print(f"{timestamp}    Фандинг получено: {format_number(received)} USDT | уплачено: {format_number(paid)} USDT")
                 
                 # Форматируем цены открытия для лога (5 знаков после запятой)
                 opening_price_long = f"{pnl_ask_long_open:.5f}" if pnl_ask_long_open is not None else "N/A"
                 opening_price_short = f"{pnl_bid_short_open:.5f}" if pnl_bid_short_open is not None else "N/A"
-                opening_str = f"⛳ Откр: {format_number(opening_spread)}% (L: {opening_price_long}, S: {opening_price_short})"
+                opening_str = f"⛳ Отк: {format_number(opening_spread)}% (L: {opening_price_long}, S: {opening_price_short})"
                 
                 # Для отладки: показываем текущие цены закрытия (можно убрать позже)
                 # closing_price_long = format_number(bid_long) if bid_long is not None else "N/A"
                 # closing_price_short = format_number(ask_short) if ask_short is not None else "N/A"
                 # debug_pnl = f" [L: {opening_price_long}→{closing_price_long}, S: {opening_price_short}→{closing_price_short}]"
                 
+                fund_l_str = format_number(funding_long_usdt) if funding_long_usdt is not None else "N/A"
+                fund_s_str = format_number(funding_short_usdt) if funding_short_usdt is not None else "N/A"
+                fund_str = f"Фанд L: {fund_l_str} | S: {fund_s_str}"
                 log_line = (
-                    f"🚩 Спред закр: {format_number(closing_display)}% | "
-                    f"{opening_str} | "
-                    f"💰 Фанд: {format_number(fr_spread)}%{time_str} | "
-                    f"🎯 Общ: {format_number(total_spread)} | "
-                    f"{pnl_str} | "
-                    f"⚙️ Long {long_exchange} | Short {short_exchange} | {coin}"
+                    f"🚩 Спред зак: {format_number(closing_display)}% "
+                    f"{opening_str} "
+                    f"💰 Фанд: {format_number(fr_spread)}%{time_str} "
+                    f"🎯 Общ: {format_number(total_spread)} "
+                    f"{pnl_str} | {fund_str} "
+                    f"⚙️ L {long_exchange} S {short_exchange} | {coin}"
                 )
-                # Выводим без префикса "__main__ - INFO"
-                print(log_line)
+                # Выводим без префикса "__main__ - INFO", добавляем временную метку
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S,%f")[:-3]
+                print(f"{timestamp} {log_line}")
 
                 # Условие: |Спред закр| ≤ X% (только если порог задан)
                 if close_threshold_pct is not None and closing_spread is not None and abs(closing_spread) <= close_threshold_pct:
@@ -506,10 +577,6 @@ async def main():
                 direction="long",
                 time_window_sec=10,
             )
-            if fee_long is None:
-                logger.warning(f"Не удалось получить реальные комиссии для {long_exchange} Long, используем фиксированные 0.05 USDT")
-                fee_long = 0.05
-            
             fee_short = await _get_real_fees_from_executions(
                 bot=bot,
                 exchange_name=short_exchange,
@@ -517,11 +584,10 @@ async def main():
                 direction="short",
                 time_window_sec=10,
             )
-            if fee_short is None:
-                logger.warning(f"Не удалось получить реальные комиссии для {short_exchange} Short, используем фиксированные 0.05 USDT")
-                fee_short = 0.05
-            
-            logger.info(f"Комиссии: Long {long_exchange}={format_number(fee_long)} USDT, Short {short_exchange}={format_number(fee_short)} USDT")
+            # При None комиссия в PNL не учитывается, в логе — N/A
+            fee_long_str = format_number(fee_long) if fee_long is not None else "N/A"
+            fee_short_str = format_number(fee_short) if fee_short is not None else "N/A"
+            logger.info(f"Комиссии: Long {long_exchange}={fee_long_str} USDT, Short {short_exchange}={fee_short_str} USDT")
 
             await _monitor_until_close(
                 bot=bot,

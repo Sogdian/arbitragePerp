@@ -687,6 +687,69 @@ async def _bybit_fetch_executions(
     return items if isinstance(items, list) else []
 
 
+async def _bybit_fetch_funding_from_transaction_log(
+    *,
+    exchange_obj: Any,
+    api_key: str,
+    api_secret: str,
+    coin: str,
+    start_ms: int,
+    end_ms: int,
+) -> Optional[float]:
+    """
+    Сумма фандинга (USDT) из transaction log за период [start_ms, end_ms].
+    Положительное = получено, отрицательное = уплачено.
+    Использует /v5/account/transaction-log, type=SETTLEMENT (funding).
+    """
+    symbol = exchange_obj._normalize_symbol(coin)
+    base_coin = coin.upper()
+    total_funding = 0.0
+    cursor: Optional[str] = None
+    first_page = True
+    while True:
+        params: Dict[str, Any] = {
+            "accountType": "UNIFIED",
+            "category": "linear",
+            "currency": "USDT",
+            "baseCoin": base_coin,
+            "type": "SETTLEMENT",
+            "startTime": start_ms,
+            "endTime": end_ms,
+            "limit": 50,
+        }
+        if cursor:
+            params["cursor"] = cursor
+        data = await _bybit_private_get(
+            exchange_obj=exchange_obj,
+            api_key=api_key,
+            api_secret=api_secret,
+            path="/v5/account/transaction-log",
+            params=params,
+        )
+        if not (isinstance(data, dict) and data.get("retCode") == 0):
+            if first_page:
+                return None
+            break
+        first_page = False
+        items = ((data.get("result") or {}).get("list") or [])
+        if not isinstance(items, list):
+            break
+        for it in items:
+            if not isinstance(it, dict) or str(it.get("symbol") or "") != symbol:
+                continue
+            raw = it.get("funding")
+            if raw is None or raw == "":
+                continue
+            try:
+                total_funding += float(raw)
+            except (TypeError, ValueError):
+                pass
+        cursor = (data.get("result") or {}).get("nextPageCursor")
+        if not cursor:
+            break
+    return total_funding
+
+
 async def _bybit_get_short_position_qty(
     *,
     exchange_obj: Any,
