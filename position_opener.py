@@ -373,8 +373,8 @@ async def close_long_short_positions(
             closing_spread = ((long_price - short_price) / short_price) * 100.0
 
         closing_spread_str = _format_number(closing_spread) + "%" if closing_spread is not None else "N/A"
-        long_price_str = _format_number(long_price) if long_price is not None else "N/A"
-        short_price_str = _format_number(short_price) if short_price is not None else "N/A"
+        long_price_str = _format_number(long_price, precision=5) if long_price is not None else "N/A"
+        short_price_str = _format_number(short_price, precision=5) if short_price is not None else "N/A"
 
         logger.info(
             f"✅ Позиции закрыты: {coin} | Long {long_exchange} + Short {short_exchange} | "
@@ -664,7 +664,7 @@ async def _bybit_close_leg_partial_ioc(
             px_str = _format_by_step(px, tick_raw)
 
             logger.info(
-                f"Bybit close(ws): ордер {order_n}/{max_orders_total} | side={side_close} qty={qty_str} "
+                f"Bybit close(ws): попытка {order_n}/{max_orders_total} | side={side_close} qty={qty_str} "
                 f"| px={px_str} | remaining={_format_number(remaining)} | no_fill_streak={no_fill_streak} "
                 f"| escalate_ticks={escalate_ticks}"
             )
@@ -894,7 +894,7 @@ async def _bybit_close_leg_partial_ioc(
         px_str = _format_by_step(px, tick_raw) if tick > 0 else str(px)
 
         logger.info(
-            f"Bybit close: ордер {order_n}/{max_orders_total} | side={side_close} qty={qty_str} | "
+            f"Bybit close: попытка {order_n}/{max_orders_total} | side={side_close} qty={qty_str} | "
             f"лимит={px_str} | remaining={_format_number(remaining)} | cum={_format_number(cum)} | "
             f"no_fill_streak={no_fill_streak} | escalate_ticks={escalate_ticks} | elapsed={elapsed:.2f}s"
         )

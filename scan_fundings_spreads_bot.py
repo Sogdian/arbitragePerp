@@ -299,6 +299,9 @@ async def _monitor_until_close(
     # Для теоретических сделок: ставки фандинга, зафиксированные в последнюю минуту каждого часа (час_индекс -> (rate_long, rate_short)).
     # В PNL фандинг попадает только после закрытия часа, по ставке, запрошенной перед закрытием.
     funding_rates_by_hour: dict[int, tuple[float, float]] = {}
+    last_logged_completed_hours: int = -1
+    prev_cumulative_funding_long: Optional[float] = None
+    prev_cumulative_funding_short: Optional[float] = None
 
     try:
         while True:
@@ -403,17 +406,25 @@ async def _monitor_until_close(
                     notional_long = frozen_ask_long_open * coin_amount
                     notional_short = frozen_bid_short_open * coin_amount
                     if close_positions_on_trigger:
-                        # Реальные позиции: только фактические данные с бирж. Если нет по обеим сторонам — в лог N/A, в PNL фандинг не включаем.
+                        # Реальные позиции: только фактические данные с бирж. L и S показываем по отдельности (N/A если нет данных).
                         real_funding_long = await _get_real_funding_usdt(bot, long_exchange, coin, open_time)
                         real_funding_short = await _get_real_funding_usdt(bot, short_exchange, coin, open_time)
-                        if real_funding_long is not None and real_funding_short is not None:
-                            funding_long_usdt = real_funding_long
-                            funding_short_usdt = real_funding_short
-                            funding_impact_usdt = funding_long_usdt + funding_short_usdt
-                        else:
-                            funding_long_usdt = None
-                            funding_short_usdt = None
-                            funding_impact_usdt = None
+                        funding_long_usdt = real_funding_long
+                        funding_short_usdt = real_funding_short
+                        funding_impact_usdt = (funding_long_usdt + funding_short_usdt) if (funding_long_usdt is not None and funding_short_usdt is not None) else None
+                        num_completed_hours = int(elapsed_sec / FUNDING_INTERVAL_SEC)
+                        if num_completed_hours > last_logged_completed_hours:
+                            delta_long = (real_funding_long or 0.0) - (prev_cumulative_funding_long or 0.0)
+                            delta_short = (real_funding_short or 0.0) - (prev_cumulative_funding_short or 0.0)
+                            received = max(0.0, delta_long) + max(0.0, delta_short)
+                            paid = abs(min(0.0, delta_long)) + abs(min(0.0, delta_short))
+                            if received != 0.0 or paid != 0.0:
+                                hours_label = "час" if num_completed_hours - last_logged_completed_hours == 1 else "часов"
+                                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S,%f")[:-3]
+                                print(f"{timestamp}    Фандинг за {hours_label}: получено: {format_number(received)} USDT | уплачено: {format_number(paid)} USDT")
+                            prev_cumulative_funding_long = real_funding_long
+                            prev_cumulative_funding_short = real_funding_short
+                            last_logged_completed_hours = num_completed_hours
                     else:
                         # Теоретические: ставки нет в середине часа; в последнюю минуту часа запрашиваем и сохраняем ставку.
                         # В PNL учитываем фандинг только по уже закрытым часам, по сохранённым ставкам.
@@ -443,8 +454,23 @@ async def _monitor_until_close(
                             funding_long_usdt = None
                             funding_short_usdt = None
                             funding_impact_usdt = None
+                        if num_completed_hours > last_logged_completed_hours:
+                            delta_received = 0.0
+                            delta_paid = 0.0
+                            for hour_ix in range(last_logged_completed_hours + 1, num_completed_hours):
+                                if hour_ix in funding_rates_by_hour:
+                                    fl, fs = funding_rates_by_hour[hour_ix]
+                                    dl = -fl * notional_long
+                                    ds = fs * notional_short
+                                    delta_received += max(0.0, dl) + max(0.0, ds)
+                                    delta_paid += abs(min(0.0, dl)) + abs(min(0.0, ds))
+                            if delta_received != 0.0 or delta_paid != 0.0:
+                                hours_label = "час" if num_completed_hours - last_logged_completed_hours == 1 else "часов"
+                                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S,%f")[:-3]
+                                print(f"{timestamp}    Фандинг за {hours_label}: получено: {format_number(delta_received)} USDT | уплачено: {format_number(delta_paid)} USDT")
+                            last_logged_completed_hours = num_completed_hours
 
-                # Расчет PNL: цены открытия фиксированные + комиссии + фандинг за прошедшие периоды
+                # Расчет PNL: + комиссии + фандинг за прошедшие периоды
                 pnl_usdt = _calculate_pnl_usdt(
                     coin_amount=coin_amount,
                     ask_long_open=pnl_ask_long_open,
@@ -456,13 +482,7 @@ async def _monitor_until_close(
                     funding_impact_usdt=funding_impact_usdt,
                 )
                 pnl_str = f"💲 PNL: {format_number(pnl_usdt)} USDT" if pnl_usdt is not None else "💲 PNL: N/A"
-                # Отдельный лог: сколько фандинга получено и сколько уплачено (только когда есть данные).
-                if funding_impact_usdt is not None and funding_long_usdt is not None and funding_short_usdt is not None:
-                    received = max(0.0, funding_long_usdt) + max(0.0, funding_short_usdt)
-                    paid = abs(min(0.0, funding_long_usdt)) + abs(min(0.0, funding_short_usdt))
-                    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S,%f")[:-3]
-                    print(f"{timestamp}    Фандинг получено: {format_number(received)} USDT | уплачено: {format_number(paid)} USDT")
-                
+
                 # Форматируем цены открытия для лога (5 знаков после запятой)
                 opening_price_long = f"{pnl_ask_long_open:.5f}" if pnl_ask_long_open is not None else "N/A"
                 opening_price_short = f"{pnl_bid_short_open:.5f}" if pnl_bid_short_open is not None else "N/A"
@@ -581,7 +601,6 @@ async def _monitor_until_close(
                     logger.error(f"Ошибка при закрытии позиций: {e}")
                     ok_closed = False
                 if ok_closed:
-                    logger.info("Позиции закрыты")
                     if frozen_ask_long_open is not None and frozen_bid_short_open is not None:
                         closing_info = []
                         if bid_long_close is not None:
