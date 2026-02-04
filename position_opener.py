@@ -32,9 +32,8 @@ import httpx
 # Логируем в __main__, чтобы совпадало с основным логгером bot.py
 logger = logging.getLogger("__main__")
 
-# Максимальная глубина стакана для подбора цен и количества попыток исполнения (уровни 1..N).
-# Раньше использовалось 3, но по требованию увеличено до 10.
-MAX_ORDERBOOK_LEVELS = max(1, int(os.getenv("OPEN_ORDERBOOK_LEVELS", "10") or "10"))
+# Глубина стакана при открытии: уровни 1..N, с первого уровня частичные ордера (IOC) до набора объёма.
+MAX_ORDERBOOK_LEVELS = max(1, int(os.getenv("OPEN_ORDERBOOK_LEVELS", "5") or "5"))
 
 
 def _format_number(value: Optional[float], precision: int = 3) -> str:
@@ -67,6 +66,8 @@ class OpenLegResult:
     order_id: Optional[str] = None
     error: Optional[str] = None
     raw: Optional[Any] = None
+    filled_qty: Optional[float] = None  # при открытии несколькими IOC — суммарно исполнено
+    avg_price: Optional[float] = None   # средняя цена исполнения (для лога)
 
 
 def _get_env(name: str) -> Optional[str]:
@@ -115,9 +116,9 @@ def _is_multiple_of_step(x: float, step: float, eps: float = 1e-12) -> bool:
 
 def _round_price_for_side(price: float, tick: float, side: str) -> float:
     """
-    Aggressive rounding:
-    - Buy  -> ceil to tick
-    - Sell -> floor to tick
+    Округление цены по шагу (tick): для buy — вверх (ceil), для sell — вниз (floor).
+    Так лимит получается «агрессивнее»: покупка по цене не ниже лучшего ask, продажа по цене не выше
+    лучшего bid, чтобы ордер мог исполниться против текущего стакана.
     """
     price = float(price)
     tick = float(tick)
@@ -210,7 +211,8 @@ async def open_long_short_positions(
 ) -> bool:
     """
     Открывает Long (на long_exchange) и Short (на short_exchange) на coin_amount монет (для каждой ноги).
-    Возвращает True только если обе ноги открылись успешно.
+    Возвращает (ok, long_price, short_price): ok=True только если обе ноги открылись успешно;
+    при ok=True — фактические средние цены исполнения (long_price, short_price), иначе (None, None).
     """
     try:
         coin_amount = float(coin_amount)
@@ -250,15 +252,23 @@ async def open_long_short_positions(
     _log_leg_result(long_res)
     _log_leg_result(short_res)
 
-    # 3) Проверка fill: строго 100% (иначе считаем ошибкой)
+    # 3) Проверка fill: весь объём исполнен (одним ордером или несколькими частичными)
     long_filled_ok = False
     short_filled_ok = False
     long_filled_qty = 0.0
     short_filled_qty = 0.0
-    if long_res.ok and long_res.order_id:
-        long_filled_ok, long_filled_qty = await _check_filled_full(planned=long_plan, order_id=long_res.order_id)
-    if short_res.ok and short_res.order_id:
-        short_filled_ok, short_filled_qty = await _check_filled_full(planned=short_plan, order_id=short_res.order_id)
+    if long_res.ok:
+        if long_res.filled_qty is not None:
+            long_filled_qty = long_res.filled_qty
+            long_filled_ok = long_filled_qty >= coin_amount - 1e-9
+        elif long_res.order_id:
+            long_filled_ok, long_filled_qty = await _check_filled_full(planned=long_plan, order_id=long_res.order_id)
+    if short_res.ok:
+        if short_res.filled_qty is not None:
+            short_filled_qty = short_res.filled_qty
+            short_filled_ok = short_filled_qty >= coin_amount - 1e-9
+        elif short_res.order_id:
+            short_filled_ok, short_filled_qty = await _check_filled_full(planned=short_plan, order_id=short_res.order_id)
 
     if long_res.ok and not long_filled_ok:
         logger.error(f"❌ Ордер не исполнен полностью: {long_exchange} long | исполнено={_format_number(long_filled_qty)} {coin} | требовалось={_format_number(coin_amount)} {coin}")
@@ -266,9 +276,11 @@ async def open_long_short_positions(
         logger.error(f"❌ Ордер не исполнен полностью: {short_exchange} short | исполнено={_format_number(short_filled_qty)} {coin} | требовалось={_format_number(coin_amount)} {coin}")
 
     ok_all = bool(long_res.ok and short_res.ok and long_filled_ok and short_filled_ok)
+    long_px: Optional[float] = None
+    short_px: Optional[float] = None
     if ok_all:
-        long_px = float(long_plan.get("limit_price") or 0)
-        short_px = float(short_plan.get("limit_price") or 0)
+        long_px = float(long_res.avg_price if long_res.avg_price is not None else long_plan.get("limit_price") or 0)
+        short_px = float(short_res.avg_price if short_res.avg_price is not None else short_plan.get("limit_price") or 0)
         spread_open = None
         if long_px > 0:
             spread_open = (short_px - long_px) / long_px * 100.0
@@ -286,7 +298,7 @@ async def open_long_short_positions(
             logger.error(f"⚠️ Открыта только Short позиция: {coin} | Long ok=False | Short ok=True")
         else:
             logger.error(f"❌ Не удалось открыть позиции: {coin} | Long ok={long_res.ok and long_filled_ok} | Short ok={short_res.ok and short_filled_ok}")
-    return ok_all
+    return ok_all, long_px, short_px
 
 
 async def close_long_short_positions(
@@ -2081,64 +2093,34 @@ async def _binance_plan_leg(*, exchange_obj: Any, coin: str, direction: str, coi
     ob = await exchange_obj.get_orderbook(coin, limit=MAX_ORDERBOOK_LEVELS)
     if not ob or not ob.get("bids") or not ob.get("asks"):
         return OpenLegResult(exchange="binance", direction=direction, ok=False, error=f"orderbook not available for {coin}")
-
     side = "BUY" if direction == "long" else "SELL"
     book_side = ob["asks"] if side == "BUY" else ob["bids"]
     best_price = float(book_side[0][0])
     if best_price <= 0:
         return OpenLegResult(exchange="binance", direction=direction, ok=False, error="bad orderbook best price")
 
-    # Candidates (<=3 levels): prices where cumulative size >= qty
-    candidates: list[float] = []
-    cum = 0.0
-    for lvl in book_side[:MAX_ORDERBOOK_LEVELS]:
-        try:
-            p = float(lvl[0]); s = float(lvl[1])
-        except Exception:
-            continue
-        if p <= 0 or s <= 0:
-            continue
-        cum += s
-        if cum + 1e-12 >= coin_amount:
-            candidates.append(p)
-    if not candidates:
-        return OpenLegResult(
-            exchange="binance",
-            direction=direction,
-            ok=False,
-            error=f"not enough depth in first {MAX_ORDERBOOK_LEVELS} levels: need {coin_amount}, available {cum}",
-        )
-
     f = await _binance_get_symbol_filters(exchange_obj=exchange_obj, symbol=symbol)
     tick_raw = f.get("tickSize")
     step_raw = f.get("stepSize")
     min_qty_raw = f.get("minQty")
     min_notional_raw = f.get("minNotional")
-
     tick = float(tick_raw) if tick_raw else 0.0
     step = float(step_raw) if step_raw else 0.0
     min_qty = float(min_qty_raw) if min_qty_raw else 0.0
     min_notional = float(min_notional_raw) if min_notional_raw else 0.0
-
     if step > 0 and not _is_multiple_of_step(coin_amount, step):
         return OpenLegResult(exchange="binance", direction=direction, ok=False, error=f"qty {coin_amount} not multiple of stepSize {step_raw}")
     if min_qty > 0 and coin_amount < min_qty:
         return OpenLegResult(exchange="binance", direction=direction, ok=False, error=f"qty {coin_amount} < minQty {min_qty_raw}")
-
-    limit_price = _round_price_for_side(float(candidates[0]), tick, "buy" if side == "BUY" else "sell")
-    notional = coin_amount * limit_price
+    notional = coin_amount * best_price
     if min_notional > 0 and notional < min_notional:
-        min_qty_needed = min_notional / limit_price if limit_price > 0 else 0
+        min_qty_needed = min_notional / best_price if best_price > 0 else 0
         return OpenLegResult(
-            exchange="binance",
-            direction=direction,
-            ok=False,
-            error=f"минимальная номинальная стоимость ордера {min_notional_raw} USDT > запрошенная {_format_number(notional)} USDT (qty={_format_number(coin_amount)} {coin} × цена {_format_number(limit_price)}). Минимум монет: ~{_format_number(min_qty_needed)} {coin}"
+            exchange="binance", direction=direction, ok=False,
+            error=f"минимальная номинальная стоимость ордера {min_notional_raw} USDT > запрошенная {_format_number(notional)} USDT. Минимум монет: ~{_format_number(min_qty_needed)} {coin}",
         )
-
     qty_str = _format_by_step(coin_amount, step_raw)
-    candidates_str = "[" + ", ".join([_format_number(c) for c in candidates[:MAX_ORDERBOOK_LEVELS]]) + "]"
-    logger.info(f"План Binance: {direction} qty={qty_str} | best={_format_number(best_price)} | кандидаты уровней(<=%d)=%s" % (MAX_ORDERBOOK_LEVELS, candidates_str))
+    logger.info(f"План Binance: {direction} qty={qty_str} | best={_format_number(best_price)} | уровни 1..{MAX_ORDERBOOK_LEVELS} (IOC)")
 
     return {
         "exchange": "binance",
@@ -2146,10 +2128,9 @@ async def _binance_plan_leg(*, exchange_obj: Any, coin: str, direction: str, coi
         "exchange_obj": exchange_obj,
         "symbol": symbol,
         "side": side,
+        "coin": coin,
+        "coin_amount": coin_amount,
         "qty": qty_str,
-        "limit_price": float(_format_by_step(limit_price, tick_raw)),
-        "price_str": _format_by_step(limit_price, tick_raw),
-        "candidate_prices_raw": candidates,
         "api_key": api_key,
         "api_secret": api_secret,
         "tickSize": tick_raw,
@@ -2242,14 +2223,36 @@ async def _binance_place_leg(*, planned: Dict[str, Any]) -> OpenLegResult:
     direction = planned["direction"]
     symbol = planned["symbol"]
     side = planned["side"]
+    coin = planned["coin"]
+    coin_amount = float(planned["coin_amount"])
     tick_raw = planned.get("tickSize")
+    step_raw = planned.get("stepSize")
     tick = float(tick_raw) if tick_raw else 0.0
-    candidates = planned.get("candidate_prices_raw") or [float(planned["price_str"])]
-    attempts = candidates[:MAX_ORDERBOOK_LEVELS]
-    for idx, px_raw in enumerate(attempts, start=1):
-        px = _round_price_for_side(float(px_raw), tick, "buy" if side == "BUY" else "sell")
+
+    total_filled = 0.0
+    total_notional = 0.0
+    last_order_id: Optional[str] = None
+
+    for level_idx in range(1, MAX_ORDERBOOK_LEVELS + 1):
+        remaining = coin_amount - total_filled
+        if remaining <= 0:
+            break
+        ob = await exchange_obj.get_orderbook(coin, limit=MAX_ORDERBOOK_LEVELS)
+        if not ob or not ob.get("bids") or not ob.get("asks"):
+            break
+        book_side = ob["asks"] if side == "BUY" else ob["bids"]
+        if level_idx > len(book_side):
+            break
+        try:
+            price_raw = float(book_side[level_idx - 1][0])
+        except (IndexError, TypeError, ValueError):
+            break
+        px = _round_price_for_side(price_raw, tick, "buy" if side == "BUY" else "sell")
         px_str = _format_by_step(px, tick_raw)
-        logger.info(f"Binance: попытка {idx}/{len(attempts)} | {direction} qty={planned['qty']} | лимит={px_str}")
+        qty_str = _format_by_step(remaining, step_raw)
+        if float(qty_str) <= 0:
+            break
+        logger.info(f"Binance: уровень {level_idx}/{MAX_ORDERBOOK_LEVELS} | {direction} qty={qty_str} | лимит={px_str} | осталось={_format_number(remaining)}")
         data = await _binance_private_request(
             exchange_obj=exchange_obj,
             api_key=api_key,
@@ -2260,36 +2263,34 @@ async def _binance_place_leg(*, planned: Dict[str, Any]) -> OpenLegResult:
                 "symbol": symbol,
                 "side": side,
                 "type": "LIMIT",
-                "timeInForce": "FOK",
-                "quantity": planned["qty"],
+                "timeInForce": "IOC",
+                "quantity": qty_str,
                 "price": px_str,
             },
         )
         if not isinstance(data, dict):
             return OpenLegResult(exchange="binance", direction=direction, ok=False, error=f"api error: {data}", raw=data)
-
-        # FOK rejection is a normal outcome when the snapshot is stale or liquidity moved:
-        # try the next price level (up to 3), per our strategy.
-        code = data.get("code")
-        msg = str(data.get("msg") or "")
-        if data.get("_error") or code is not None:
-            if code == -5021 or "FOK" in msg.upper():
-                logger.warning(f"Binance: FOK отклонён на уровне {idx} | причина={msg or data.get('_body')}")
-                continue
+        if data.get("code") is not None or data.get("_error"):
             return OpenLegResult(exchange="binance", direction=direction, ok=False, error=f"api error: {data}", raw=data)
-
         order_id = str(data.get("orderId") or "")
         if not order_id:
             return OpenLegResult(exchange="binance", direction=direction, ok=False, error=f"no orderId in response: {data}", raw=data)
-        ok_full, executed = await _binance_wait_full_fill(planned={**planned, "price_str": px_str, "limit_price": float(px_str)}, order_id=order_id)
-        if ok_full:
-            return OpenLegResult(exchange="binance", direction=direction, ok=True, order_id=order_id, raw=data)
-        logger.warning(f"Binance: не исполнилось полностью на уровне {idx} | исполнено={_format_number(executed)} | требовалось={_format_number(float(planned['qty']))}")
+        last_order_id = order_id
+        ok_full, executed = await _binance_wait_full_fill(planned={**planned, "qty": qty_str, "price_str": px_str, "limit_price": px}, order_id=order_id)
+        total_filled += executed
+        total_notional += executed * px
+        if executed > 0:
+            logger.info(f"Binance: уровень {level_idx} исполнено={_format_number(executed)} | всего={_format_number(total_filled)}")
+
+    if total_filled >= coin_amount - 1e-9:
+        avg_price = total_notional / total_filled if total_filled > 0 else None
+        return OpenLegResult(
+            exchange="binance", direction=direction, ok=True,
+            order_id=last_order_id, filled_qty=total_filled, avg_price=avg_price, raw=None,
+        )
     return OpenLegResult(
-        exchange="binance",
-        direction=direction,
-        ok=False,
-        error=f"не удалось исполнить ордер полностью за {MAX_ORDERBOOK_LEVELS} попыток (уровни 1-{MAX_ORDERBOOK_LEVELS})",
+        exchange="binance", direction=direction, ok=False,
+        error=f"не набрали объём за {MAX_ORDERBOOK_LEVELS} уровней: исполнено={_format_number(total_filled)}, требовалось={_format_number(coin_amount)}",
     )
 
 
@@ -2370,58 +2371,29 @@ async def _mexc_plan_leg(*, exchange_obj: Any, coin: str, direction: str, coin_a
     ob = await exchange_obj.get_orderbook(coin, limit=MAX_ORDERBOOK_LEVELS)
     if not ob or not ob.get("bids") or not ob.get("asks"):
         return OpenLegResult(exchange="mexc", direction=direction, ok=False, error=f"orderbook not available for {coin}")
-
-    # MEXC contract API sides (best-effort):
-    # 1 = open long, 3 = open short
     mexc_side = 1 if direction == "long" else 3
     book_side = ob["asks"] if direction == "long" else ob["bids"]
     best_price = float(book_side[0][0])
     if best_price <= 0:
         return OpenLegResult(exchange="mexc", direction=direction, ok=False, error="bad orderbook best price")
 
-    candidates: list[float] = []
-    cum = 0.0
-    for lvl in book_side[:MAX_ORDERBOOK_LEVELS]:
-        try:
-            p = float(lvl[0]); s = float(lvl[1])
-        except Exception:
-            continue
-        if p <= 0 or s <= 0:
-            continue
-        cum += s
-        if cum + 1e-12 >= coin_amount:
-            candidates.append(p)
-    if not candidates:
-        return OpenLegResult(
-            exchange="mexc",
-            direction=direction,
-            ok=False,
-            error=f"not enough depth in first {MAX_ORDERBOOK_LEVELS} levels: need {coin_amount}, available {cum}",
-        )
-
-    candidates_str = "[" + ", ".join([_format_number(c) for c in candidates[:MAX_ORDERBOOK_LEVELS]]) + "]"
-    logger.info(f"План MEXC: {direction} qty={_format_number(coin_amount)} | best={_format_number(best_price)} | кандидаты уровней(<=%d)=%s" % (MAX_ORDERBOOK_LEVELS, candidates_str))
-
-    # type code: best-effort "4" as FOK-like, fallback to "1" limit
     mexc_type = int(os.getenv("MEXC_ORDER_TYPE", "4"))
-    open_type = int(os.getenv("MEXC_OPEN_TYPE", "2"))  # 1 isolated, 2 cross (best-effort)
-
-    # externalOid to query order
-    external_oid = f"arb-{int(time.time()*1000)}-{direction}"
+    open_type = int(os.getenv("MEXC_OPEN_TYPE", "2"))
+    logger.info(f"План MEXC: {direction} qty={_format_number(coin_amount)} | best={_format_number(best_price)} | уровни 1..{MAX_ORDERBOOK_LEVELS} (IOC)")
 
     return {
         "exchange": "mexc",
         "direction": direction,
         "exchange_obj": exchange_obj,
         "symbol": symbol,
+        "coin": coin,
+        "coin_amount": coin_amount,
         "mexc_side": mexc_side,
-        "qty": _format_number(coin_amount),  # vol in base qty (best-effort)
-        "candidate_prices_raw": candidates,
         "api_key": api_key,
         "api_secret": api_secret,
         "mexc_type": mexc_type,
         "openType": open_type,
-        "externalOid": external_oid,
+        "externalOid": f"arb-{int(time.time()*1000)}-{direction}",
     }
 
 
@@ -2489,18 +2461,36 @@ async def _mexc_place_leg(*, planned: Dict[str, Any]) -> OpenLegResult:
     api_secret = planned["api_secret"]
     direction = planned["direction"]
     symbol = planned["symbol"]
+    coin = planned["coin"]
+    coin_amount = float(planned["coin_amount"])
     mexc_side = planned["mexc_side"]
     mexc_type = planned["mexc_type"]
     open_type = planned["openType"]
-    qty = planned["qty"]
-    candidates = planned.get("candidate_prices_raw") or []
-    attempts = candidates[:MAX_ORDERBOOK_LEVELS]
-    for idx, px_raw in enumerate(attempts, start=1):
-        px = float(px_raw)
-        px_str = _format_number(px)
-        logger.info(f"MEXC: попытка {idx}/{len(attempts)} | {direction} qty={qty} | лимит={px_str}")
-        # refresh externalOid per attempt to avoid collisions
-        external_oid = f"{planned.get('externalOid','arb')}-{idx}"
+
+    total_filled = 0.0
+    total_notional = 0.0
+    last_order_id: Optional[str] = None
+
+    for level_idx in range(1, MAX_ORDERBOOK_LEVELS + 1):
+        remaining = coin_amount - total_filled
+        if remaining <= 0:
+            break
+        ob = await exchange_obj.get_orderbook(coin, limit=MAX_ORDERBOOK_LEVELS)
+        if not ob or not ob.get("bids") or not ob.get("asks"):
+            break
+        book_side = ob["asks"] if direction == "long" else ob["bids"]
+        if level_idx > len(book_side):
+            break
+        try:
+            price_raw = float(book_side[level_idx - 1][0])
+        except (IndexError, TypeError, ValueError):
+            break
+        px_str = _format_number(price_raw)
+        qty_str = _format_number(remaining)
+        if float(qty_str) <= 0:
+            break
+        external_oid = f"{planned.get('externalOid','arb')}-{level_idx}-{int(time.time()*1000)}"
+        logger.info(f"MEXC: уровень {level_idx}/{MAX_ORDERBOOK_LEVELS} | {direction} qty={qty_str} | лимит={px_str} | осталось={_format_number(remaining)}")
         data = await _mexc_private_request(
             exchange_obj=exchange_obj,
             api_key=api_key,
@@ -2510,7 +2500,7 @@ async def _mexc_place_leg(*, planned: Dict[str, Any]) -> OpenLegResult:
             params={
                 "symbol": symbol,
                 "price": px_str,
-                "vol": qty,
+                "vol": qty_str,
                 "side": str(mexc_side),
                 "type": str(mexc_type),
                 "openType": str(open_type),
@@ -2518,37 +2508,29 @@ async def _mexc_place_leg(*, planned: Dict[str, Any]) -> OpenLegResult:
             },
         )
         if not isinstance(data, dict) or data.get("_error"):
-            error_code = data.get("_error", "")
-            error_body = data.get("_body", "")
-            if "403" in error_code or "Access Denied" in error_body:
-                return OpenLegResult(
-                    exchange="mexc",
-                    direction=direction,
-                    ok=False,
-                    error=f"API ключ не имеет разрешений на размещение ордеров (403 Access Denied). Проверь настройки API ключа на MEXC: разрешения на торговлю должны быть включены, IP-адрес должен быть разрешен (если включен whitelist)",
-                    raw=data
-                )
+            if isinstance(data, dict) and ("403" in str(data.get("_error", "")) or "Access Denied" in str(data.get("_body", ""))):
+                return OpenLegResult(exchange="mexc", direction=direction, ok=False, error="API ключ не имеет разрешений на размещение ордеров (403).", raw=data)
             return OpenLegResult(exchange="mexc", direction=direction, ok=False, error=f"api error: {data}", raw=data)
-        # orderId in data/result
         item = data.get("data") or data.get("result") or data
-        order_id = None
-        if isinstance(item, dict):
-            order_id = item.get("orderId") or item.get("id")
-        if not order_id:
-            # sometimes orderId is plain number/string
-            order_id = data.get("orderId") if isinstance(data, dict) else None
+        order_id = item.get("orderId") or item.get("id") if isinstance(item, dict) else data.get("orderId")
         if not order_id:
             return OpenLegResult(exchange="mexc", direction=direction, ok=False, error=f"no orderId in response: {data}", raw=data)
-        order_id_s = str(order_id)
-        ok_full, deal = await _mexc_wait_full_fill(planned={**planned, "externalOid": external_oid}, order_id=order_id_s)
-        if ok_full:
-            return OpenLegResult(exchange="mexc", direction=direction, ok=True, order_id=order_id_s, raw=data)
-        logger.warning(f"MEXC: не исполнилось полностью на уровне {idx} | исполнено={_format_number(deal)} | требовалось={qty}")
+        last_order_id = str(order_id)
+        ok_full, deal = await _mexc_wait_full_fill(planned={**planned, "qty": qty_str, "externalOid": external_oid}, order_id=last_order_id)
+        total_filled += deal
+        total_notional += deal * price_raw
+        if deal > 0:
+            logger.info(f"MEXC: уровень {level_idx} исполнено={_format_number(deal)} | всего={_format_number(total_filled)}")
+
+    if total_filled >= coin_amount - 1e-9:
+        avg_price = total_notional / total_filled if total_filled > 0 else None
+        return OpenLegResult(
+            exchange="mexc", direction=direction, ok=True,
+            order_id=last_order_id, filled_qty=total_filled, avg_price=avg_price, raw=None,
+        )
     return OpenLegResult(
-        exchange="mexc",
-        direction=direction,
-        ok=False,
-        error=f"не удалось исполнить ордер полностью за {MAX_ORDERBOOK_LEVELS} попыток (уровни 1-{MAX_ORDERBOOK_LEVELS})",
+        exchange="mexc", direction=direction, ok=False,
+        error=f"не набрали объём за {MAX_ORDERBOOK_LEVELS} уровней: исполнено={_format_number(total_filled)}, требовалось={_format_number(coin_amount)}",
     )
 
 
@@ -2841,52 +2823,24 @@ async def _bitget_plan_leg(*, exchange_obj: Any, coin: str, direction: str, coin
     if best_price <= 0:
         return OpenLegResult(exchange="bitget", direction=direction, ok=False, error="bad orderbook best price")
 
-    candidates: list[float] = []
-    cum = 0.0
-    for lvl in book_side[:MAX_ORDERBOOK_LEVELS]:
-        try:
-            p = float(lvl[0]); s = float(lvl[1])
-        except Exception:
-            continue
-        if p <= 0 or s <= 0:
-            continue
-        cum += s
-        if cum + 1e-12 >= coin_amount:
-            candidates.append(p)
-    if not candidates:
-        return OpenLegResult(
-            exchange="bitget",
-            direction=direction,
-            ok=False,
-            error=f"not enough depth in first {MAX_ORDERBOOK_LEVELS} levels: need {coin_amount}, available {cum}",
-        )
-
     f = await _bitget_get_contract_filters(exchange_obj=exchange_obj, symbol=symbol)
     tick_raw = f.get("tickSize")
     step_raw = f.get("stepSize")
     min_qty_raw = f.get("minQty")
     min_notional_raw = f.get("minNotional")
     product_type = f.get("productType") or getattr(exchange_obj, "PRODUCT_TYPE", "umcbl")
-
     tick = float(tick_raw) if tick_raw else 0.0
     step = float(step_raw) if step_raw else 0.0
     min_qty = float(min_qty_raw) if min_qty_raw else 0.0
     min_notional = float(min_notional_raw) if min_notional_raw else 0.0
-
     if step > 0 and not _is_multiple_of_step(coin_amount, step):
         return OpenLegResult(exchange="bitget", direction=direction, ok=False, error=f"qty {coin_amount} not multiple of stepSize {step_raw}")
     if min_qty > 0 and coin_amount < min_qty:
         return OpenLegResult(exchange="bitget", direction=direction, ok=False, error=f"qty {coin_amount} < minQty {min_qty_raw}")
-
-    limit_price = _round_price_for_side(float(candidates[0]), tick, "buy" if direction == "long" else "sell")
-    notional = coin_amount * limit_price
-    if min_notional > 0 and notional < min_notional:
-        return OpenLegResult(exchange="bitget", direction=direction, ok=False, error=f"minNotional {min_notional_raw} > requested ~{_format_number(notional)}")
-
+    if min_notional > 0 and coin_amount * best_price < min_notional:
+        return OpenLegResult(exchange="bitget", direction=direction, ok=False, error=f"minNotional {min_notional_raw} > requested ~{_format_number(coin_amount * best_price)}")
     qty_str = _format_by_step(coin_amount, step_raw)
-    px_str = _format_by_step(limit_price, tick_raw)
-    candidates_str = "[" + ", ".join([_format_number(c) for c in candidates[:MAX_ORDERBOOK_LEVELS]]) + "]"
-    logger.info(f"План Bitget: {direction} qty={qty_str} | best={_format_number(best_price)} | кандидаты уровней(<=%d)=%s" % (MAX_ORDERBOOK_LEVELS, candidates_str))
+    logger.info(f"План Bitget: {direction} qty={qty_str} | best={_format_number(best_price)} | уровни 1..{MAX_ORDERBOOK_LEVELS} (IOC)")
 
     return {
         "exchange": "bitget",
@@ -2896,10 +2850,9 @@ async def _bitget_plan_leg(*, exchange_obj: Any, coin: str, direction: str, coin
         "productType": str(product_type),
         "marginCoin": "USDT",
         "side": side,
+        "coin": coin,
+        "coin_amount": coin_amount,
         "qty": qty_str,
-        "price_str": px_str,
-        "limit_price": float(px_str),
-        "candidate_prices_raw": candidates,
         "api_key": api_key,
         "api_secret": api_secret,
         "api_passphrase": api_pass,
@@ -2976,29 +2929,42 @@ async def _bitget_place_leg(*, planned: Dict[str, Any]) -> OpenLegResult:
     direction = planned["direction"]
     symbol = planned["symbol"]
     product_type = planned["productType"]
-    qty = planned["qty"]
-    candidates = planned.get("candidate_prices_raw") or [float(planned["price_str"])]
-    attempts = candidates[:MAX_ORDERBOOK_LEVELS]
+    coin = planned["coin"]
+    coin_amount = float(planned["coin_amount"])
     tick_raw = planned.get("tickSize")
+    step_raw = planned.get("stepSize")
     tick = float(tick_raw) if tick_raw else 0.0
+    side = planned["side"]
+    bitget_margin_mode = (os.getenv("BITGET_MARGIN_MODE", "isolated") or "").strip().lower()
+    if not bitget_margin_mode or bitget_margin_mode == "cross":
+        bitget_margin_mode = "crossed" if bitget_margin_mode == "cross" else "isolated"
+    if bitget_margin_mode not in ("isolated", "crossed"):
+        bitget_margin_mode = "isolated"
 
-    for idx, px_raw in enumerate(attempts, start=1):
-        px = _round_price_for_side(float(px_raw), tick, "buy" if direction == "long" else "sell")
+    total_filled = 0.0
+    total_notional = 0.0
+    last_order_id: Optional[str] = None
+
+    for level_idx in range(1, MAX_ORDERBOOK_LEVELS + 1):
+        remaining = coin_amount - total_filled
+        if remaining <= 0:
+            break
+        ob = await exchange_obj.get_orderbook(coin, limit=MAX_ORDERBOOK_LEVELS)
+        if not ob or not ob.get("bids") or not ob.get("asks"):
+            break
+        book_side = ob["asks"] if direction == "long" else ob["bids"]
+        if level_idx > len(book_side):
+            break
+        try:
+            price_raw = float(book_side[level_idx - 1][0])
+        except (IndexError, TypeError, ValueError):
+            break
+        px = _round_price_for_side(price_raw, tick, "buy" if direction == "long" else "sell")
         px_str = _format_by_step(px, tick_raw)
-        logger.info(f"Bitget: попытка {idx}/{len(attempts)} | {direction} qty={qty} | лимит={px_str}")
-
-        # Bitget требует указать marginMode в ордере (иначе: "The margin mode cannot be empty").
-        # Это НЕ про плечо; плечо мы не трогаем. Только обязательный флаг режима маржи для контракта.
-        # По умолчанию открываем в isolated (требование пользователя).
-        # Можно переопределить через .env: BITGET_MARGIN_MODE=isolated|crossed
-        bitget_margin_mode = (os.getenv("BITGET_MARGIN_MODE", "isolated") or "").strip().lower()
-        if not bitget_margin_mode:
-            bitget_margin_mode = "isolated"
-        if bitget_margin_mode == "cross":
-            bitget_margin_mode = "crossed"
-        if bitget_margin_mode not in ("isolated", "crossed"):
-            bitget_margin_mode = "isolated"
-
+        qty_str = _format_by_step(remaining, step_raw)
+        if float(qty_str) <= 0:
+            break
+        logger.info(f"Bitget: уровень {level_idx}/{MAX_ORDERBOOK_LEVELS} | {direction} qty={qty_str} | лимит={px_str} | осталось={_format_number(remaining)}")
         base_body = {
             "symbol": symbol,
             "productType": product_type,
@@ -3006,22 +2972,14 @@ async def _bitget_place_leg(*, planned: Dict[str, Any]) -> OpenLegResult:
             "marginMode": bitget_margin_mode,
             "orderType": "limit",
             "price": px_str,
-            "size": qty,
-            "force": "fok",
-            "clientOid": f"arb-{int(time.time()*1000)}-{direction}-{idx}",
+            "size": qty_str,
+            "force": "ioc",
+            "clientOid": f"arb-{int(time.time()*1000)}-{direction}-{level_idx}",
         }
-
-        # Bitget режимы (unilateral/hedge) требуют разные поля. Пробуем несколько схем безопасно
-        # (ошибки типа "side mismatch"/"unilateral ..." возникают ДО создания ордера).
         if direction == "long":
-            side_open = "open_long"
-            side_buy_sell = "buy"
-            pos_side = "long"
+            side_open, side_buy_sell, pos_side = "open_long", "buy", "long"
         else:
-            side_open = "open_short"
-            side_buy_sell = "sell"
-            pos_side = "short"
-
+            side_open, side_buy_sell, pos_side = "open_short", "sell", "short"
         candidate_bodies = [
             {**base_body, "side": side_open},
             {**base_body, "side": side_buy_sell, "tradeSide": "open", "posSide": pos_side},
@@ -3030,68 +2988,43 @@ async def _bitget_place_leg(*, planned: Dict[str, Any]) -> OpenLegResult:
             {**base_body, "side": side_buy_sell, "holdSide": pos_side},
             {**base_body, "side": side_buy_sell, "tradeSide": side_open},
         ]
-
         data: Any = None
-        ok_created = False
         for body in candidate_bodies:
             data = await _bitget_private_request(
-                exchange_obj=exchange_obj,
-                api_key=api_key,
-                api_secret=api_secret,
-                api_passphrase=api_pass,
-                method="POST",
-                path="/api/v2/mix/order/place-order",
-                body=body,
+                exchange_obj=exchange_obj, api_key=api_key, api_secret=api_secret,
+                api_passphrase=api_pass, method="POST", path="/api/v2/mix/order/place-order", body=body,
             )
-
             code, msg = _bitget_extract_code_msg(data)
-
             if code is not None and code != "00000":
                 msg_l = (msg or "").lower()
                 if "sign" in msg_l or "signature" in msg_l or "passphrase" in msg_l:
-                    return OpenLegResult(
-                        exchange="bitget",
-                        direction=direction,
-                        ok=False,
-                        error=f"Bitget auth error (проверь BITGET_API_KEY/BITGET_API_SECRET/BITGET_API_PASSPHRASE): {msg}",
-                        raw=data,
-                    )
-
+                    return OpenLegResult(exchange="bitget", direction=direction, ok=False, error=f"Bitget auth error: {msg}", raw=data)
                 if "side mismatch" in msg_l or "unilateral" in msg_l or str(code) in ("400172", "40774"):
                     continue
-
-                if msg and ("fok" in msg_l or "fill" in msg_l or "immediately" in msg_l):
-                    logger.warning(f"Bitget: FOK отклонён на уровне {idx} | причина={msg}")
-                    break
-
                 return OpenLegResult(exchange="bitget", direction=direction, ok=False, error=f"api error: {data}", raw=data)
-
-            ok_created = True
             break
-
-        if not ok_created:
-            continue
-
-        item = data.get("data") if isinstance(data, dict) else None
-        order_id = None
-        if isinstance(item, dict):
-            order_id = item.get("orderId") or item.get("id")
-        if not order_id and isinstance(data, dict):
-            order_id = data.get("orderId") or data.get("id")
+        if not isinstance(data, dict):
+            break
+        item = data.get("data")
+        order_id = (item.get("orderId") or item.get("id")) if isinstance(item, dict) else data.get("orderId") or data.get("id")
         if not order_id:
             return OpenLegResult(exchange="bitget", direction=direction, ok=False, error=f"no orderId in response: {data}", raw=data)
+        last_order_id = str(order_id)
+        ok_full, filled = await _bitget_wait_full_fill(planned={**planned, "qty": qty_str, "price_str": px_str, "limit_price": px}, order_id=last_order_id)
+        total_filled += filled
+        total_notional += filled * px
+        if filled > 0:
+            logger.info(f"Bitget: уровень {level_idx} исполнено={_format_number(filled)} | всего={_format_number(total_filled)}")
 
-        order_id_s = str(order_id)
-        ok_full, filled = await _bitget_wait_full_fill(planned={**planned, "price_str": px_str, "limit_price": float(px_str)}, order_id=order_id_s)
-        if ok_full:
-            return OpenLegResult(exchange="bitget", direction=direction, ok=True, order_id=order_id_s, raw=data)
-        logger.warning(f"Bitget: не исполнилось полностью на уровне {idx} | исполнено={_format_number(filled)} | требовалось={qty}")
-
+    if total_filled >= coin_amount - 1e-9:
+        avg_price = total_notional / total_filled if total_filled > 0 else None
+        return OpenLegResult(
+            exchange="bitget", direction=direction, ok=True,
+            order_id=last_order_id, filled_qty=total_filled, avg_price=avg_price, raw=None,
+        )
     return OpenLegResult(
-        exchange="bitget",
-        direction=direction,
-        ok=False,
-        error=f"не удалось исполнить ордер полностью за {MAX_ORDERBOOK_LEVELS} попыток (уровни 1-{MAX_ORDERBOOK_LEVELS})",
+        exchange="bitget", direction=direction, ok=False,
+        error=f"не набрали объём за {MAX_ORDERBOOK_LEVELS} уровней: исполнено={_format_number(total_filled)}, требовалось={_format_number(coin_amount)}",
     )
 
 
@@ -3199,51 +3132,23 @@ async def _bingx_plan_leg(*, exchange_obj: Any, coin: str, direction: str, coin_
     if best_price <= 0:
         return OpenLegResult(exchange="bingx", direction=direction, ok=False, error="bad orderbook best price")
 
-    candidates: list[float] = []
-    cum = 0.0
-    for lvl in book_side[:MAX_ORDERBOOK_LEVELS]:
-        try:
-            p = float(lvl[0]); s = float(lvl[1])
-        except Exception:
-            continue
-        if p <= 0 or s <= 0:
-            continue
-        cum += s
-        if cum + 1e-12 >= coin_amount:
-            candidates.append(p)
-    if not candidates:
-        return OpenLegResult(
-            exchange="bingx",
-            direction=direction,
-            ok=False,
-            error=f"not enough depth in first {MAX_ORDERBOOK_LEVELS} levels: need {coin_amount}, available {cum}",
-        )
-
     f = await _bingx_get_contract_filters(exchange_obj=exchange_obj, symbol=symbol)
     tick_raw = f.get("tickSize")
     step_raw = f.get("stepSize")
     min_qty_raw = f.get("minQty")
     min_notional_raw = f.get("minNotional")
-
     tick = float(tick_raw) if tick_raw else 0.0
     step = float(step_raw) if step_raw else 0.0
     min_qty = float(min_qty_raw) if min_qty_raw else 0.0
     min_notional = float(min_notional_raw) if min_notional_raw else 0.0
-
     if step > 0 and not _is_multiple_of_step(coin_amount, step):
         return OpenLegResult(exchange="bingx", direction=direction, ok=False, error=f"qty {coin_amount} not multiple of stepSize {step_raw}")
     if min_qty > 0 and coin_amount < min_qty:
         return OpenLegResult(exchange="bingx", direction=direction, ok=False, error=f"qty {coin_amount} < minQty {min_qty_raw}")
-
-    limit_price = _round_price_for_side(float(candidates[0]), tick, "buy" if direction == "long" else "sell")
-    notional = coin_amount * limit_price
-    if min_notional > 0 and notional < min_notional:
-        return OpenLegResult(exchange="bingx", direction=direction, ok=False, error=f"minNotional {min_notional_raw} > requested ~{_format_number(notional)}")
-
+    if min_notional > 0 and coin_amount * best_price < min_notional:
+        return OpenLegResult(exchange="bingx", direction=direction, ok=False, error=f"minNotional {min_notional_raw} > requested ~{_format_number(coin_amount * best_price)}")
     qty_str = _format_by_step(coin_amount, step_raw)
-    px_str = _format_by_step(limit_price, tick_raw)
-    candidates_str = "[" + ", ".join([_format_number(c) for c in candidates[:MAX_ORDERBOOK_LEVELS]]) + "]"
-    logger.info(f"План BingX: {direction} qty={qty_str} | best={_format_number(best_price)} | кандидаты уровней(<=%d)=%s" % (MAX_ORDERBOOK_LEVELS, candidates_str))
+    logger.info(f"План BingX: {direction} qty={qty_str} | best={_format_number(best_price)} | уровни 1..{MAX_ORDERBOOK_LEVELS} (IOC)")
 
     return {
         "exchange": "bingx",
@@ -3252,10 +3157,9 @@ async def _bingx_plan_leg(*, exchange_obj: Any, coin: str, direction: str, coin_
         "symbol": symbol,
         "side": side,
         "positionSide": position_side,
+        "coin": coin,
+        "coin_amount": coin_amount,
         "qty": qty_str,
-        "price_str": px_str,
-        "limit_price": float(px_str),
-        "candidate_prices_raw": candidates,
         "api_key": api_key,
         "api_secret": api_secret,
         "tickSize": tick_raw,
@@ -3322,28 +3226,46 @@ async def _bingx_place_leg(*, planned: Dict[str, Any]) -> OpenLegResult:
     symbol = planned["symbol"]
     side = planned["side"]
     position_side = planned.get("positionSide")
-    qty = planned["qty"]
-    candidates = planned.get("candidate_prices_raw") or [float(planned["price_str"])]
-    attempts = candidates[:MAX_ORDERBOOK_LEVELS]
+    coin = planned["coin"]
+    coin_amount = float(planned["coin_amount"])
     tick_raw = planned.get("tickSize")
+    step_raw = planned.get("stepSize")
     tick = float(tick_raw) if tick_raw else 0.0
 
-    for idx, px_raw in enumerate(attempts, start=1):
-        px = _round_price_for_side(float(px_raw), tick, "buy" if direction == "long" else "sell")
-        px_str = _format_by_step(px, tick_raw)
-        logger.info(f"BingX: попытка {idx}/{len(attempts)} | {direction} qty={qty} | лимит={px_str}")
+    total_filled = 0.0
+    total_notional = 0.0
+    last_order_id: Optional[str] = None
 
+    for level_idx in range(1, MAX_ORDERBOOK_LEVELS + 1):
+        remaining = coin_amount - total_filled
+        if remaining <= 0:
+            break
+        ob = await exchange_obj.get_orderbook(coin, limit=MAX_ORDERBOOK_LEVELS)
+        if not ob or not ob.get("bids") or not ob.get("asks"):
+            break
+        book_side = ob["asks"] if direction == "long" else ob["bids"]
+        if level_idx > len(book_side):
+            break
+        try:
+            price_raw = float(book_side[level_idx - 1][0])
+        except (IndexError, TypeError, ValueError):
+            break
+        px = _round_price_for_side(price_raw, tick, "buy" if direction == "long" else "sell")
+        px_str = _format_by_step(px, tick_raw)
+        qty_str = _format_by_step(remaining, step_raw)
+        if float(qty_str) <= 0:
+            break
+        logger.info(f"BingX: уровень {level_idx}/{MAX_ORDERBOOK_LEVELS} | {direction} qty={qty_str} | лимит={px_str} | осталось={_format_number(remaining)}")
         params = {
             "symbol": symbol,
             "side": side,
             "type": "LIMIT",
             "price": px_str,
-            "quantity": qty,
-            "timeInForce": "FOK",
+            "quantity": qty_str,
+            "timeInForce": "IOC",
         }
         if position_side:
             params["positionSide"] = position_side
-
         data = await _bingx_private_request(
             exchange_obj=exchange_obj,
             api_key=api_key,
@@ -3354,67 +3276,33 @@ async def _bingx_place_leg(*, planned: Dict[str, Any]) -> OpenLegResult:
         )
         if not isinstance(data, dict) or data.get("_error"):
             return OpenLegResult(exchange="bingx", direction=direction, ok=False, error=f"api error: {data}", raw=data)
-        code = str(data.get("code")) if data.get("code") is not None else None
-        msg = str(data.get("msg") or "")
-        if code is not None and code != "0":
-            # FOK rejection -> try next level
-            if "fok" in msg.lower() or "fill" in msg.lower() or "immediately" in msg.lower():
-                logger.warning(f"BingX: FOK отклонён на уровне {idx} | причина={msg}")
-                continue
+        if str(data.get("code")) not in (None, "0"):
             return OpenLegResult(exchange="bingx", direction=direction, ok=False, error=f"api error: {data}", raw=data)
-
         item = data.get("data")
-        # BingX часто возвращает вложенность: data.order.orderId / data.order.orderID
-        order_container = None
-        if isinstance(item, dict) and isinstance(item.get("order"), dict):
-            order_container = item.get("order")
-        elif isinstance(item, dict):
-            order_container = item
-        else:
-            order_container = None
-
+        order_container = item.get("order") if isinstance(item, dict) and isinstance(item.get("order"), dict) else item if isinstance(item, dict) else None
         order_id = None
         if isinstance(order_container, dict):
-            order_id = (
-                order_container.get("orderId")
-                or order_container.get("orderID")
-                or order_container.get("id")
-                or order_container.get("order_id")
-            )
+            order_id = order_container.get("orderId") or order_container.get("orderID") or order_container.get("id") or order_container.get("order_id")
         if not order_id:
-            order_id = data.get("orderId") if isinstance(data, dict) else None
+            order_id = data.get("orderId")
         if not order_id:
             return OpenLegResult(exchange="bingx", direction=direction, ok=False, error=f"no orderId in response: {data}", raw=data)
+        last_order_id = str(order_id)
+        ok_full, filled = await _bingx_wait_full_fill(planned={**planned, "qty": qty_str, "price_str": px_str, "limit_price": px}, order_id=last_order_id)
+        total_filled += filled
+        total_notional += filled * px
+        if filled > 0:
+            logger.info(f"BingX: уровень {level_idx} исполнено={_format_number(filled)} | всего={_format_number(total_filled)}")
 
-        order_id_s = str(order_id)
-
-        # Если BingX вернул сразу статус CANCELLED + executedQty=0 — это типичный результат FOK (не исполнился мгновенно).
-        # В этом случае пробуем следующий уровень (до 3).
-        status0 = ""
-        exec0 = 0.0
-        if isinstance(order_container, dict):
-            status0 = str(order_container.get("status") or "")
-            exec_raw0 = order_container.get("executedQty") or order_container.get("filledQty") or order_container.get("dealQty")
-            try:
-                exec0 = float(exec_raw0) if exec_raw0 is not None else 0.0
-            except Exception:
-                exec0 = 0.0
-        if status0.upper() in ("CANCELLED", "CANCELED") and exec0 <= 0:
-            logger.warning(
-                f"BingX: ордер создан (orderId={order_id_s}), но FOK отменён на уровне {idx} | status={status0} | исполнено={_format_number(exec0)}"
-            )
-            continue
-
-        ok_full, filled = await _bingx_wait_full_fill(planned={**planned, "price_str": px_str, "limit_price": float(px_str)}, order_id=order_id_s)
-        if ok_full:
-            return OpenLegResult(exchange="bingx", direction=direction, ok=True, order_id=order_id_s, raw=data)
-        logger.warning(f"BingX: не исполнилось полностью на уровне {idx} | исполнено={_format_number(filled)} | требовалось={qty}")
-
+    if total_filled >= coin_amount - 1e-9:
+        avg_price = total_notional / total_filled if total_filled > 0 else None
+        return OpenLegResult(
+            exchange="bingx", direction=direction, ok=True,
+            order_id=last_order_id, filled_qty=total_filled, avg_price=avg_price, raw=None,
+        )
     return OpenLegResult(
-        exchange="bingx",
-        direction=direction,
-        ok=False,
-        error=f"не удалось исполнить ордер полностью за {MAX_ORDERBOOK_LEVELS} попыток (уровни 1-{MAX_ORDERBOOK_LEVELS})",
+        exchange="bingx", direction=direction, ok=False,
+        error=f"не набрали объём за {MAX_ORDERBOOK_LEVELS} уровней: исполнено={_format_number(total_filled)}, требовалось={_format_number(coin_amount)}",
     )
 
 
@@ -3713,74 +3601,39 @@ async def _bybit_plan_leg(*, exchange_obj: Any, coin: str, direction: str, coin_
         return OpenLegResult(exchange="bybit", direction=direction, ok=False, error="missing BYBIT_API_KEY/BYBIT_API_SECRET in env")
 
     symbol = exchange_obj._normalize_symbol(coin)
+    side = "Buy" if direction == "long" else "Sell"
 
-    ob_levels = min(3, int(os.getenv("ENTRY_OB_LEVELS", "3")))
-    ob = await exchange_obj.get_orderbook(coin, limit=ob_levels)
+    ob = await exchange_obj.get_orderbook(coin, limit=MAX_ORDERBOOK_LEVELS)
     if not ob or not ob.get("bids") or not ob.get("asks"):
         return OpenLegResult(exchange="bybit", direction=direction, ok=False, error=f"orderbook not available for {coin}")
-
-    side = "Buy" if direction == "long" else "Sell"
     book_side = ob["asks"] if side == "Buy" else ob["bids"]
     best_price = float(book_side[0][0])
     if best_price <= 0:
         return OpenLegResult(exchange="bybit", direction=direction, ok=False, error="bad orderbook best price")
-
-    # Кандидаты цен: максимум 3 уровня. Пытаемся 1й, потом 2й, потом 3й.
-    candidates: list[float] = []
-    cum = 0.0
-    for lvl in book_side[:ob_levels]:
-        try:
-            p = float(lvl[0])
-            s = float(lvl[1])
-        except Exception:
-            continue
-        if p <= 0 or s <= 0:
-            continue
-        cum += s
-        if cum + 1e-12 >= coin_amount:
-            candidates.append(p)
-    if not candidates:
-        return OpenLegResult(exchange="bybit", direction=direction, ok=False, error=f"not enough depth in first {ob_levels} levels: need {coin_amount}, available {cum}")
-    limit_price_raw = float(candidates[0])
 
     f = await _bybit_fetch_instrument_filters(exchange_obj=exchange_obj, symbol=symbol)
     qty_step_raw = f.get("qtyStep")
     min_qty_raw = f.get("minOrderQty")
     min_amt_raw = f.get("minOrderAmt")
     tick_raw = f.get("tickSize")
-
     qty_step = float(qty_step_raw) if qty_step_raw else 0.0
     min_qty = float(min_qty_raw) if min_qty_raw else 0.0
     min_amt = float(min_amt_raw) if min_amt_raw else 0.0
     tick = float(tick_raw) if tick_raw else 0.0
 
-    # Проверка шагов/минималок количества — не подгоняем, а валидируем ввод
     if qty_step > 0 and not _is_multiple_of_step(coin_amount, qty_step):
         return OpenLegResult(exchange="bybit", direction=direction, ok=False, error=f"qty {coin_amount} not multiple of qtyStep {qty_step_raw}")
     if min_qty > 0 and coin_amount < min_qty:
         return OpenLegResult(exchange="bybit", direction=direction, ok=False, error=f"qty {coin_amount} < minOrderQty {min_qty_raw}")
-
-    # Лимитная цена по лучшему уровню стакана + округление по tick
-    limit_price = _round_price_for_side(limit_price_raw, tick, "buy" if side == "Buy" else "sell")
-    notional = coin_amount * limit_price
-
-    # Минимальная сумма ордера (полезно, чтобы не ловить 110094)
+    notional = coin_amount * best_price
     if min_amt > 0 and notional < min_amt:
         return OpenLegResult(
-            exchange="bybit",
-            direction=direction,
-            ok=False,
+            exchange="bybit", direction=direction, ok=False,
             error=f"Order does not meet minimum order value {min_amt:.3f}USDT (requested ~{notional:.3f}USDT)",
         )
 
-    # Примечание: мы уже выбрали price level, на котором хватает cum_sz >= coin_amount,
-    # поэтому отдельная проверка top-of-book не нужна.
-
     qty_str = _format_by_step(coin_amount, qty_step_raw)
-    price_str = _format_by_step(limit_price, tick_raw)
-
-    candidates_str = "[" + ", ".join([_format_number(c) for c in candidates]) + "]"
-    logger.info(f"План Bybit: {direction} qty={qty_str} | best={_format_number(best_price)} | кандидаты уровней(<=%d)=%s" % (MAX_ORDERBOOK_LEVELS, candidates_str))
+    logger.info(f"План Bybit: {direction} qty={qty_str} | best={_format_number(best_price)} | уровни 1..{MAX_ORDERBOOK_LEVELS} (IOC)")
 
     return {
         "exchange": "bybit",
@@ -3788,10 +3641,11 @@ async def _bybit_plan_leg(*, exchange_obj: Any, coin: str, direction: str, coin_
         "exchange_obj": exchange_obj,
         "symbol": symbol,
         "side": side,
+        "coin": coin,
+        "coin_amount": coin_amount,
         "qty": qty_str,
-        "limit_price": float(price_str),
-        "price_str": price_str,
-        "candidate_prices_raw": candidates,
+        "qty_step_raw": qty_step_raw,
+        "tick_raw": tick_raw,
         "api_key": api_key,
         "api_secret": api_secret,
     }
@@ -3803,25 +3657,44 @@ async def _bybit_place_leg(*, planned: Dict[str, Any]) -> OpenLegResult:
     api_secret = planned["api_secret"]
     direction = planned["direction"]
     side = planned["side"]
-    tick_raw = (await _bybit_fetch_instrument_filters(exchange_obj=exchange_obj, symbol=planned["symbol"])).get("tickSize")
+    coin = planned["coin"]
+    coin_amount = float(planned["coin_amount"])
+    tick_raw = planned.get("tick_raw")
     tick = float(tick_raw) if tick_raw else 0.0
+    qty_step_raw = planned.get("qty_step_raw")
 
-    candidates = planned.get("candidate_prices_raw") or [float(planned["price_str"])]
-    # максимум N попыток: уровни 1..MAX_ORDERBOOK_LEVELS
-    attempts = candidates[:MAX_ORDERBOOK_LEVELS]
-    for idx, px_raw in enumerate(attempts, start=1):
-        px = _round_price_for_side(float(px_raw), tick, "buy" if side == "Buy" else "sell")
+    total_filled = 0.0
+    total_notional = 0.0
+    last_order_id: Optional[str] = None
+
+    for level_idx in range(1, MAX_ORDERBOOK_LEVELS + 1):
+        remaining = coin_amount - total_filled
+        if remaining <= 0:
+            break
+        ob = await exchange_obj.get_orderbook(coin, limit=MAX_ORDERBOOK_LEVELS)
+        if not ob or not ob.get("bids") or not ob.get("asks"):
+            break
+        book_side = ob["asks"] if side == "Buy" else ob["bids"]
+        if level_idx > len(book_side):
+            break
+        try:
+            price_raw = float(book_side[level_idx - 1][0])
+        except (IndexError, TypeError, ValueError):
+            break
+        px = _round_price_for_side(price_raw, tick, "buy" if side == "Buy" else "sell")
         px_str = _format_by_step(px, tick_raw)
-        logger.info(f"Bybit: попытка {idx}/{len(attempts)} | {direction} qty={planned['qty']} | лимит={px_str}")
+        qty_str = _format_by_step(remaining, qty_step_raw)
+        if float(qty_str) <= 0:
+            break
+        logger.info(f"Bybit: уровень {level_idx}/{MAX_ORDERBOOK_LEVELS} | {direction} qty={qty_str} | лимит={px_str} | осталось={_format_number(remaining)}")
         body = {
             "category": "linear",
             "symbol": planned["symbol"],
             "side": side,
             "orderType": "Limit",
-            "qty": planned["qty"],
+            "qty": qty_str,
             "price": px_str,
-            # строго 100% или отмена
-            "timeInForce": "FOK",
+            "timeInForce": "IOC",
         }
         data = await _bybit_private_post(exchange_obj=exchange_obj, api_key=api_key, api_secret=api_secret, path="/v5/order/create", body=body)
         if not isinstance(data, dict) or data.get("retCode") != 0:
@@ -3829,18 +3702,25 @@ async def _bybit_place_leg(*, planned: Dict[str, Any]) -> OpenLegResult:
         order_id = (data.get("result") or {}).get("orderId") if isinstance(data.get("result"), dict) else None
         if not order_id:
             return OpenLegResult(exchange="bybit", direction=direction, ok=False, error=f"no orderId in response: {data}", raw=data)
+        last_order_id = str(order_id)
+        ok_full, filled_qty = await _bybit_wait_full_fill(
+            planned={**planned, "qty": qty_str, "price_str": px_str, "limit_price": px},
+            order_id=last_order_id,
+        )
+        total_filled += filled_qty
+        total_notional += filled_qty * px
+        if filled_qty > 0:
+            logger.info(f"Bybit: уровень {level_idx} исполнено={_format_number(filled_qty)} | всего={_format_number(total_filled)}")
 
-        ok_full, filled_qty = await _bybit_wait_full_fill(planned={**planned, "price_str": px_str, "limit_price": float(px_str)}, order_id=str(order_id))
-        if ok_full:
-            return OpenLegResult(exchange="bybit", direction=direction, ok=True, order_id=str(order_id), raw=data)
-        # если не исполнилось, пробуем следующий уровень
-        logger.warning(f"Bybit: не исполнилось полностью на уровне {idx} | исполнено={_format_number(filled_qty)} | требовалось={_format_number(float(planned['qty']))}")
-
+    if total_filled >= coin_amount - 1e-9:
+        avg_price = total_notional / total_filled if total_filled > 0 else None
+        return OpenLegResult(
+            exchange="bybit", direction=direction, ok=True,
+            order_id=last_order_id, filled_qty=total_filled, avg_price=avg_price, raw=None,
+        )
     return OpenLegResult(
-        exchange="bybit",
-        direction=direction,
-        ok=False,
-        error=f"не удалось исполнить ордер полностью за {MAX_ORDERBOOK_LEVELS} попыток (уровни 1-{MAX_ORDERBOOK_LEVELS})",
+        exchange="bybit", direction=direction, ok=False,
+        error=f"не набрали объём за {MAX_ORDERBOOK_LEVELS} уровней: исполнено={_format_number(total_filled)}, требовалось={_format_number(coin_amount)}",
     )
 
 
@@ -3917,11 +3797,9 @@ async def _gate_plan_leg(*, exchange_obj: Any, coin: str, direction: str, coin_a
         return OpenLegResult(exchange="gate", direction=direction, ok=False, error="missing GATEIO_API_KEY/GATEIO_API_SECRET in env")
 
     contract = exchange_obj._normalize_symbol(coin)
-    ob_levels = min(3, int(os.getenv("ENTRY_OB_LEVELS", "3")))
-    ob = await exchange_obj.get_orderbook(coin, limit=ob_levels)
+    ob = await exchange_obj.get_orderbook(coin, limit=MAX_ORDERBOOK_LEVELS)
     if not ob or not ob.get("bids") or not ob.get("asks"):
         return OpenLegResult(exchange="gate", direction=direction, ok=False, error=f"orderbook not available for {coin}")
-
     best_bid = float(ob["bids"][0][0])
     best_ask = float(ob["asks"][0][0])
     if best_bid <= 0 or best_ask <= 0:
@@ -3930,7 +3808,6 @@ async def _gate_plan_leg(*, exchange_obj: Any, coin: str, direction: str, coin_a
     cinfo = await _gate_fetch_contract_info(exchange_obj=exchange_obj, contract=contract)
     if not isinstance(cinfo, dict):
         return OpenLegResult(exchange="gate", direction=direction, ok=False, error=f"contract info not available for {contract}")
-
     qmul_raw = cinfo.get("quanto_multiplier") or cinfo.get("contract_size") or cinfo.get("multiplier")
     try:
         qmul = float(qmul_raw)
@@ -3938,11 +3815,8 @@ async def _gate_plan_leg(*, exchange_obj: Any, coin: str, direction: str, coin_a
         qmul = None
     if qmul is None or qmul <= 0:
         return OpenLegResult(exchange="gate", direction=direction, ok=False, error=f"bad quanto_multiplier for {contract}: {qmul_raw}")
-
     min_raw = cinfo.get("order_size_min")
     min_size = int(float(min_raw)) if min_raw is not None else None
-
-    # coin_amount -> contracts должен быть целым (не подгоняем)
     contracts_exact = coin_amount / qmul
     contracts_i = int(round(contracts_exact))
     if abs(contracts_exact - contracts_i) > 1e-9:
@@ -3953,43 +3827,19 @@ async def _gate_plan_leg(*, exchange_obj: Any, coin: str, direction: str, coin_a
         return OpenLegResult(exchange="gate", direction=direction, ok=False, error=f"contracts {contracts_i} < min {min_size}")
 
     side = "buy" if direction == "long" else "sell"
-    book_side = ob["asks"] if side == "buy" else ob["bids"]
-    # Кандидаты цен: максимум 3 уровня. Пытаемся 1й, потом 2й, потом 3й.
-    candidates: list[float] = []
-    cum = 0.0
-    for lvl in book_side[:ob_levels]:
-        try:
-            p = float(lvl[0])
-            s = float(lvl[1])
-        except Exception:
-            continue
-        if p <= 0 or s <= 0:
-            continue
-        cum += s
-        if cum + 1e-12 >= float(contracts_i):
-            candidates.append(p)
-    if not candidates:
-        return OpenLegResult(exchange="gate", direction=direction, ok=False, error=f"not enough depth in first {ob_levels} levels: need {contracts_i} contracts, available {cum}")
-    limit_price_raw = float(candidates[0])
-
     price_step = _gate_price_step_from_contract_info(cinfo) or 0.0
-    limit_price = _round_price_for_side(limit_price_raw, price_step, side)
-
-    candidates_str = "[" + ", ".join([_format_number(c) for c in candidates]) + "]"
-    logger.info(f"План Gate: {direction} contracts={contracts_i} | best_bid={_format_number(best_bid)} best_ask={_format_number(best_ask)} | кандидаты уровней(<=%d)=%s" % (MAX_ORDERBOOK_LEVELS, candidates_str))
-
-    size_signed = contracts_i if direction == "long" else -contracts_i
-    price_str = _format_by_step(limit_price, str(price_step) if price_step > 0 else None)
+    logger.info(f"План Gate: {direction} contracts={contracts_i} | best_bid={_format_number(best_bid)} best_ask={_format_number(best_ask)} | уровни 1..{MAX_ORDERBOOK_LEVELS} (IOC)")
 
     return {
         "exchange": "gate",
         "direction": direction,
         "exchange_obj": exchange_obj,
         "contract": contract,
-        "size": size_signed,
-        "limit_price": float(price_str),
-        "price_str": price_str,
-        "candidate_prices_raw": candidates,
+        "coin": coin,
+        "coin_amount": coin_amount,
+        "contracts_i": contracts_i,
+        "qmul": qmul,
+        "price_step": price_step,
         "api_key": api_key,
         "api_secret": api_secret,
     }
@@ -4000,38 +3850,64 @@ async def _gate_place_leg(*, planned: Dict[str, Any]) -> OpenLegResult:
     api_key = planned["api_key"]
     api_secret = planned["api_secret"]
     direction = planned["direction"]
-    candidates = planned.get("candidate_prices_raw") or [float(planned["price_str"])]
-    attempts = candidates[:MAX_ORDERBOOK_LEVELS]
-    for idx, px_raw in enumerate(attempts, start=1):
-        px = float(px_raw)
-        px_str = _format_by_step(px, None)
-        logger.info(f"Gate: попытка {idx}/{len(attempts)} | {direction} size={planned['size']} | лимит={px_str}")
+    coin = planned["coin"]
+    contracts_i = int(planned["contracts_i"])
+    qmul = float(planned["qmul"])
+    coin_amount = float(planned["coin_amount"])
+    price_step = float(planned.get("price_step") or 0.0)
+    side = "buy" if direction == "long" else "sell"
+    sign = 1 if direction == "long" else -1
+
+    total_filled_base = 0.0
+    total_notional = 0.0
+    remaining_contracts = contracts_i
+    last_order_id: Optional[str] = None
+
+    for level_idx in range(1, MAX_ORDERBOOK_LEVELS + 1):
+        if remaining_contracts <= 0:
+            break
+        ob = await exchange_obj.get_orderbook(coin, limit=MAX_ORDERBOOK_LEVELS)
+        if not ob or not ob.get("bids") or not ob.get("asks"):
+            break
+        book_side = ob["asks"] if side == "buy" else ob["bids"]
+        if level_idx > len(book_side):
+            break
+        try:
+            price_raw = float(book_side[level_idx - 1][0])
+        except (IndexError, TypeError, ValueError):
+            break
+        px = _round_price_for_side(price_raw, price_step, side)
+        px_str = _format_by_step(px, str(price_step) if price_step > 0 else None)
+        size_signed = sign * remaining_contracts
+        logger.info(f"Gate: уровень {level_idx}/{MAX_ORDERBOOK_LEVELS} | {direction} size={size_signed} | лимит={px_str} | осталось_контрактов={remaining_contracts}")
         body = {
             "contract": planned["contract"],
-            "size": planned["size"],
+            "size": size_signed,
             "price": px_str,
-            # Требование: строго 100% исполнение или отмена
-            "tif": "fok",
+            "tif": "ioc",
         }
         data = await _gate_private_post(exchange_obj=exchange_obj, api_key=api_key, api_secret=api_secret, path="/api/v4/futures/usdt/orders", body=body)
-        # Gate может вернуть dict с label/message при ошибке — не считаем это успехом
         if not (isinstance(data, dict) and data.get("id") is not None and ("label" not in data) and ("message" not in data)):
             return OpenLegResult(exchange="gate", direction=direction, ok=False, error=f"api error: {data}", raw=data)
         order_id = str(data.get("id"))
-        ok_full, filled_base = await _gate_wait_full_fill(planned={**planned, "price_str": px_str, "limit_price": float(px_str)}, order_id=order_id)
-        if ok_full:
-            return OpenLegResult(exchange="gate", direction=direction, ok=True, order_id=order_id, raw=data)
+        last_order_id = order_id
+        ok_full, filled_base = await _gate_wait_full_fill(planned={**planned, "size": size_signed, "price_str": px_str, "limit_price": px}, order_id=order_id)
+        filled_contracts = int(filled_base / qmul) if qmul > 0 else 0
+        remaining_contracts -= filled_contracts
+        total_filled_base += filled_base
+        total_notional += filled_base * px
         if filled_base > 0:
-            # partial fill — не продолжаем, чтобы не добирать остаток по худшей цене без явного разрешения
-            logger.warning(f"Gate: частичное исполнение, дальнейшие попытки остановлены | исполнено~{_format_number(filled_base)} base")
-            return OpenLegResult(exchange="gate", direction=direction, ok=False, order_id=order_id, error="частичное исполнение (не 100%)", raw=data)
-        logger.warning("Gate: не исполнилось полностью на уровне %s (0 исполнено) — пробуем следующий", idx)
+            logger.info(f"Gate: уровень {level_idx} исполнено={_format_number(filled_base)} base | всего base={_format_number(total_filled_base)}")
 
+    if total_filled_base >= coin_amount - 1e-9:
+        avg_price = total_notional / total_filled_base if total_filled_base > 0 else None
+        return OpenLegResult(
+            exchange="gate", direction=direction, ok=True,
+            order_id=last_order_id, filled_qty=total_filled_base, avg_price=avg_price, raw=None,
+        )
     return OpenLegResult(
-        exchange="gate",
-        direction=direction,
-        ok=False,
-        error=f"не удалось исполнить ордер полностью за {MAX_ORDERBOOK_LEVELS} попыток (уровни 1-{MAX_ORDERBOOK_LEVELS})",
+        exchange="gate", direction=direction, ok=False,
+        error=f"не набрали объём за {MAX_ORDERBOOK_LEVELS} уровней: исполнено={_format_number(total_filled_base)}, требовалось={_format_number(coin_amount)}",
     )
 
 

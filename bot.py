@@ -983,13 +983,14 @@ async def main():
                             return
                         
                         # Автоматическое открытие позиций (лонг+шорт) по API, затем мониторинг как обычно
-                        opened_ok = await open_long_short_positions(
+                        open_result = await open_long_short_positions(
                             bot=bot,
                             coin=monitoring_data["coin"],
                             long_exchange=monitoring_data["long_exchange"],
                             short_exchange=monitoring_data["short_exchange"],
                             coin_amount=monitoring_data["coin_amount"],
                         )
+                        opened_ok = open_result[0] if isinstance(open_result, (tuple, list)) else bool(open_result)
                         if opened_ok:
                             should_monitor = True
                             # После успешного открытия позиций мониторинг запускается с указанным порогом закрытия

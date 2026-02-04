@@ -712,13 +712,7 @@ async def main():
             else:
                 logger.info("Порог закрытия не указан, мониторинг без порога закрытия")
 
-            # Получаем текущие цены перед открытием позиций для расчета PNL
-            long_data_before = await bot.get_futures_data(long_exchange, coin, need_funding=False)
-            short_data_before = await bot.get_futures_data(short_exchange, coin, need_funding=False)
-            ask_long_open = long_data_before.get("ask") if long_data_before else None
-            bid_short_open = short_data_before.get("bid") if short_data_before else None
-            
-            opened_ok = await open_long_short_positions(
+            opened_ok, long_px_actual, short_px_actual = await open_long_short_positions(
                 bot=bot,
                 coin=coin,
                 long_exchange=long_exchange,
@@ -760,6 +754,9 @@ async def main():
                 "short_exchange": short_exchange,
                 "coin_amount": coin_amount,
             }
+            # Фактические цены исполнения (из результата открытия) — для единых цен в логе мониторинга
+            ask_long_open = long_px_actual if long_px_actual is not None else None
+            bid_short_open = short_px_actual if short_px_actual is not None else None
             try:
                 await _monitor_until_close(
                     bot=bot,
