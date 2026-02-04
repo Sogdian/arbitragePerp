@@ -626,24 +626,39 @@ async def _monitor_until_close(
                         fee_s_open = fee_short if fee_short is not None else 0.0
                         fee_l_close = fee_long_close if fee_long_close is not None else 0.0
                         fee_s_close = fee_short_close if fee_short_close is not None else 0.0
-                        income_l = None
-                        if bid_long_close is not None and frozen_ask_long_open is not None:
-                            income_l = (bid_long_close - frozen_ask_long_open) * coin_amount - fee_l_open - fee_l_close
-                        income_s = None
-                        if ask_short_close is not None and frozen_bid_short_open is not None:
-                            income_s = (frozen_bid_short_open - ask_short_close) * coin_amount - fee_s_open - fee_s_close
-                        income_l_str = format_number(income_l) if income_l is not None else "N/A"
-                        income_s_str = format_number(income_s) if income_s is not None else "N/A"
-                        logger.info(f"L доход: {income_l_str} | S доход: {income_s_str}")
                         fee_l_close_str = format_number(fee_long_close) if fee_long_close is not None else "N/A"
                         fee_s_close_str = format_number(fee_short_close) if fee_short_close is not None else "N/A"
                         fee_long_total = fee_l_open + fee_l_close
                         fee_short_total = fee_s_open + fee_s_close
                         fee_total_str = format_number(fee_long_total + fee_short_total)
+                        fund_l_usdt = final_funding_long_usdt if final_funding_long_usdt is not None else 0.0
+                        fund_s_usdt = final_funding_short_usdt if final_funding_short_usdt is not None else 0.0
+                        # 1) Комиссии
                         logger.info(
                             f"L комиссия закр: {fee_l_close_str} | S комиссия закр: {fee_s_close_str} | "
                             f"L комиссия общая: {format_number(fee_long_total)} | S комиссия общая: {format_number(fee_short_total)} | Итоговая комиссия: {fee_total_str}"
                         )
+                        # 2) Фандинг L / S
+                        if final_funding_long_usdt is not None and final_funding_short_usdt is not None:
+                            fund_l_str = format_number(final_funding_long_usdt)
+                            fund_s_str = format_number(final_funding_short_usdt)
+                            logger.info(f"Фанд L: {fund_l_str} | S: {fund_s_str}")
+                            received = max(0.0, final_funding_long_usdt) + max(0.0, final_funding_short_usdt)
+                            paid = abs(min(0.0, final_funding_long_usdt)) + abs(min(0.0, final_funding_short_usdt))
+                            logger.info(f"Фандинг получено: {format_number(received)} USDT | уплачено: {format_number(paid)} USDT")
+                        else:
+                            logger.info("Фанд L: N/A | S: N/A")
+                        # 3) L/S доход (включая фандинг; при N/A фандинг = 0)
+                        income_l = None
+                        if bid_long_close is not None and frozen_ask_long_open is not None:
+                            income_l = (bid_long_close - frozen_ask_long_open) * coin_amount - fee_l_open - fee_l_close + fund_l_usdt
+                        income_s = None
+                        if ask_short_close is not None and frozen_bid_short_open is not None:
+                            income_s = (frozen_bid_short_open - ask_short_close) * coin_amount - fee_s_open - fee_s_close + fund_s_usdt
+                        income_l_str = f"{income_l:.8f}" if income_l is not None else "N/A"
+                        income_s_str = f"{income_s:.8f}" if income_s is not None else "N/A"
+                        logger.info(f"L доход: {income_l_str} | S доход: {income_s_str}")
+                        # 4) Финальный PNL
                         final_pnl = _calculate_pnl_usdt(
                             coin_amount=coin_amount,
                             ask_long_open=frozen_ask_long_open,
@@ -656,15 +671,6 @@ async def _monitor_until_close(
                         )
                         if final_pnl is not None:
                             logger.info(f"💲 Финальный PNL: {format_number(final_pnl)} USDT")
-                        if final_funding_long_usdt is not None and final_funding_short_usdt is not None:
-                            fund_l_str = format_number(final_funding_long_usdt)
-                            fund_s_str = format_number(final_funding_short_usdt)
-                            logger.info(f"Фанд L: {fund_l_str} | S: {fund_s_str}")
-                            received = max(0.0, final_funding_long_usdt) + max(0.0, final_funding_short_usdt)
-                            paid = abs(min(0.0, final_funding_long_usdt)) + abs(min(0.0, final_funding_short_usdt))
-                            logger.info(f"Фандинг получено: {format_number(received)} USDT | уплачено: {format_number(paid)} USDT")
-                        else:
-                            logger.info("Фанд L: N/A | S: N/A")
                 else:
                     logger.error("Не удалось закрыть позиции")
             except Exception as e:
