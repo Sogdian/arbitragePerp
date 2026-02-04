@@ -157,36 +157,32 @@ def _calculate_pnl_usdt(
     ask_short_current: Optional[float],
     fee_long: float = 0.05,
     fee_short: float = 0.05,
+    funding_impact_usdt: Optional[float] = None,
 ) -> Optional[float]:
     """
     Рассчитывает PNL в USDT для арбитража Long/Short.
-    
-    Args:
-        coin_amount: Количество монет
-        ask_long_open: Цена покупки Long при открытии (ask)
-        bid_long_current: Текущая цена продажи Long (bid)
-        bid_short_open: Цена продажи Short при открытии (bid)
-        ask_short_current: Текущая цена покупки Short (ask)
-        fee_long: Комиссия Long в USDT (по умолчанию 0.05)
-        fee_short: Комиссия Short в USDT (по умолчанию 0.05)
-    
-    Returns:
-        PNL в USDT или None если недостаточно данных
+
+    Учитывает: разницу цен открытия/закрытия, комиссии, опционально — начисленный фандинг.
+    Фандинг: Long платит при rate > 0, Short получает; funding_impact_usdt — суммарный эффект в USDT
+    (положительный = мы получили, отрицательный = мы заплатили).
     """
-    if (ask_long_open is None or bid_long_current is None or 
+    if (ask_long_open is None or bid_long_current is None or
         bid_short_open is None or ask_short_current is None):
         return None
-    
+
     if coin_amount <= 0 or ask_long_open <= 0 or ask_short_current <= 0:
         return None
-    
+
     # Long: покупаем по ask_long_open, продаем по bid_long_current
     pnl_long = (bid_long_current - ask_long_open) * coin_amount - fee_long
-    
+
     # Short: продаем по bid_short_open, покупаем по ask_short_current
     pnl_short = (bid_short_open - ask_short_current) * coin_amount - fee_short
-    
-    return pnl_long + pnl_short
+
+    total = pnl_long + pnl_short
+    if funding_impact_usdt is not None:
+        total += funding_impact_usdt
+    return total
 
 
 async def _monitor_until_close(
@@ -215,6 +211,22 @@ async def _monitor_until_close(
     if not close_positions_on_trigger:
         logger.info("Позиции не открыты — при срабатывании порога только отправка в Telegram")
     logger.info("=" * 60)
+
+    # Замороженные цены открытия — не меняются за весь цикл мониторинга.
+    # Нужны, чтобы в логе "⛳ Откр" и PNL не пересчитывались от тика к тику по текущему рынку.
+    # frozen_ask_long_open — цена ask на бирже Long в момент «открытия» (старт мониторинга или реальный ордер).
+    # frozen_bid_short_open — цена bid на бирже Short в момент «открытия».
+    # frozen_opening_spread — спред открытия (bid_short - ask_long) / ask_long * 100, считается один раз по замороженным ценам.
+    frozen_ask_long_open: Optional[float] = ask_long_open
+    frozen_bid_short_open: Optional[float] = bid_short_open
+    frozen_opening_spread: Optional[float] = None
+    # open_time — время «открытия» (момент заморозки цен), для расчёта начисленного фандинга по числу периодов.
+    open_time: Optional[float] = None
+    # Интервал выплаты фандинга: 1 час (проверка каждый час).
+    FUNDING_INTERVAL_SEC = 3600
+    # Для теоретических сделок: ставки фандинга, зафиксированные в последнюю минуту каждого часа (час_индекс -> (rate_long, rate_short)).
+    # В PNL фандинг попадает только после закрытия часа, по ставке, запрошенной перед закрытием.
+    funding_rates_by_hour: dict[int, tuple[float, float]] = {}
 
     try:
         while True:
@@ -258,12 +270,20 @@ async def _monitor_until_close(
                 funding_long = long_data.get("funding_rate")
                 funding_short = short_data.get("funding_rate")
 
+                # При первой успешной итерации: если цены открытия не переданы — берём текущий тик; спред считаем один раз; фиксируем время открытия.
+                if frozen_opening_spread is None:
+                    if frozen_ask_long_open is None:
+                        frozen_ask_long_open = ask_long
+                    if frozen_bid_short_open is None:
+                        frozen_bid_short_open = bid_short
+                    frozen_opening_spread = bot.calculate_opening_spread(frozen_ask_long_open, frozen_bid_short_open)
+                    open_time = time.time()
+
                 closing_spread = bot.calculate_closing_spread(bid_long, ask_short)
-                # Цены открытия: при запуске мониторинга без позиций — цены на момент старта; с позициями — цены при открытии
-                pnl_ask_long_open = ask_long_open if ask_long_open is not None else ask_long
-                pnl_bid_short_open = bid_short_open if bid_short_open is not None else bid_short
-                # Спред открытия и L, S в логе — всегда одни и те же (по ценам открытия), не текущие
-                opening_spread = bot.calculate_opening_spread(pnl_ask_long_open, pnl_bid_short_open)
+                # В логе и PNL всегда используем замороженные цены открытия и спред
+                pnl_ask_long_open = frozen_ask_long_open
+                pnl_bid_short_open = frozen_bid_short_open
+                opening_spread = frozen_opening_spread
                 fr_spread = bot.calculate_funding_spread(funding_long, funding_short)
                 total_spread = None
                 if opening_spread is not None and fr_spread is not None:
@@ -287,7 +307,37 @@ async def _monitor_until_close(
                 s_str = _format_funding_time(funding_short_pct, m_short)
                 time_str = f" (L: {l_str} | S: {s_str})"
                 
-                # Расчет PNL: цены открытия — фиксированные (на момент старта мониторинга или открытия ордеров)
+                # Фандинг в PNL: только после закрытия часа. Для теоретических сделок — ставку фиксируем в последнюю минуту часа.
+                funding_impact_usdt: Optional[float] = None
+                if open_time is not None and frozen_ask_long_open is not None and frozen_bid_short_open is not None:
+                    elapsed_sec = time.time() - open_time
+                    notional_long = frozen_ask_long_open * coin_amount
+                    notional_short = frozen_bid_short_open * coin_amount
+                    if close_positions_on_trigger:
+                        # Реальные позиции: считаем фандинг по текущим ставкам за каждый закрытый час.
+                        num_periods = int(elapsed_sec / FUNDING_INTERVAL_SEC)
+                        if num_periods > 0:
+                            fl = funding_long if funding_long is not None else 0.0
+                            fs = funding_short if funding_short is not None else 0.0
+                            funding_impact_usdt = num_periods * (-fl * notional_long + fs * notional_short)
+                    else:
+                        # Теоретические: ставки нет в середине часа; в последнюю минуту часа запрашиваем и сохраняем ставку.
+                        # В PNL учитываем фандинг только по уже закрытым часам, по сохранённым ставкам.
+                        sec_in_hour = elapsed_sec % FUNDING_INTERVAL_SEC
+                        if sec_in_hour >= 3540:  # последняя минута часа (59 мин 0 сек — 59 мин 59 сек)
+                            hour_ix = int(elapsed_sec // FUNDING_INTERVAL_SEC)
+                            fl = funding_long if funding_long is not None else 0.0
+                            fs = funding_short if funding_short is not None else 0.0
+                            funding_rates_by_hour[hour_ix] = (fl, fs)
+                        num_completed_hours = int(elapsed_sec / FUNDING_INTERVAL_SEC)
+                        total_funding = 0.0
+                        for j in range(num_completed_hours):
+                            if j in funding_rates_by_hour:
+                                fl, fs = funding_rates_by_hour[j]
+                                total_funding += -fl * notional_long + fs * notional_short
+                        funding_impact_usdt = total_funding if total_funding != 0.0 else None
+
+                # Расчет PNL: цены открытия фиксированные + комиссии + фандинг за прошедшие периоды
                 pnl_usdt = _calculate_pnl_usdt(
                     coin_amount=coin_amount,
                     ask_long_open=pnl_ask_long_open,
@@ -296,8 +346,9 @@ async def _monitor_until_close(
                     ask_short_current=ask_short,
                     fee_long=fee_long,
                     fee_short=fee_short,
+                    funding_impact_usdt=funding_impact_usdt,
                 )
-                pnl_str = f"PNL: {format_number(pnl_usdt)} USDT" if pnl_usdt is not None else "PNL: N/A"
+                pnl_str = f"💲 PNL: {format_number(pnl_usdt)} USDT" if pnl_usdt is not None else "💲 PNL: N/A"
                 
                 # Форматируем цены открытия для лога (5 знаков после запятой)
                 opening_price_long = f"{pnl_ask_long_open:.5f}" if pnl_ask_long_open is not None else "N/A"
@@ -314,7 +365,8 @@ async def _monitor_until_close(
                     f"{opening_str} | "
                     f"💰 Фанд: {format_number(fr_spread)}%{time_str} | "
                     f"🎯 Общ: {format_number(total_spread)} | "
-                    f"{pnl_str}"
+                    f"{pnl_str} | "
+                    f"⚙️ Long {long_exchange} | Short {short_exchange} | {coin}"
                 )
                 # Выводим без префикса "__main__ - INFO"
                 print(log_line)
