@@ -8,9 +8,27 @@ import logging
 import os
 import re
 import sys
+import threading
 import time
 from datetime import datetime
 from typing import Optional
+
+# Флаг «закрыть позиции по CTRL+Z» (на Windows — поток читает stdin, EOF = Ctrl+Z+Enter)
+_close_positions_requested: list[bool] = [False]
+
+_windows_close_listener_started: list[bool] = [False]
+
+
+def _windows_ctrl_z_listener() -> None:
+    """Только Windows: в консоли Ctrl+Z и Enter даёт EOF; при EOF выставляем запрос на закрытие."""
+    try:
+        while True:
+            line = sys.stdin.readline()
+            if line == "":
+                _close_positions_requested[0] = True
+                break
+    except (EOFError, OSError):
+        _close_positions_requested[0] = True
 
 import config
 from bot import PerpArbitrageBot, format_number
@@ -261,6 +279,9 @@ async def _monitor_until_close(
         logger.info(f"Начало мониторинга для {coin} | без порога закрытия")
     if not close_positions_on_trigger:
         logger.info("Позиции не открыты — при срабатывании порога только отправка в Telegram")
+    if close_positions_on_trigger and sys.platform == "win32" and not _windows_close_listener_started[0]:
+        _windows_close_listener_started[0] = True
+        threading.Thread(target=_windows_ctrl_z_listener, daemon=True).start()
     logger.info("=" * 60)
 
     # Замороженные цены открытия — не меняются за весь цикл мониторинга.
@@ -281,15 +302,29 @@ async def _monitor_until_close(
 
     try:
         while True:
-            # Данные тикера (bid, ask, funding_rate)
-            long_data_task = bot.get_futures_data(long_exchange, coin)
-            short_data_task = bot.get_futures_data(short_exchange, coin)
-            long_data, short_data = await asyncio.gather(long_data_task, short_data_task, return_exceptions=True)
+            if close_positions_on_trigger and _close_positions_requested[0]:
+                _close_positions_requested[0] = False
+                logger.info("Запрос на закрытие позиций (CTRL+Z)")
+                break  # выходим в блок закрытия ниже (дублируем логику после цикла)
+
+            try:
+                # Данные тикера (bid, ask, funding_rate)
+                long_data_task = bot.get_futures_data(long_exchange, coin)
+                short_data_task = bot.get_futures_data(short_exchange, coin)
+                long_data, short_data = await asyncio.gather(long_data_task, short_data_task, return_exceptions=True)
+            except (KeyboardInterrupt, asyncio.CancelledError):
+                # CTRL+C — только остановка, без закрытия позиций
+                raise KeyboardInterrupt("Остановка пользователем")
 
             if isinstance(long_data, Exception):
+                # Пропускаем CancelledError, чтобы не логировать его как обычную ошибку
+                if isinstance(long_data, asyncio.CancelledError):
+                    raise KeyboardInterrupt("Прервано пользователем")
                 logger.debug(f"Ошибка Long {long_exchange}: {long_data}")
                 long_data = None
             if isinstance(short_data, Exception):
+                if isinstance(short_data, asyncio.CancelledError):
+                    raise KeyboardInterrupt("Прервано пользователем")
                 logger.debug(f"Ошибка Short {short_exchange}: {short_data}")
                 short_data = None
 
@@ -492,14 +527,130 @@ async def _monitor_until_close(
 
             await asyncio.sleep(1)
 
-    except KeyboardInterrupt:
-        logger.info("Мониторинг прерван пользователем")
+        # Выход из цикла по CTRL+Z — закрываем позиции и выводим статистику
+        if close_positions_on_trigger:
+            try:
+                bid_long_close = None
+                ask_short_close = None
+                try:
+                    long_data_final = await asyncio.wait_for(
+                        bot.get_futures_data(long_exchange, coin, need_funding=False),
+                        timeout=3.0
+                    )
+                    bid_long_close = long_data_final.get("bid") if long_data_final else None
+                except Exception as e:
+                    logger.debug(f"Не удалось получить цену закрытия Long: {e}")
+                try:
+                    short_data_final = await asyncio.wait_for(
+                        bot.get_futures_data(short_exchange, coin, need_funding=False),
+                        timeout=3.0
+                    )
+                    ask_short_close = short_data_final.get("ask") if short_data_final else None
+                except Exception as e:
+                    logger.debug(f"Не удалось получить цену закрытия Short: {e}")
+                final_funding_long_usdt = None
+                final_funding_short_usdt = None
+                if open_time is not None:
+                    try:
+                        final_funding_long_usdt = await asyncio.wait_for(
+                            _get_real_funding_usdt(bot, long_exchange, coin, open_time),
+                            timeout=3.0
+                        )
+                    except Exception:
+                        pass
+                    try:
+                        final_funding_short_usdt = await asyncio.wait_for(
+                            _get_real_funding_usdt(bot, short_exchange, coin, open_time),
+                            timeout=3.0
+                        )
+                    except Exception:
+                        pass
+                logger.info("Закрываем открытые позиции...")
+                try:
+                    ok_closed = await asyncio.wait_for(
+                        close_long_short_positions(
+                            bot=bot,
+                            coin=coin,
+                            long_exchange=long_exchange,
+                            short_exchange=short_exchange,
+                            coin_amount=coin_amount,
+                        ),
+                        timeout=30.0
+                    )
+                except Exception as e:
+                    logger.error(f"Ошибка при закрытии позиций: {e}")
+                    ok_closed = False
+                if ok_closed:
+                    logger.info("Позиции закрыты")
+                    if frozen_ask_long_open is not None and frozen_bid_short_open is not None:
+                        closing_info = []
+                        if bid_long_close is not None:
+                            closing_info.append(f"Цена закрытия Long: {bid_long_close:.5f}")
+                        if ask_short_close is not None:
+                            closing_info.append(f"Цена закрытия Short: {ask_short_close:.5f}")
+                        if closing_info:
+                            logger.info(" | ".join(closing_info))
+                        await asyncio.sleep(1.5)
+                        fee_long_close = await _get_real_fees_from_executions(
+                            bot, long_exchange, coin, "short", time_window_sec=15
+                        )
+                        fee_short_close = await _get_real_fees_from_executions(
+                            bot, short_exchange, coin, "long", time_window_sec=15
+                        )
+                        fee_l_open = fee_long if fee_long is not None else 0.0
+                        fee_s_open = fee_short if fee_short is not None else 0.0
+                        fee_l_close = fee_long_close if fee_long_close is not None else 0.0
+                        fee_s_close = fee_short_close if fee_short_close is not None else 0.0
+                        income_l = None
+                        if bid_long_close is not None and frozen_ask_long_open is not None:
+                            income_l = (bid_long_close - frozen_ask_long_open) * coin_amount - fee_l_open - fee_l_close
+                        income_s = None
+                        if ask_short_close is not None and frozen_bid_short_open is not None:
+                            income_s = (frozen_bid_short_open - ask_short_close) * coin_amount - fee_s_open - fee_s_close
+                        income_l_str = format_number(income_l) if income_l is not None else "N/A"
+                        income_s_str = format_number(income_s) if income_s is not None else "N/A"
+                        logger.info(f"L доход: {income_l_str} | S доход: {income_s_str}")
+                        fee_l_close_str = format_number(fee_long_close) if fee_long_close is not None else "N/A"
+                        fee_s_close_str = format_number(fee_short_close) if fee_short_close is not None else "N/A"
+                        logger.info(f"L комиссия закр: {fee_l_close_str} | S комиссия закр: {fee_s_close_str}")
+                        fee_long_total = fee_l_open + fee_l_close
+                        fee_short_total = fee_s_open + fee_s_close
+                        final_pnl = _calculate_pnl_usdt(
+                            coin_amount=coin_amount,
+                            ask_long_open=frozen_ask_long_open,
+                            bid_long_current=bid_long_close,
+                            bid_short_open=frozen_bid_short_open,
+                            ask_short_current=ask_short_close,
+                            fee_long=fee_long_total,
+                            fee_short=fee_short_total,
+                            funding_impact_usdt=(final_funding_long_usdt + final_funding_short_usdt) if (final_funding_long_usdt is not None and final_funding_short_usdt is not None) else None,
+                        )
+                        if final_pnl is not None:
+                            logger.info(f"💲 Финальный PNL: {format_number(final_pnl)} USDT")
+                        if final_funding_long_usdt is not None and final_funding_short_usdt is not None:
+                            fund_l_str = format_number(final_funding_long_usdt)
+                            fund_s_str = format_number(final_funding_short_usdt)
+                            logger.info(f"Фанд L: {fund_l_str} | S: {fund_s_str}")
+                            received = max(0.0, final_funding_long_usdt) + max(0.0, final_funding_short_usdt)
+                            paid = abs(min(0.0, final_funding_long_usdt)) + abs(min(0.0, final_funding_short_usdt))
+                            logger.info(f"Фандинг получено: {format_number(received)} USDT | уплачено: {format_number(paid)} USDT")
+                        else:
+                            logger.info("Фанд L: N/A | S: N/A")
+                else:
+                    logger.error("Не удалось закрыть позиции")
+            except Exception as e:
+                logger.error(f"Ошибка при закрытии позиций: {e}", exc_info=True)
+
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        logger.info("Мониторинг остановлен (CTRL+C). Позиции не закрываются. Для закрытия позиций используйте CTRL+Z.")
     except Exception as e:
         logger.error(f"Ошибка в мониторинге: {e}", exc_info=True)
 
 
 async def main():
     bot = PerpArbitrageBot()
+    positions_opened = False
+    positions_info: dict[str, any] = {}  # coin, long_exchange, short_exchange, coin_amount
 
     try:
         raw_args = [a.strip() for a in sys.argv[1:]]
@@ -539,7 +690,7 @@ async def main():
         sys.stdout.flush()
 
         # Первый вопрос: открыть позиции?
-        print("\nОткрыть позиции в лонг и шорт? Введите 'Да' или 'Нет': если 'Да', то позиции будут открыты и введите min цену (через .) закр, для отправки сообщения в тг и закрытия всех позиций.")
+        print("\nОткрыть позиции в лонг и шорт? Введите 'Да' или 'Нет': если 'Да', то позиции будут открыты. Опционально можно указать min цену (через .) закр для отправки сообщения в тг и закрытия всех позиций (например: 'Да, 1' или 'Да, 0.5').")
         sys.stdout.flush()
         if not sys.stdin.isatty() or os.getenv("BOT_NO_PROMPT") == "1":
             logger.info("Интерактивный ввод недоступен, выход без открытия позиций")
@@ -550,15 +701,16 @@ async def main():
 
         close_threshold_pct: Optional[float] = None
         if open_positions:
+            # Порог закрытия опционален: если указан — используем, если нет — мониторинг без порога
             match = re.search(r"([-]?\d+(?:\.\d+)?)", answer)
-            if not match:
-                logger.error("Не указана min цена закрытия (проценты). Ожидается формат: 'Да, 1' или 'Да, 0.5'")
-                return
-            try:
-                close_threshold_pct = float(match.group(1))
-            except ValueError:
-                logger.error("Некорректное число для порога закрытия")
-                return
+            if match:
+                try:
+                    close_threshold_pct = float(match.group(1))
+                except ValueError:
+                    logger.warning("Некорректное число для порога закрытия, мониторинг без порога")
+                    close_threshold_pct = None
+            else:
+                logger.info("Порог закрытия не указан, мониторинг без порога закрытия")
 
             # Получаем текущие цены перед открытием позиций для расчета PNL
             long_data_before = await bot.get_futures_data(long_exchange, coin, need_funding=False)
@@ -600,19 +752,48 @@ async def main():
             fee_short_str = format_number(fee_short) if fee_short is not None else "N/A"
             logger.info(f"Комиссии: Long {long_exchange}={fee_long_str} USDT, Short {short_exchange}={fee_short_str} USDT")
 
-            await _monitor_until_close(
-                bot=bot,
-                coin=coin,
-                long_exchange=long_exchange,
-                short_exchange=short_exchange,
-                coin_amount=coin_amount,
-                close_threshold_pct=close_threshold_pct,
-                close_positions_on_trigger=True,
-                ask_long_open=ask_long_open,
-                bid_short_open=bid_short_open,
-                fee_long=fee_long,
-                fee_short=fee_short,
-            )
+            # Сохраняем информацию об открытых позициях для возможного закрытия при CTRL+C
+            positions_opened = True
+            positions_info = {
+                "coin": coin,
+                "long_exchange": long_exchange,
+                "short_exchange": short_exchange,
+                "coin_amount": coin_amount,
+            }
+            try:
+                await _monitor_until_close(
+                    bot=bot,
+                    coin=coin,
+                    long_exchange=long_exchange,
+                    short_exchange=short_exchange,
+                    coin_amount=coin_amount,
+                    close_threshold_pct=close_threshold_pct,
+                    close_positions_on_trigger=True,
+                    ask_long_open=ask_long_open,
+                    bid_short_open=bid_short_open,
+                    fee_long=fee_long,
+                    fee_short=fee_short,
+                )
+            except (KeyboardInterrupt, asyncio.CancelledError):
+                # Если мониторинг был прерван, но позиции не были закрыты в _monitor_until_close, закрываем здесь
+                logger.info("Попытка закрыть позиции после прерывания мониторинга...")
+                try:
+                    ok_closed = await close_long_short_positions(
+                        bot=bot,
+                        coin=positions_info["coin"],
+                        long_exchange=positions_info["long_exchange"],
+                        short_exchange=positions_info["short_exchange"],
+                        coin_amount=positions_info["coin_amount"],
+                    )
+                    if ok_closed:
+                        logger.info("Позиции закрыты")
+                    else:
+                        logger.error("Не удалось закрыть позиции")
+                except Exception as e:
+                    logger.error(f"Ошибка при закрытии позиций: {e}", exc_info=True)
+                raise
+            finally:
+                positions_opened = False
             return
         # Ответ "Нет" на открытие — второй вопрос: включить мониторинг?
         print("\nВключить мониторинг?")
@@ -657,6 +838,42 @@ async def main():
 
     except KeyboardInterrupt:
         logger.info("Прервано пользователем")
+        # Если позиции были открыты, пытаемся их закрыть
+        if positions_opened and positions_info:
+            try:
+                logger.info("Закрываем открытые позиции...")
+                ok_closed = await close_long_short_positions(
+                    bot=bot,
+                    coin=positions_info["coin"],
+                    long_exchange=positions_info["long_exchange"],
+                    short_exchange=positions_info["short_exchange"],
+                    coin_amount=positions_info["coin_amount"],
+                )
+                if ok_closed:
+                    logger.info("Позиции закрыты")
+                else:
+                    logger.error("Не удалось закрыть позиции")
+            except Exception as e:
+                logger.error(f"Ошибка при закрытии позиций: {e}", exc_info=True)
+    except asyncio.CancelledError:
+        logger.info("Операция отменена")
+        # Если позиции были открыты, пытаемся их закрыть
+        if positions_opened and positions_info:
+            try:
+                logger.info("Закрываем открытые позиции...")
+                ok_closed = await close_long_short_positions(
+                    bot=bot,
+                    coin=positions_info["coin"],
+                    long_exchange=positions_info["long_exchange"],
+                    short_exchange=positions_info["short_exchange"],
+                    coin_amount=positions_info["coin_amount"],
+                )
+                if ok_closed:
+                    logger.info("Позиции закрыты")
+                else:
+                    logger.error("Не удалось закрыть позиции")
+            except Exception as e:
+                logger.error(f"Ошибка при закрытии позиций: {e}", exc_info=True)
     except Exception as e:
         logger.error(f"Ошибка: {e}", exc_info=True)
     finally:

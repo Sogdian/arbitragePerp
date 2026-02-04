@@ -274,8 +274,8 @@ async def open_long_short_positions(
             spread_open = (short_px - long_px) / long_px * 100.0
         spread_str = f"{spread_open:.3f}%" if spread_open is not None else "N/A"
         logger.info(
-            f"Биржа лонг: {long_exchange}, Цена входа Long: {_format_number(long_px)}, "
-            f"Биржа шорт: {short_exchange}, Цена входа Short: {_format_number(short_px)}, "
+            f"Биржа лонг: {long_exchange}, Цена входа Long: {long_px:.5f}, "
+            f"Биржа шорт: {short_exchange}, Цена входа Short: {short_px:.5f}, "
             f"Количество монет: {_format_number(coin_amount)}, Спред открытия: {spread_str}"
         )
         logger.info(f"✅ Позиции открыты: {coin} | Long {long_exchange} | Short {short_exchange}")
@@ -1673,7 +1673,7 @@ async def _gather2(t1, t2):
 
 def _log_leg_result(res: OpenLegResult) -> None:
     if res.ok:
-        logger.info(f"✅ Ордер выставлен: {res.exchange} {res.direction} | order_id={res.order_id}")
+        logger.info(f"✅ Ордер выставлен: {res.exchange} {res.direction}")
         return
     msg = res.error or "unknown error"
     logger.error(f"❌ Ошибка открытия: {res.exchange} {res.direction} | {msg}")
