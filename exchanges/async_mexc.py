@@ -5,6 +5,8 @@ from typing import Dict, Optional, Any, Set, List
 import logging
 import asyncio
 import json
+import os
+import time
 import httpx
 from .async_base_exchange import AsyncBaseExchange
 from .coin_list_fetchers import fetch_mexc_coins
@@ -56,6 +58,116 @@ class AsyncMexcExchange(AsyncBaseExchange):
         # Защищаем загрузку алиасов от гонок: при старте много параллельных запросов
         # могут одновременно вызвать contract/detail и/или перезаписать результат {} при ошибке.
         self._mexc_alias_lock = asyncio.Lock()
+        # Для MEXC нужен стабильный keep-alive и чуть более щадящие таймауты.
+        # Важно: раньше тут создавался новый AsyncClient на КАЖДЫЙ запрос + был хардкод timeout=15s,
+        # из-за чего под параллельной нагрузкой тикеры/фандинг массово падали (connect/pool/handshake),
+        # и скан видел "нет валидных данных".
+        mexc_rw_timeout_s = float(os.getenv("MEXC_HTTP_TIMEOUT_SEC", "25"))
+        mexc_connect_timeout_s = float(os.getenv("MEXC_HTTP_CONNECT_TIMEOUT_SEC", str(self._connect_timeout_s)))
+        mexc_pool_timeout_s = float(os.getenv("MEXC_HTTP_POOL_TIMEOUT_SEC", str(self._pool_timeout_s)))
+        mexc_max_inflight = int(os.getenv("MEXC_HTTP_MAX_INFLIGHT", "5"))
+        self._mexc_req_sem = asyncio.Semaphore(max(1, mexc_max_inflight))
+        self._mexc_timeout = httpx.Timeout(
+            mexc_rw_timeout_s,
+            connect=mexc_connect_timeout_s,
+            pool=mexc_pool_timeout_s,
+        )
+        self._mexc_headers = {
+            # иногда WAF'ы режут пустой UA на некоторых эндпоинтах
+            "User-Agent": "Mozilla/5.0 (compatible; arbitragePerp/1.0)",
+            "Accept": "application/json",
+        }
+        # Обновим заголовки основного клиента (contract.mexc.com)
+        try:
+            self.client.headers.update(self._mexc_headers)
+        except Exception:
+            pass
+        # Отдельный клиент для fallback домена (futures.mexc.com)
+        self._fallback_client = httpx.AsyncClient(
+            base_url=self.BASE_URL_FALLBACK,
+            headers=self._mexc_headers,
+            limits=httpx.Limits(max_connections=pool_limit, max_keepalive_connections=pool_limit),
+            timeout=self._mexc_timeout,
+        )
+        # Кэши для снижения нагрузки/банов:
+        # MEXC поддерживает bulk эндпоинты:
+        # - GET /api/v1/contract/ticker        -> список тикеров
+        # - GET /api/v1/contract/funding_rate  -> список фандингов
+        # В сканере это критично: иначе по 1000+ монетам получаем WAF/rate-limit и "нет валидных данных".
+        self._ticker_cache_lock = asyncio.Lock()
+        self._ticker_cache_ts: float = 0.0
+        self._ticker_cache_ttl_s: float = float(os.getenv("MEXC_TICKER_CACHE_TTL_SEC", "2.0"))
+        self._ticker_cache: Dict[str, Dict[str, Any]] = {}
+
+        self._funding_cache_lock = asyncio.Lock()
+        self._funding_cache_ts: float = 0.0
+        self._funding_cache_ttl_s: float = float(os.getenv("MEXC_FUNDING_CACHE_TTL_SEC", "5.0"))
+        self._funding_cache: Dict[str, Dict[str, Any]] = {}
+
+    async def close(self):
+        """Закрывает HTTP клиенты (основной + fallback)."""
+        await super().close()
+        try:
+            await self._fallback_client.aclose()
+        except Exception:
+            pass
+
+    def _cache_fresh(self, ts: float, ttl_s: float) -> bool:
+        if ts <= 0:
+            return False
+        if ttl_s <= 0:
+            return False
+        return (time.monotonic() - ts) < ttl_s
+
+    async def _ensure_ticker_cache(self) -> None:
+        """Обновляет кэш тикеров через bulk endpoint (если протух)."""
+        if self._cache_fresh(self._ticker_cache_ts, self._ticker_cache_ttl_s) and self._ticker_cache:
+            return
+        async with self._ticker_cache_lock:
+            if self._cache_fresh(self._ticker_cache_ts, self._ticker_cache_ttl_s) and self._ticker_cache:
+                return
+            data = await self._request_json_with_domain_fallback("GET", "/api/v1/contract/ticker", params={})
+            if not isinstance(data, dict) or _to_int(data.get("code")) != 0:
+                return
+            items = data.get("data")
+            if not isinstance(items, list) or not items:
+                return
+            cache: Dict[str, Dict[str, Any]] = {}
+            for it in items:
+                if not isinstance(it, dict):
+                    continue
+                sym = it.get("symbol")
+                if not isinstance(sym, str) or not sym:
+                    continue
+                cache[self._canon(sym)] = it
+            if cache:
+                self._ticker_cache = cache
+                self._ticker_cache_ts = time.monotonic()
+
+    async def _ensure_funding_cache(self) -> None:
+        """Обновляет кэш фандингов через bulk endpoint (если протух)."""
+        if self._cache_fresh(self._funding_cache_ts, self._funding_cache_ttl_s) and self._funding_cache:
+            return
+        async with self._funding_cache_lock:
+            if self._cache_fresh(self._funding_cache_ts, self._funding_cache_ttl_s) and self._funding_cache:
+                return
+            data = await self._request_json_with_domain_fallback("GET", "/api/v1/contract/funding_rate", params={})
+            if not isinstance(data, dict) or _to_int(data.get("code")) != 0:
+                return
+            items = data.get("data")
+            if not isinstance(items, list) or not items:
+                return
+            cache: Dict[str, Dict[str, Any]] = {}
+            for it in items:
+                if not isinstance(it, dict):
+                    continue
+                sym = it.get("symbol")
+                if not isinstance(sym, str) or not sym:
+                    continue
+                cache[self._canon(sym)] = it
+            if cache:
+                self._funding_cache = cache
+                self._funding_cache_ts = time.monotonic()
 
     async def _ensure_mexc_aliases_loaded(self, force_reload: bool = False) -> None:
         """Один раз загрузить алиасы из API contract/detail (логика как в scripts/mexc_alias_check.py)."""
@@ -230,55 +342,88 @@ class AsyncMexcExchange(AsyncBaseExchange):
         params: Optional[dict] = None,
         *,
         try_domains: Optional[List[str]] = None,
-        retries_per_domain: int = 1,
+        retries_per_domain: int = 2,
         backoff_s: float = 0.2,
     ) -> Any:
         """
         Обёртка, которая пробует два домена и короткие ретраи.
         ВАЖНО: тут мы сами делаем httpx запрос, чтобы реально сменить base_url.
         """
-        domains = try_domains or [self.BASE_URL, self.BASE_URL_FALLBACK]
-
-        headers = {
-            # иногда WAF'ы режут пустой UA на некоторых эндпоинтах
-            "User-Agent": "Mozilla/5.0 (compatible; arbitragePerp/1.0)",
-            "Accept": "application/json",
-        }
-
-        for d_i, domain in enumerate(domains):
-            for r in range(max(1, int(retries_per_domain))):
-                try:
-                    async with httpx.AsyncClient(
-                        base_url=domain,
-                        headers=headers,
-                        limits=httpx.Limits(max_connections=10, max_keepalive_connections=10),
-                        timeout=httpx.Timeout(15.0, connect=5.0),  # MEXC часто отвечает медленно
-                    ) as client:
-                        resp = await client.request(method, url, params=params)
-                        resp.raise_for_status()
-                        try:
-                            return resp.json()
-                        except json.JSONDecodeError:
-                            is_last = (d_i == len(domains) - 1) and (r == max(1, int(retries_per_domain)) - 1)
-                            msg = f"MEXC: non-JSON response for {domain}{url} status={resp.status_code}"
-                            if is_last:
-                                logger.warning(msg)
-                                return None
-                            logger.debug(msg)
+        # Если задан конкретный список доменов — уважаем его, иначе используем (primary, fallback).
+        # Важно: мы используем ДОЛГОЖИВУЩИЕ клиенты, чтобы не тратить время на handshake под нагрузкой.
+        if try_domains:
+            # минимальная совместимость: если кто-то передаст кастомные домены — используем одноразовые клиенты
+            # (редко используется). Основной hot-path ниже.
+            domains = try_domains
+            for d_i, domain in enumerate(domains):
+                for r in range(max(1, int(retries_per_domain))):
+                    is_last = (d_i == len(domains) - 1) and (r == max(1, int(retries_per_domain)) - 1)
+                    try:
+                        async with httpx.AsyncClient(
+                            base_url=domain,
+                            headers=self._mexc_headers,
+                            limits=httpx.Limits(max_connections=10, max_keepalive_connections=10),
+                            timeout=self._mexc_timeout,
+                        ) as c:
+                            resp = await c.request(method, url, params=params, timeout=self._mexc_timeout)
+                            resp.raise_for_status()
+                            try:
+                                return resp.json()
+                            except json.JSONDecodeError:
+                                if is_last:
+                                    logger.warning(f"MEXC: non-JSON response for {domain}{url} status={resp.status_code}")
+                                    return None
+                                await asyncio.sleep(backoff_s * (1 + r + d_i))
+                    except (httpx.RequestError, httpx.HTTPStatusError, asyncio.TimeoutError) as e:
+                        if not is_last:
                             await asyncio.sleep(backoff_s * (1 + r + d_i))
-                            continue
-                except (httpx.RequestError, httpx.HTTPStatusError, asyncio.TimeoutError) as e:
-                    # на последней попытке просто отдадим None
-                    is_last = (d_i == len(domains) - 1) and (r == max(1, int(retries_per_domain)) - 1)
+                    except Exception as e:
+                        logger.debug(f"MEXC: unexpected error for {domain}{url}: {e}")
+                        if not is_last:
+                            await asyncio.sleep(backoff_s * (1 + r + d_i))
+            return None
+
+        clients = [
+            (self.client, self.BASE_URL),
+            (self._fallback_client, self.BASE_URL_FALLBACK),
+        ]
+
+        for d_i, (client, domain) in enumerate(clients):
+            for r in range(max(1, int(retries_per_domain))):
+                is_last = (d_i == len(clients) - 1) and (r == max(1, int(retries_per_domain)) - 1)
+                try:
+                    async with self._mexc_req_sem:
+                        resp = await client.request(method, url, params=params, timeout=self._mexc_timeout)
+                    resp.raise_for_status()
+                    try:
+                        return resp.json()
+                    except json.JSONDecodeError:
+                        # обычно это WAF/HTML. На последней попытке покажем warning (коротко).
+                        if is_last:
+                            logger.warning(f"MEXC: non-JSON response for {domain}{url} status={resp.status_code}")
+                            return None
+                        await asyncio.sleep(backoff_s * (1 + r + d_i))
+                        continue
+                except httpx.HTTPStatusError as e:
+                    status = e.response.status_code
                     if is_last:
-                        logger.debug(f"MEXC: domain fallback failed for {domain}{url}: {e}")
-                    else:
-                        await asyncio.sleep(backoff_s * (1 + r + d_i))
+                        if status in (403, 429):
+                            logger.warning(f"MEXC: HTTP {status} for {domain}{url} (possible WAF/rate-limit)")
+                        else:
+                            logger.debug(f"MEXC: HTTP {status} for {domain}{url}")
+                        return None
+                    await asyncio.sleep(backoff_s * (1 + r + d_i))
+                except (httpx.RequestError, asyncio.TimeoutError) as e:
+                    if is_last:
+                        # не спамим warning здесь — скан сам решит, что логировать
+                        logger.debug(f"MEXC: request failed for {domain}{url}: {type(e).__name__}: {e}")
+                        return None
+                    await asyncio.sleep(backoff_s * (1 + r + d_i))
                 except Exception as e:
-                    is_last = (d_i == len(domains) - 1) and (r == max(1, int(retries_per_domain)) - 1)
                     logger.debug(f"MEXC: unexpected error for {domain}{url}: {e}")
-                    if not is_last:
-                        await asyncio.sleep(backoff_s * (1 + r + d_i))
+                    if is_last:
+                        return None
+                    await asyncio.sleep(backoff_s * (1 + r + d_i))
 
         return None
 
@@ -329,8 +474,26 @@ class AsyncMexcExchange(AsyncBaseExchange):
             await self._ensure_mexc_aliases_loaded()
             url = "/api/v1/contract/ticker"
 
+            # 0) Быстрый путь: bulk-кэш тикеров (1 запрос на все символы раз в TTL)
+            await self._ensure_ticker_cache()
+
             # 1) основной формат COIN_USDT (с учетом алиасов)
             symbol = self._normalize_symbol(coin)
+            canon = self._canon(symbol)
+            cached = self._ticker_cache.get(canon)
+            if isinstance(cached, dict):
+                last_price_raw = cached.get("lastPrice") if cached.get("lastPrice") is not None else cached.get("last")
+                if last_price_raw is not None and last_price_raw != "":
+                    price = float(last_price_raw)
+                    if price > 0:
+                        bid = self._safe_px(cached.get("bid1") or cached.get("bid"), price)
+                        ask = self._safe_px(cached.get("ask1") or cached.get("ask"), price)
+                        if bid > ask:
+                            bid = price
+                            ask = price
+                        return {"price": price, "bid": bid, "ask": ask}
+
+            # fallback: точечный запрос по символу (если кэш не содержит)
             data = await self._request_json_with_domain_fallback("GET", url, params={"symbol": symbol})
 
             # 2) если ответ странный/ошибочный — пробуем COINUSDT
@@ -414,8 +577,11 @@ class AsyncMexcExchange(AsyncBaseExchange):
                 logger.debug(f"MEXC: ticker for {coin} not dict (symbol={symbol})")
                 return None
 
-            last_price_raw = item.get("lastPrice") or item.get("last")
-            if not last_price_raw:
+            # ВАЖНО: lastPrice может быть 0/"" в редких случаях. Нам важно отличать None от 0.
+            last_price_raw = item.get("lastPrice")
+            if last_price_raw is None:
+                last_price_raw = item.get("last")
+            if last_price_raw is None or last_price_raw == "":
                 # тоже не надо шуметь WARN — это частая ситуация для невалидных/пустых тикеров
                 logger.debug(f"MEXC: no lastPrice/last for {coin} (symbol={symbol}) item_keys={list(item.keys())[:10]}")
                 return None
@@ -444,8 +610,17 @@ class AsyncMexcExchange(AsyncBaseExchange):
         """
         try:
             await self._ensure_mexc_aliases_loaded()
-            # 1) пробуем COIN_USDT (с учетом алиасов)
+            # 0) Быстрый путь: bulk-кэш фандингов (1 запрос на все символы раз в TTL)
+            await self._ensure_funding_cache()
+
             symbol1 = self._normalize_symbol(coin)
+            cached = self._funding_cache.get(self._canon(symbol1))
+            if isinstance(cached, dict):
+                fr = cached.get("fundingRate")
+                if fr is not None:
+                    return float(fr)
+
+            # fallback: точечный запрос по символу
             url1 = f"/api/v1/contract/funding_rate/{symbol1}"
             data = await self._request_json_with_domain_fallback("GET", url1, params=None)
 
@@ -484,7 +659,12 @@ class AsyncMexcExchange(AsyncBaseExchange):
                 logger.warning(f"MEXC: funding для {coin} не найден/не dict")
                 return None
 
-            funding_rate_raw = item.get("fundingRate") or item.get("rate") or item.get("r")
+            # ВАЖНО: fundingRate может быть 0.0 — это валидное значение.
+            funding_rate_raw = item.get("fundingRate")
+            if funding_rate_raw is None:
+                funding_rate_raw = item.get("rate")
+            if funding_rate_raw is None:
+                funding_rate_raw = item.get("r")
 
             if funding_rate_raw is None:
                 logger.warning(f"MEXC: нет поля fundingRate/rate/r для {coin}: {item}")
@@ -513,8 +693,24 @@ class AsyncMexcExchange(AsyncBaseExchange):
         """
         try:
             await self._ensure_mexc_aliases_loaded()
-            # 1) пробуем COIN_USDT (с учетом алиасов)
+            # 0) Быстрый путь: bulk-кэш фандингов
+            await self._ensure_funding_cache()
+
             symbol1 = self._normalize_symbol(coin)
+            cached = self._funding_cache.get(self._canon(symbol1))
+            if isinstance(cached, dict):
+                fr = cached.get("fundingRate")
+                if fr is not None:
+                    nft = cached.get("nextSettleTime") or cached.get("nextFundingTime") or cached.get("nextFundingTimeMs")
+                    next_funding_time = None
+                    if nft is not None:
+                        try:
+                            next_funding_time = int(nft)
+                        except (TypeError, ValueError):
+                            next_funding_time = None
+                    return {"funding_rate": float(fr), "next_funding_time": next_funding_time}
+
+            # fallback: точечный запрос по символу
             url1 = f"/api/v1/contract/funding_rate/{symbol1}"
             data = await self._request_json_with_domain_fallback("GET", url1, params=None)
 
@@ -553,7 +749,12 @@ class AsyncMexcExchange(AsyncBaseExchange):
                 logger.warning(f"MEXC: funding для {coin} не найден/не dict")
                 return None
 
-            funding_rate_raw = item.get("fundingRate") or item.get("rate") or item.get("r")
+            # ВАЖНО: fundingRate может быть 0.0 — это валидное значение.
+            funding_rate_raw = item.get("fundingRate")
+            if funding_rate_raw is None:
+                funding_rate_raw = item.get("rate")
+            if funding_rate_raw is None:
+                funding_rate_raw = item.get("r")
 
             if funding_rate_raw is None:
                 logger.warning(f"MEXC: нет поля fundingRate/rate/r для {coin}: {item}")
