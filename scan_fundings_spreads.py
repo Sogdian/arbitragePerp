@@ -52,7 +52,7 @@ load_dotenv(".env")
 MIN_FUNDING_SPREAD = float(os.getenv("MIN_FUNDING_SPREAD", "1.5"))  # спред фандинга >= (Long получаем, Short платим), %
 MIN_FUNDING_LONG_FILTER_FOR_LOG = float(os.getenv("MIN_FUNDING_LONG_FILTER_FOR_LOG", "-0.5"))  # в лог только связки, где фандинг на Long (в %) <= этого значения (напр. -0.5: проходят -1, -1.5, -0.6; не проходят -0.4, 0, +1)
 MAX_PRICE_SPREAD = float(os.getenv("MAX_PRICE_SPREAD", "0.5"))  # |спред цен| <= %, для минимального проскальзывания
-SCAN_INTERVAL_SEC = float(os.getenv("SCAN_FUNDING_INTERVAL_SEC", "60"))
+SCAN_INTERVAL_SEC = 0  # непрерывное сканирование без паузы
 MAX_CONCURRENCY = int(os.getenv("SCAN_FUNDING_MAX_CONCURRENCY", "20"))
 COIN_BATCH_SIZE = int(os.getenv("SCAN_FUNDING_COIN_BATCH_SIZE", "50"))
 REQ_TIMEOUT_SEC = float(os.getenv("SCAN_FUNDING_REQ_TIMEOUT_SEC", "20"))
@@ -778,7 +778,7 @@ async def main():
         logger.info(
             f"scan_fundings_spreads started | mode={config.ENV_MODE} | "
             f"MIN_FUNDING_SPREAD={MIN_FUNDING_SPREAD:.2f}% | MAX_PRICE_SPREAD={MAX_PRICE_SPREAD:.2f}% | "
-            f"MIN_TIME_TO_PAY={SCAN_FUNDING_MIN_TIME_TO_PAY:.0f} min | interval={SCAN_INTERVAL_SEC}s | "
+            f"MIN_TIME_TO_PAY={SCAN_FUNDING_MIN_TIME_TO_PAY:.0f} min | "
             f"exchanges={exchanges} | telegram={'enabled' if telegram.enabled else 'disabled'}"
         )
         printed_stats = False
@@ -800,8 +800,7 @@ async def main():
             if coins:
                 await scan_once(bot, exchanges, coins, sem, coins_by_exchange, analysis_sem)
             dt = time.perf_counter() - t0
-            logger.info(f"scan_once finished in {dt:.1f}s; sleeping {SCAN_INTERVAL_SEC:.1f}s")
-            await asyncio.sleep(SCAN_INTERVAL_SEC)
+            logger.info(f"scan_once finished in {dt:.1f}s")
     except KeyboardInterrupt:
         logger.info("scan_fundings_spreads stopped by user")
     finally:
