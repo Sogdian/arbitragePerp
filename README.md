@@ -31,7 +31,7 @@ python bot.py "STO Long (mexc), Short (bybit) 30" --no-monitor (30 = колич�
 python scan_fundings.py - поиск фанлингов
 python fun.py "LPT Bybit 10 -0.1%" - скальпинг фандингов
 python scan_fundings_spreads.py - скан спреда фандингов
-python scan_fundings_spreads_bot.py "BIRB Long (gate), Short (bybit) 100" - открытие и закрытие (ручное по "CTRL+Z") ордеров 
+python scan_fundings_spreads_bot.py "WHITEWHALE Long (bybit), Short (bingx) 200" - открытие и закрытие (ручное по "CTRL+Z") ордеров 
 ```
 
 **macOS:**
@@ -61,7 +61,7 @@ python bot.py
 - **MEXC** (mexc) -
 - **XT.com** (xt) ✅
 - **Binance** (binance) ✅
-- **Bitget** (bitget) ??
+- **Bitget** (bitget) ✅
 - **OKX** (okx) 
 - **BingX** (bingx)  ??
 

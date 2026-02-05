@@ -58,7 +58,7 @@ except ImportError:
 logger = logging.getLogger("__main__")
 
 # Глубина стакана при открытии: уровни 1..N, с первого уровня частичные ордера (IOC) до набора объёма.
-MAX_ORDERBOOK_LEVELS = max(1, int(os.getenv("OPEN_ORDERBOOK_LEVELS", "5") or "5"))
+MAX_ORDERBOOK_LEVELS = max(1, int(os.getenv("OPEN_ORDERBOOK_LEVELS", "10") or "10"))
 
 
 def _format_number(value: Optional[float], precision: int = 3) -> str:
@@ -233,99 +233,243 @@ async def open_long_short_positions(
     long_exchange: str,
     short_exchange: str,
     coin_amount: float,
-) -> Tuple[bool, Optional[float], Optional[float]]:
+) -> Tuple[bool, Optional[float], Optional[float], float, float]:
     """
     Открывает Long (на long_exchange) и Short (на short_exchange) на coin_amount монет (для каждой ноги).
-    Возвращает (ok, long_price, short_price): ok=True только если обе ноги открылись успешно;
-    при ok=True — фактические средние цены исполнения (long_price, short_price), иначе (None, None).
+    Возвращает (ok, long_price, short_price, long_filled_qty, short_filled_qty).
+
+    ВАЖНО (по требованию пользователя):
+    - если нога открылась не полностью — НЕ откатываем обе ноги автоматически (разные объёмы допускаются)
+    - но стараемся ДОоткрыть недостающий объём (несколько дополнительных попыток)
     """
     try:
         coin_amount = float(coin_amount)
     except Exception:
         logger.error(f"❌ Некорректное количество монет: {coin_amount!r}")
-        return False, None, None
+        return False, None, None, 0.0, 0.0
     if coin_amount <= 0:
         logger.error(f"❌ Количество монет должно быть > 0, получено: {coin_amount}")
-        return False, None, None
-
-    logger.info(f"🧩 Авто-открытие позиций: {coin} | Long {long_exchange} + Short {short_exchange} | qty={_format_number(coin_amount)} {coin}")
+        return False, None, None, 0.0, 0.0
 
     long_obj = (getattr(bot, "exchanges", {}) or {}).get(long_exchange)
     short_obj = (getattr(bot, "exchanges", {}) or {}).get(short_exchange)
     if long_obj is None or short_obj is None:
         logger.error(f"❌ Не найдены биржи в bot.exchanges: long={long_exchange} short={short_exchange}")
-        return False, None, None
+        return False, None, None, 0.0, 0.0
 
-    # 1) Preflight: проверяем возможность открытия на обеих биржах заранее
-    long_plan = await _plan_one_leg(exchange_name=long_exchange, exchange_obj=long_obj, coin=coin, direction="long", coin_amount=coin_amount)
-    if isinstance(long_plan, OpenLegResult) and not long_plan.ok:
-        logger.error(f"❌ Preflight failed (Long): {long_plan.error}")
-        return False, None, None
-    short_plan = await _plan_one_leg(exchange_name=short_exchange, exchange_obj=short_obj, coin=coin, direction="short", coin_amount=coin_amount)
-    if isinstance(short_plan, OpenLegResult) and not short_plan.ok:
-        logger.error(f"❌ Preflight failed (Short): {short_plan.error}")
-        return False, None, None
-    if not isinstance(long_plan, dict) or not isinstance(short_plan, dict):
-        logger.error("❌ Preflight не пройден, ордера не отправлены")
-        return False, None, None
+    logger.info(f"🧩 Авто-открытие позиций: {coin} | Long {long_exchange} + Short {short_exchange} | qty={_format_number(coin_amount)} {coin}")
 
-    # 2) Выставляем лимитные ордера параллельно
-    long_task = _place_one_leg(planned=long_plan)
-    short_task = _place_one_leg(planned=short_plan)
-    long_res_raw, short_res_raw = await _gather2(long_task, short_task)
-    long_res = _as_open_leg_result(long_res_raw, exchange=str(long_exchange), direction="long")
-    short_res = _as_open_leg_result(short_res_raw, exchange=str(short_exchange), direction="short")
+    eps = max(1e-9, abs(coin_amount) * 1e-9)
+    topup_attempts = max(0, int(os.getenv("OPEN_TOPUP_ATTEMPTS", "6") or "6"))
+    topup_sleep_s = float(os.getenv("OPEN_TOPUP_SLEEP_SEC", "0.35") or "0.35")
 
-    _log_leg_result(long_res)
-    _log_leg_result(short_res)
+    async def _filled_qty_any(res: OpenLegResult, plan: Dict[str, Any]) -> float:
+        if res.filled_qty is not None:
+            try:
+                return float(res.filled_qty)
+            except Exception:
+                return 0.0
+        if res.order_id:
+            try:
+                _ok_full, filled = await _check_filled_full(planned=plan, order_id=str(res.order_id))
+                return float(filled)
+            except Exception:
+                return 0.0
+        return 0.0
 
-    # 3) Проверка fill: весь объём исполнен (одним ордером или несколькими частичными)
-    long_filled_ok = False
-    short_filled_ok = False
-    long_filled_qty = 0.0
-    short_filled_qty = 0.0
-    if long_res.ok:
-        if long_res.filled_qty is not None:
-            long_filled_qty = long_res.filled_qty
-            long_filled_ok = long_filled_qty >= coin_amount - 1e-9
-        elif long_res.order_id:
-            long_filled_ok, long_filled_qty = await _check_filled_full(planned=long_plan, order_id=long_res.order_id)
-    if short_res.ok:
-        if short_res.filled_qty is not None:
-            short_filled_qty = short_res.filled_qty
-            short_filled_ok = short_filled_qty >= coin_amount - 1e-9
-        elif short_res.order_id:
-            short_filled_ok, short_filled_qty = await _check_filled_full(planned=short_plan, order_id=short_res.order_id)
+    def _is_min_notional_err(res: OpenLegResult) -> bool:
+        # XT: open_order_min_nominal_value_limit; Bitget: less than the minimum amount 5 USDT (45110)
+        raw = getattr(res, "raw", None)
+        if isinstance(raw, dict):
+            err = raw.get("error")
+            if isinstance(err, dict):
+                code = str(err.get("code") or "")
+                if code == "open_order_min_nominal_value_limit":
+                    return True
+            msg = str(raw.get("msg") or raw.get("msgInfo") or "").lower()
+            if "minimum amount" in msg and "usdt" in msg:
+                return True
+            if str(raw.get("code") or "") == "45110":
+                return True
+        err_s = str(getattr(res, "error", "") or "").lower()
+        return ("open_order_min_nominal_value_limit" in err_s) or ("less than the minimum amount" in err_s)
 
-    if long_res.ok and not long_filled_ok:
-        logger.error(f"❌ Ордер не исполнен полностью: {long_exchange} long | исполнено={_format_number(long_filled_qty)} {coin} | требовалось={_format_number(coin_amount)} {coin}")
-    if short_res.ok and not short_filled_ok:
-        logger.error(f"❌ Ордер не исполнен полностью: {short_exchange} short | исполнено={_format_number(short_filled_qty)} {coin} | требовалось={_format_number(coin_amount)} {coin}")
+    async def _open_leg_once(*, exchange_name: str, exchange_obj: Any, direction: str, amount: float) -> Tuple[OpenLegResult, Optional[Dict[str, Any]]]:
+        plan = await _plan_one_leg(exchange_name=exchange_name, exchange_obj=exchange_obj, coin=coin, direction=direction, coin_amount=amount)
+        if isinstance(plan, OpenLegResult) and not plan.ok:
+            return plan, None
+        if not isinstance(plan, dict):
+            return OpenLegResult(exchange=exchange_name, direction=direction, ok=False, error="preflight failed"), None
+        raw = await _place_one_leg(planned=plan)
+        res = _as_open_leg_result(raw, exchange=str(exchange_name), direction=direction)
+        _log_leg_result(res)
+        return res, plan
 
-    ok_all = bool(long_res.ok and short_res.ok and long_filled_ok and short_filled_ok)
-    long_px: Optional[float] = None
-    short_px: Optional[float] = None
-    if ok_all:
-        long_px = float(long_res.avg_price if long_res.avg_price is not None else long_plan.get("limit_price") or 0)
-        short_px = float(short_res.avg_price if short_res.avg_price is not None else short_plan.get("limit_price") or 0)
-        spread_open = None
-        if long_px > 0:
-            spread_open = (short_px - long_px) / long_px * 100.0
-        spread_str = f"{spread_open:.3f}%" if spread_open is not None else "N/A"
+    # 1) Первичное открытие обеих ног (параллельно)
+    long_task = _open_leg_once(exchange_name=long_exchange, exchange_obj=long_obj, direction="long", amount=coin_amount)
+    short_task = _open_leg_once(exchange_name=short_exchange, exchange_obj=short_obj, direction="short", amount=coin_amount)
+    (long_res, long_plan), (short_res, short_plan) = await _gather2(long_task, short_task)
+    if long_plan is None:
+        long_plan = {}
+    if short_plan is None:
+        short_plan = {}
+
+    long_filled = await _filled_qty_any(long_res, long_plan) if isinstance(long_plan, dict) else float(long_res.filled_qty or 0.0)
+    short_filled = await _filled_qty_any(short_res, short_plan) if isinstance(short_plan, dict) else float(short_res.filled_qty or 0.0)
+
+    # VWAP по ногам (best-effort)
+    long_notional = float(long_filled) * float(long_res.avg_price if long_res.avg_price is not None else (long_plan.get("limit_price") if isinstance(long_plan, dict) else 0) or 0)
+    short_notional = float(short_filled) * float(short_res.avg_price if short_res.avg_price is not None else (short_plan.get("limit_price") if isinstance(short_plan, dict) else 0) or 0)
+
+    # 2) Попытки ДОоткрыть недостающий объём
+    no_progress_streak = 0
+    stop_long_topup = False
+    stop_short_topup = False
+    for i in range(1, topup_attempts + 1):
+        long_rem = max(0.0, coin_amount - long_filled)
+        short_rem = max(0.0, coin_amount - short_filled)
+        if long_rem <= eps and short_rem <= eps:
+            break
+
         logger.info(
-            f"Биржа лонг: {long_exchange}, Цена входа Long: {long_px:.8f}, "
-            f"Биржа шорт: {short_exchange}, Цена входа Short: {short_px:.8f}, "
-            f"Количество монет: {_format_number(coin_amount)}, Спред открытия: {spread_str}"
+            f"🧩 Доооткрытие (попытка {i}/{topup_attempts}): "
+            f"Long_rem={_format_number(long_rem)} {coin} | Short_rem={_format_number(short_rem)} {coin}"
         )
-        logger.info(f"✅ Позиции открыты: {coin} | Long {long_exchange} | Short {short_exchange}")
-    else:
-        if (long_res.ok and long_filled_ok) and not (short_res.ok and short_filled_ok):
-            logger.error(f"⚠️ Открыта только Long позиция: {coin} | Long ok=True | Short ok=False")
-        elif (short_res.ok and short_filled_ok) and not (long_res.ok and long_filled_ok):
-            logger.error(f"⚠️ Открыта только Short позиция: {coin} | Long ok=False | Short ok=True")
+
+        prev_long = long_filled
+        prev_short = short_filled
+
+        # добираем только там, где есть остаток
+        if (long_rem > eps) and (not stop_long_topup):
+            res2, plan2 = await _open_leg_once(exchange_name=long_exchange, exchange_obj=long_obj, direction="long", amount=long_rem)
+            if isinstance(plan2, dict):
+                f2 = await _filled_qty_any(res2, plan2)
+            else:
+                f2 = float(res2.filled_qty or 0.0)
+            if f2 > 0:
+                ap2 = float(res2.avg_price if res2.avg_price is not None else (plan2.get("limit_price") if isinstance(plan2, dict) else 0) or 0)
+                long_notional += float(f2) * float(ap2)
+                long_filled += float(f2)
+            # если это min-notional — дальше бессмысленно пытаться добирать маленький остаток
+            if _is_min_notional_err(res2):
+                logger.warning("⚠️ Long: остаток ниже минимума ордера, прекращаем попытки добора по Long")
+                stop_long_topup = True
+        if (short_rem > eps) and (not stop_short_topup):
+            res2, plan2 = await _open_leg_once(exchange_name=short_exchange, exchange_obj=short_obj, direction="short", amount=short_rem)
+            if isinstance(plan2, dict):
+                f2 = await _filled_qty_any(res2, plan2)
+            else:
+                f2 = float(res2.filled_qty or 0.0)
+            if f2 > 0:
+                ap2 = float(res2.avg_price if res2.avg_price is not None else (plan2.get("limit_price") if isinstance(plan2, dict) else 0) or 0)
+                short_notional += float(f2) * float(ap2)
+                short_filled += float(f2)
+            if _is_min_notional_err(res2):
+                logger.warning("⚠️ Short: остаток ниже минимума ордера, прекращаем попытки добора по Short")
+                stop_short_topup = True
+
+        if abs(long_filled - prev_long) < eps and abs(short_filled - prev_short) < eps:
+            no_progress_streak += 1
+            if no_progress_streak >= 2:
+                break
         else:
-            logger.error(f"❌ Не удалось открыть позиции: {coin} | Long ok={long_res.ok and long_filled_ok} | Short ok={short_res.ok and short_filled_ok}")
-    return ok_all, long_px, short_px
+            no_progress_streak = 0
+
+        await asyncio.sleep(max(0.0, topup_sleep_s))
+
+    long_filled = min(float(long_filled), float(coin_amount))
+    short_filled = min(float(short_filled), float(coin_amount))
+
+    long_px = (long_notional / long_filled) if long_filled > eps else None
+    short_px = (short_notional / short_filled) if short_filled > eps else None
+
+    ok_any = bool(long_filled > eps and short_filled > eps)
+    if not ok_any:
+        # Safety: если открылась только одна нога — пытаемся закрыть её, чтобы не оставить голую позицию
+        if long_filled > eps and short_filled <= eps:
+            logger.error(
+                f"❌ Открылась только Long нога ({long_exchange}) объёмом {_format_number(long_filled)} {coin}."
+            )
+            should_close = True
+            if sys.stdin is not None and sys.stdin.isatty() and os.getenv("BOT_NO_PROMPT") != "1":
+                try:
+                    ans = input("Закрыть её для безопасности? Введите 'Да' или 'Нет': ").strip().lower()
+                    should_close = ans.startswith("да") or ans.startswith("yes") or ans.startswith("y")
+                except Exception:
+                    should_close = True
+            if should_close:
+                logger.warning("🧯 Закрываем открытую Long ногу для безопасности")
+                await _close_one_leg(
+                    exchange_name=long_exchange,
+                    exchange_obj=long_obj,
+                    coin=coin,
+                    position_direction="long",
+                    coin_amount=long_filled,
+                )
+            else:
+                logger.warning("⚠️ Long нога оставлена ОТКРЫТОЙ по выбору пользователя (вторая нога не открылась)")
+            return False, long_px, short_px, float(long_filled), float(short_filled)
+        if short_filled > eps and long_filled <= eps:
+            logger.error(
+                f"❌ Открылась только Short нога ({short_exchange}) объёмом {_format_number(short_filled)} {coin}."
+            )
+            should_close = True
+            if sys.stdin is not None and sys.stdin.isatty() and os.getenv("BOT_NO_PROMPT") != "1":
+                try:
+                    ans = input("Закрыть её для безопасности? Введите 'Да' или 'Нет': ").strip().lower()
+                    should_close = ans.startswith("да") or ans.startswith("yes") or ans.startswith("y")
+                except Exception:
+                    should_close = True
+            if should_close:
+                logger.warning("🧯 Закрываем открытую Short ногу для безопасности")
+                await _close_one_leg(
+                    exchange_name=short_exchange,
+                    exchange_obj=short_obj,
+                    coin=coin,
+                    position_direction="short",
+                    coin_amount=short_filled,
+                )
+            else:
+                logger.warning("⚠️ Short нога оставлена ОТКРЫТОЙ по выбору пользователя (вторая нога не открылась)")
+            return False, long_px, short_px, float(long_filled), float(short_filled)
+    if long_filled + eps < coin_amount or short_filled + eps < coin_amount:
+        logger.warning(
+            f"⚠️ Открыто не полностью: {coin} | "
+            f"Long={_format_number(long_filled)}/{_format_number(coin_amount)} ({long_exchange}) | "
+            f"Short={_format_number(short_filled)}/{_format_number(coin_amount)} ({short_exchange})"
+        )
+    else:
+        logger.info(f"✅ Позиции открыты: {coin} | Long {long_exchange} | Short {short_exchange} | qty={_format_number(coin_amount)}")
+
+    return ok_any, long_px, short_px, long_filled, short_filled
+
+
+async def _close_one_leg(
+    *,
+    exchange_name: str,
+    exchange_obj: Any,
+    coin: str,
+    position_direction: str,
+    coin_amount: float,
+) -> Tuple[bool, Optional[float]]:
+    """
+    Закрывает одну ногу позиции на указанный объём. Возвращает (успех, средняя_цена_исполнения).
+    """
+    ex = (exchange_name or "").lower().strip()
+    if ex == "bybit":
+        return await _bybit_close_leg_partial_ioc(exchange_obj=exchange_obj, coin=coin, position_direction=position_direction, coin_amount=coin_amount)
+    if ex == "gate":
+        return await _gate_close_leg_partial_ioc(exchange_obj=exchange_obj, coin=coin, position_direction=position_direction, coin_amount=coin_amount)
+    if ex == "binance":
+        return await _binance_close_leg_partial_ioc(exchange_obj=exchange_obj, coin=coin, position_direction=position_direction, coin_amount=coin_amount)
+    if ex == "bitget":
+        return await _bitget_close_leg_partial_ioc(exchange_obj=exchange_obj, coin=coin, position_direction=position_direction, coin_amount=coin_amount)
+    if ex == "bingx":
+        return await _bingx_close_leg_partial_ioc(exchange_obj=exchange_obj, coin=coin, position_direction=position_direction, coin_amount=coin_amount)
+    if ex == "xt":
+        return await _xt_close_leg_partial_ioc(exchange_obj=exchange_obj, coin=coin, position_direction=position_direction, coin_amount=coin_amount)
+    logger.error(f"❌ Авто-закрытие пока не реализовано для биржи: {exchange_name}")
+    return False, None
 
 
 async def close_long_short_positions(
@@ -334,7 +478,9 @@ async def close_long_short_positions(
     coin: str,
     long_exchange: str,
     short_exchange: str,
-    coin_amount: float,
+    coin_amount: Optional[float] = None,
+    long_coin_amount: Optional[float] = None,
+    short_coin_amount: Optional[float] = None,
 ) -> bool:
     """
     Автоматическое закрытие Long/Short позиций (две ноги) на coin_amount монет.
@@ -345,14 +491,32 @@ async def close_long_short_positions(
     - можем отправлять несколько ордеров, пока весь объем не закроется
     - пока реализовано только для Bybit и Gate
     """
-    try:
-        coin_amount_f = float(coin_amount)
-    except Exception:
-        logger.error(f"❌ Некорректное количество монет для закрытия: {coin_amount!r}")
-        return False
-    if coin_amount_f <= 0:
-        logger.error(f"❌ Количество монет для закрытия должно быть > 0, получено: {coin_amount_f}")
-        return False
+    # Поддерживаем оба режима:
+    # 1) старый: coin_amount (одинаковый объём для обеих ног)
+    # 2) новый: long_coin_amount / short_coin_amount (фактические объёмы по ногам могут отличаться)
+    if long_coin_amount is None and short_coin_amount is None:
+        try:
+            coin_amount_f = float(coin_amount) if coin_amount is not None else 0.0
+        except Exception:
+            logger.error(f"❌ Некорректное количество монет для закрытия: {coin_amount!r}")
+            return False
+        if coin_amount_f <= 0:
+            logger.error(f"❌ Количество монет для закрытия должно быть > 0, получено: {coin_amount_f}")
+            return False
+        long_amount = coin_amount_f
+        short_amount = coin_amount_f
+    else:
+        try:
+            long_amount = float(long_coin_amount or 0.0)
+            short_amount = float(short_coin_amount or 0.0)
+        except Exception:
+            logger.error(f"❌ Некорректное количество монет для закрытия: long={long_coin_amount!r}, short={short_coin_amount!r}")
+            return False
+        if long_amount < 0 or short_amount < 0:
+            logger.error(f"❌ Количество монет для закрытия должно быть >= 0, получено: long={long_amount}, short={short_amount}")
+            return False
+        if long_amount <= 0 and short_amount <= 0:
+            return True
 
     long_obj = (getattr(bot, "exchanges", {}) or {}).get(long_exchange)
     short_obj = (getattr(bot, "exchanges", {}) or {}).get(short_exchange)
@@ -361,33 +525,26 @@ async def close_long_short_positions(
         return False
 
     logger.warning(
-        f"🧯 Авто-закрытие позиций: {coin} | Long {long_exchange} + Short {short_exchange} | qty={_format_number(coin_amount_f)} {coin}"
+        f"🧯 Авто-закрытие позиций: {coin} | "
+        f"Long {long_exchange} qty={_format_number(long_amount)} {coin} | "
+        f"Short {short_exchange} qty={_format_number(short_amount)} {coin}"
     )
 
-    async def _close_one(exchange_name: str, exchange_obj: Any, position_direction: str) -> Tuple[bool, Optional[float]]:
-        """
-        Закрывает одну ногу позиции. Возвращает (успех, средняя_цена_исполнения).
-        """
-        ex = (exchange_name or "").lower().strip()
-        if ex == "bybit":
-            return await _bybit_close_leg_partial_ioc(exchange_obj=exchange_obj, coin=coin, position_direction=position_direction, coin_amount=coin_amount_f)
-        if ex == "gate":
-            return await _gate_close_leg_partial_ioc(exchange_obj=exchange_obj, coin=coin, position_direction=position_direction, coin_amount=coin_amount_f)
-        if ex == "binance":
-            return await _binance_close_leg_partial_ioc(exchange_obj=exchange_obj, coin=coin, position_direction=position_direction, coin_amount=coin_amount_f)
-        if ex == "bitget":
-            return await _bitget_close_leg_partial_ioc(exchange_obj=exchange_obj, coin=coin, position_direction=position_direction, coin_amount=coin_amount_f)
-        if ex == "bingx":
-            return await _bingx_close_leg_partial_ioc(exchange_obj=exchange_obj, coin=coin, position_direction=position_direction, coin_amount=coin_amount_f)
-        if ex == "xt":
-            return await _xt_close_leg_partial_ioc(exchange_obj=exchange_obj, coin=coin, position_direction=position_direction, coin_amount=coin_amount_f)
-        logger.error(f"❌ Авто-закрытие пока не реализовано для биржи: {exchange_name}")
-        return False, None
+    async def _close_one(exchange_name: str, exchange_obj: Any, position_direction: str, amount: float) -> Tuple[bool, Optional[float]]:
+        if amount <= 0:
+            return True, None
+        return await _close_one_leg(
+            exchange_name=exchange_name,
+            exchange_obj=exchange_obj,
+            coin=coin,
+            position_direction=position_direction,
+            coin_amount=amount,
+        )
 
     # Закрываем обе ноги (параллельно)
     # long_exchange содержит LONG позицию, short_exchange содержит SHORT позицию
-    long_task = _close_one(long_exchange, long_obj, "long")
-    short_task = _close_one(short_exchange, short_obj, "short")
+    long_task = _close_one(long_exchange, long_obj, "long", long_amount)
+    short_task = _close_one(short_exchange, short_obj, "short", short_amount)
     long_result, short_result = await _gather2(long_task, short_task)
 
     long_ok = isinstance(long_result, tuple) and len(long_result) >= 1 and long_result[0] is True
@@ -409,7 +566,8 @@ async def close_long_short_positions(
 
         logger.info(
             f"✅ Позиции закрыты: Цена выхода Long: {long_price_str}, Цена выхода Short: {short_price_str}, "
-            f"Спред закрытия: {closing_spread_str}, Количество монет: {_format_number(coin_amount_f)}"
+            f"Спред закрытия: {closing_spread_str}, "
+            f"Кол-во: Long={_format_number(long_amount)} | Short={_format_number(short_amount)}"
         )
     else:
         logger.error(f"❌ Не удалось закрыть обе позиции: {coin} | Long ok={bool(long_ok)} | Short ok={bool(short_ok)}")
@@ -1736,7 +1894,8 @@ def _log_leg_result(res: OpenLegResult) -> None:
     msg = getattr(res, "error", None) or "unknown error"
     ex = getattr(res, "exchange", "unknown")
     d = getattr(res, "direction", "unknown")
-    logger.error(f"❌ Ошибка открытия: {ex} {d} | {msg}")
+    # Открытие может частично исполниться (IOC) — это не всегда фатально (мы можем откатить и повторить).
+    logger.warning(f"⚠️ Ошибка открытия: {ex} {d} | {msg}")
 
 
 async def _plan_one_leg(
@@ -2448,6 +2607,121 @@ async def get_gate_fees_from_trades(
     return total if total > 0 else None
 
 
+async def get_bitget_fees_from_trades(
+    *,
+    exchange_obj: Any,
+    api_key: str,
+    api_secret: str,
+    api_passphrase: str,
+    coin: str,
+    direction: str,
+    start_ms: int,
+    end_ms: int,
+) -> Optional[float]:
+    """
+    Сумма комиссий в USDT по сделкам Bitget Mix за период [start_ms, end_ms].
+    direction: "long" → open_long/buy, "short" → open_short/sell.
+    Использует fills (order/allFills) — там есть поле fee.
+    """
+    symbol = exchange_obj._normalize_symbol(coin)  # e.g. BTCUSDT
+    product_type_raw = str(getattr(exchange_obj, "PRODUCT_TYPE", "") or "").strip()
+    product_type_v2 = product_type_raw or "USDT-FUTURES"  # v2-style productType used by our ticker/detail calls
+    pt_l = product_type_v2.lower()
+    # v1 Mix (legacy) uses productType like "umcbl" and symbolId like "BTCUSDT_UMCBL"
+    product_type_v1 = "umcbl"
+    if pt_l in ("umcbl", "dmcbl", "cmcbl", "sumcbl", "sdmcbl", "scmcbl"):
+        product_type_v1 = pt_l
+    elif pt_l in ("usdt-futures", "usdt_futures", "usdt futures", "usdt-future"):
+        product_type_v1 = "umcbl"
+    v1_suffix = "_" + str(product_type_v1).upper()
+    symbol_v1_id = f"{symbol}{v1_suffix}"
+    direction_l = (direction or "").lower().strip()
+
+    candidates: List[Tuple[str, Dict[str, Any]]] = [
+        # v1 (Mix) — стабильно есть fee в fills
+        ("/api/mix/v1/order/allFills", {"symbol": symbol_v1_id, "marginCoin": "USDT", "startTime": str(start_ms), "endTime": str(end_ms), "pageSize": "100"}),
+        ("/api/mix/v1/order/allFills", {"symbol": symbol_v1_id, "startTime": str(start_ms), "endTime": str(end_ms), "pageSize": "100"}),
+        # иногда требуют productType (встречается на некоторых аккаунтах/прокси)
+        ("/api/mix/v1/order/allFills", {"symbol": symbol_v1_id, "productType": str(product_type_v1), "startTime": str(start_ms), "endTime": str(end_ms), "pageSize": "100"}),
+        # fallback: вдруг у конкретного окружения ожидают символ без суффикса
+        ("/api/mix/v1/order/allFills", {"symbol": symbol, "marginCoin": "USDT", "startTime": str(start_ms), "endTime": str(end_ms), "pageSize": "100"}),
+        # v2 fallback (если есть в конкретном аккаунте/домене)
+        ("/api/v2/mix/order/all-fills", {"symbol": symbol, "productType": str(product_type_v2), "startTime": str(start_ms), "endTime": str(end_ms), "limit": "100"}),
+        ("/api/v2/mix/order/allFills", {"symbol": symbol, "productType": str(product_type_v2), "startTime": str(start_ms), "endTime": str(end_ms), "limit": "100"}),
+    ]
+
+    data: Any = None
+    used_path: Optional[str] = None
+    for path, params in candidates:
+        data = await _bitget_private_request(
+            exchange_obj=exchange_obj,
+            api_key=api_key,
+            api_secret=api_secret,
+            api_passphrase=api_passphrase,
+            method="GET",
+            path=path,
+            params=params,
+        )
+        if isinstance(data, dict) and data.get("_error"):
+            continue
+        code, _msg = _bitget_extract_code_msg(data)
+        if code is None or code == "00000":
+            used_path = path
+            break
+
+    if used_path is None:
+        if isinstance(data, dict) and data.get("_error"):
+            err_s = str(data.get("_error") or "")
+            # fills используются только для расчёта комиссий; 404 часто означает "endpoint недоступен" → это не критично
+            if "404" in err_s:
+                logger.debug("Bitget fills недоступны (404), комиссии=N/A | %s", err_s)
+            else:
+                logger.warning("Bitget fills: ошибка запроса | %s", err_s or str(data)[:200])
+        return None
+
+    items = None
+    if isinstance(data, dict):
+        raw = data.get("data")
+        if isinstance(raw, list):
+            items = raw
+        elif isinstance(raw, dict):
+            items = raw.get("list") or raw.get("fillList") or raw.get("orderList") or raw.get("data")
+    if not isinstance(items, list):
+        return None
+
+    def _side_matches(side_raw: Any) -> bool:
+        s = str(side_raw or "").lower().strip()
+        if not s:
+            return False
+        if direction_l == "long":
+            return ("open_long" in s) or (s == "buy") or ("buy" in s and "close" not in s)
+        if direction_l == "short":
+            return ("open_short" in s) or (s == "sell") or ("sell" in s and "close" not in s)
+        return False
+
+    total = 0.0
+    for t in items:
+        if not isinstance(t, dict):
+            continue
+        side = t.get("side") or t.get("tradeSide") or t.get("orderSide")
+        if not _side_matches(side):
+            continue
+
+        fee_raw = t.get("fee") or t.get("tradeFee") or t.get("totalFee") or t.get("feeAmount")
+        if fee_raw is None:
+            continue
+        try:
+            fee_val = abs(float(fee_raw))
+        except Exception:
+            continue
+
+        fee_coin = str(t.get("feeCoin") or t.get("feeCurrency") or t.get("feeAsset") or "USDT").upper()
+        if fee_coin in ("USDT", "USDC"):
+            total += fee_val
+
+    return total if total > 0 else None
+
+
 async def get_gate_funding_from_settlements(
     *,
     exchange_obj: Any,
@@ -2589,7 +2863,7 @@ async def _binance_place_leg(*, planned: Dict[str, Any]) -> OpenLegResult:
 
     if total_filled >= coin_amount - 1e-9:
         avg_price = total_notional / total_filled if total_filled > 0 else None
-        return OpenLegResult(
+    return OpenLegResult(
             exchange="binance", direction=direction, ok=True,
             order_id=last_order_id, filled_qty=total_filled, avg_price=avg_price, raw=None,
         )
@@ -2829,7 +3103,7 @@ async def _mexc_place_leg(*, planned: Dict[str, Any]) -> OpenLegResult:
 
     if total_filled >= coin_amount - 1e-9:
         avg_price = total_notional / total_filled if total_filled > 0 else None
-        return OpenLegResult(
+    return OpenLegResult(
             exchange="mexc", direction=direction, ok=True,
             order_id=last_order_id, filled_qty=total_filled, avg_price=avg_price, raw=None,
         )
@@ -3243,8 +3517,8 @@ async def _bitget_place_leg(*, planned: Dict[str, Any]) -> OpenLegResult:
     bitget_margin_mode = (os.getenv("BITGET_MARGIN_MODE", "isolated") or "").strip().lower()
     if not bitget_margin_mode or bitget_margin_mode == "cross":
         bitget_margin_mode = "crossed" if bitget_margin_mode == "cross" else "isolated"
-    if bitget_margin_mode not in ("isolated", "crossed"):
-        bitget_margin_mode = "isolated"
+        if bitget_margin_mode not in ("isolated", "crossed"):
+            bitget_margin_mode = "isolated"
 
     total_filled = 0.0
     total_notional = 0.0
@@ -3270,6 +3544,13 @@ async def _bitget_place_leg(*, planned: Dict[str, Any]) -> OpenLegResult:
         if float(qty_str) <= 0:
             break
         logger.info(f"Bitget: уровень {level_idx}/{MAX_ORDERBOOK_LEVELS} | {direction} qty={qty_str} | лимит={px_str} | осталось={_format_number(remaining)}")
+        # clientOid должен быть уникальным на уровне аккаунта; делаем короткий рандомный суффикс
+        try:
+            import uuid
+            _oid_sfx = uuid.uuid4().hex[:8]
+        except Exception:
+            _oid_sfx = str(int(time.time() * 1e6))[-8:]
+        client_oid = f"arb-{int(time.time()*1000)}-{direction}-{level_idx}-{_oid_sfx}"
         base_body = {
             "symbol": symbol,
             "productType": product_type,
@@ -3279,7 +3560,7 @@ async def _bitget_place_leg(*, planned: Dict[str, Any]) -> OpenLegResult:
             "price": px_str,
             "size": qty_str,
             "force": "ioc",
-            "clientOid": f"arb-{int(time.time()*1000)}-{direction}-{level_idx}",
+            "clientOid": client_oid,
         }
         if direction == "long":
             side_open, side_buy_sell, pos_side = "open_long", "buy", "long"
@@ -3294,6 +3575,7 @@ async def _bitget_place_leg(*, planned: Dict[str, Any]) -> OpenLegResult:
             {**base_body, "side": side_buy_sell, "tradeSide": side_open},
         ]
         data: Any = None
+        ok_body = False
         for body in candidate_bodies:
             data = await _bitget_private_request(
                 exchange_obj=exchange_obj, api_key=api_key, api_secret=api_secret,
@@ -3313,8 +3595,33 @@ async def _bitget_place_leg(*, planned: Dict[str, Any]) -> OpenLegResult:
                     )
                 if "side mismatch" in msg_l or "unilateral" in msg_l or str(code) in ("400172", "40774"):
                     continue
-                return OpenLegResult(exchange="bitget", direction=direction, ok=False, error=f"api error: {data}", raw=data)
+                avg_price = total_notional / total_filled if total_filled > 0 else None
+                return OpenLegResult(
+                    exchange="bitget",
+                    direction=direction,
+                    ok=False,
+                    order_id=last_order_id,
+                    filled_qty=total_filled,
+                    avg_price=avg_price,
+                    error=f"api error: {data}",
+                    raw=data,
+                )
+            # Успех: прекращаем перебирать варианты body (иначе получим Duplicate clientOid)
+            ok_body = True
             break
+        if not ok_body:
+            # не удалось подобрать корректный body для режима аккаунта
+            avg_price = total_notional / total_filled if total_filled > 0 else None
+            return OpenLegResult(
+                exchange="bitget",
+                direction=direction,
+                ok=False,
+                order_id=last_order_id,
+                filled_qty=total_filled,
+                avg_price=avg_price,
+                error="Bitget: не удалось подобрать параметры ордера (side/posSide/holdSide/tradeSide)",
+                raw=data,
+            )
         if not isinstance(data, dict):
             break
         item = data.get("data")
@@ -3334,8 +3641,14 @@ async def _bitget_place_leg(*, planned: Dict[str, Any]) -> OpenLegResult:
             exchange="bitget", direction=direction, ok=True,
             order_id=last_order_id, filled_qty=total_filled, avg_price=avg_price, raw=None,
         )
+    avg_price = total_notional / total_filled if total_filled > 0 else None
     return OpenLegResult(
-        exchange="bitget", direction=direction, ok=False,
+        exchange="bitget",
+        direction=direction,
+        ok=False,
+        order_id=last_order_id,
+        filled_qty=total_filled,
+        avg_price=avg_price,
         error=f"не набрали объём за {MAX_ORDERBOOK_LEVELS} уровней: исполнено={_format_number(total_filled)}, требовалось={_format_number(coin_amount)}",
     )
 
@@ -3711,7 +4024,7 @@ async def _bingx_close_leg_partial_ioc(*, exchange_obj: Any, coin: str, position
 
             if not isinstance(data, dict):
                 logger.error(f"❌ BingX close: api error: {data}")
-                continue
+            continue
 
             if data.get("_error") or str(data.get("code")) not in (None, "0"):
                 logger.error(f"❌ BingX close: api error: {data}")
@@ -4175,7 +4488,7 @@ async def _bybit_place_leg(*, planned: Dict[str, Any]) -> OpenLegResult:
 
     if total_filled >= coin_amount - 1e-9:
         avg_price = total_notional / total_filled if total_filled > 0 else None
-        return OpenLegResult(
+    return OpenLegResult(
             exchange="bybit", direction=direction, ok=True,
             order_id=last_order_id, filled_qty=total_filled, avg_price=avg_price, raw=None,
         )
@@ -4362,7 +4675,7 @@ async def _gate_place_leg(*, planned: Dict[str, Any]) -> OpenLegResult:
 
     if total_filled_base >= coin_amount - 1e-9:
         avg_price = total_notional / total_filled_base if total_filled_base > 0 else None
-        return OpenLegResult(
+    return OpenLegResult(
             exchange="gate", direction=direction, ok=True,
             order_id=last_order_id, filled_qty=total_filled_base, avg_price=avg_price, raw=None,
         )
@@ -4716,6 +5029,136 @@ async def _xt_fetch_instrument_filters(*, exchange_obj: Any, symbol: str) -> Dic
     return {}
 
 
+async def _xt_get_position_qty_contracts(
+    *,
+    exchange_obj: Any,
+    api_key: str,
+    api_secret: str,
+    symbol: str,
+    position_side: str,  # "LONG" | "SHORT"
+) -> Optional[float]:
+    """
+    Best-effort: возвращает текущий размер позиции на XT в КОНТРАКТАХ (как отдаёт endpoint позиции).
+    Используется для проверки "позиция уже 0" при странных ошибках закрытия.
+    """
+    try:
+        data = await _xt_private_request(
+            exchange_obj=exchange_obj,
+            api_key=api_key,
+            api_secret=api_secret,
+            method="GET",
+            path="/future/user/v1/position/list",
+            params={"symbol": str(symbol)},
+        )
+    except Exception:
+        return None
+
+    if not isinstance(data, dict) or data.get("returnCode") != 0:
+        return None
+
+    result = data.get("result")
+    positions: List[Dict[str, Any]] = []
+    if isinstance(result, list):
+        positions = [p for p in result if isinstance(p, dict)]
+    elif isinstance(result, dict):
+        raw_list = result.get("list") or result.get("data") or result.get("positions")
+        if isinstance(raw_list, list):
+            positions = [p for p in raw_list if isinstance(p, dict)]
+        else:
+            positions = [result]
+    elif isinstance(data.get("data"), list):
+        positions = [p for p in data.get("data") if isinstance(p, dict)]
+
+    sym_l = str(symbol).lower().strip()
+    ps_u = str(position_side).upper().strip()  # "LONG" | "SHORT"
+
+    def _norm_side(v: Any) -> str:
+        s = str(v or "").strip().upper()
+        if not s:
+            return ""
+        if "LONG" in s or s in ("BUY", "1"):
+            return "LONG"
+        if "SHORT" in s or s in ("SELL", "2"):
+            return "SHORT"
+        return s
+
+    long_total = 0.0
+    short_total = 0.0
+    unknown_total = 0.0
+    saw_symbol = False
+
+    for p in positions:
+        p_sym = p.get("symbol") or p.get("contract") or p.get("pair") or p.get("instId")
+        if p_sym is not None and str(p_sym).strip():
+            if str(p_sym).lower().strip() != sym_l:
+                continue
+
+        # qty: пытаемся взять "signed" поле раньше (если оно есть)
+        qty_candidates = [
+            ("positionAmt", p.get("positionAmt")),  # часто signed (long>0 / short<0)
+            ("positionQty", p.get("positionQty")),
+            ("qty", p.get("qty")),
+            ("holdVol", p.get("holdVol")),
+            ("volume", p.get("volume")),
+            ("size", p.get("size")),
+            ("availableQty", p.get("availableQty")),
+            ("available", p.get("available")),
+            ("total", p.get("total")),
+        ]
+        qty_key = None
+        qty_raw = None
+        for k, v in qty_candidates:
+            if v is not None:
+                qty_key = k
+                qty_raw = v
+                break
+        if qty_raw is None:
+            continue
+
+        try:
+            qty_val = float(qty_raw)
+        except Exception:
+            continue
+
+        saw_symbol = True
+
+        side_raw = p.get("positionSide") or p.get("posSide") or p.get("holdSide") or p.get("side")
+        side = _norm_side(side_raw)
+
+        if side == "LONG":
+            long_total += abs(qty_val)
+            continue
+        if side == "SHORT":
+            short_total += abs(qty_val)
+            continue
+
+        # Если side не распознан — пытаемся infer только когда поле вероятно signed.
+        if qty_key == "positionAmt":
+            if qty_val > 0:
+                long_total += abs(qty_val)
+            elif qty_val < 0:
+                short_total += abs(qty_val)
+            # qty_val == 0 → игнор
+        else:
+            unknown_total += abs(qty_val)
+
+    # Если по этому symbol нет ни одной записи — трактуем как "позиция 0".
+    # Это важно для сценария, когда биржа не возвращает нулевые позиции в списке.
+    if not saw_symbol:
+        return 0.0
+
+    # Если есть распознанные стороны — возвращаем конкретную сторону (0 тоже ок).
+    if long_total > 0.0 or short_total > 0.0:
+        return long_total if ps_u == "LONG" else short_total
+
+    # Если всё нулевое и нет "unknown" — позиция 0.
+    if unknown_total <= 0.0:
+        return 0.0
+
+    # Есть объём, но нельзя уверенно определить сторону.
+    return None
+
+
 async def _xt_plan_leg(*, exchange_obj: Any, coin: str, direction: str, coin_amount: float) -> Any:
     api_key = _get_env("XT_API_KEY")
     api_secret = _get_env("XT_API_SECRET")
@@ -4755,8 +5198,8 @@ async def _xt_plan_leg(*, exchange_obj: Any, coin: str, direction: str, coin_amo
     if qty_step > 0 and not _is_multiple_of_step(contracts, qty_step):
         return OpenLegResult(
             exchange="xt",
-            direction=direction,
-            ok=False,
+        direction=direction,
+        ok=False,
             error=f"qty {coin_amount} {coin} (= {contracts} contracts) not multiple of qtyStep {qty_step_raw}",
         )
     if min_qty > 0 and contracts < min_qty:
@@ -4948,7 +5391,20 @@ async def _xt_place_leg(*, planned: Dict[str, Any]) -> OpenLegResult:
             data = last_error or {"_error": "all endpoints failed"}
         
         if not isinstance(data, dict) or data.get("returnCode") != 0:
-            return OpenLegResult(exchange="xt", direction=direction, ok=False, error=f"api error: {data}", raw=data)
+            # ВАЖНО: открытие должно быть на полный объём.
+            # Если не можем добрать остаток (например, min nominal) — возвращаем ошибку, но с filled_qty,
+            # чтобы вызывающий код мог откатить (закрыть) частично открытый объём и повторить попытку.
+            avg_price = total_notional / total_filled if total_filled > 0 else None
+            return OpenLegResult(
+                exchange="xt",
+                direction=direction,
+                ok=False,
+                order_id=last_order_id or None,
+                filled_qty=total_filled,
+                avg_price=avg_price,
+                error=f"api error: {data}",
+                raw=data,
+            )
         
         # XT.com может возвращать orderId в разных местах
         # Проверяем несколько возможных путей
@@ -4982,7 +5438,7 @@ async def _xt_place_leg(*, planned: Dict[str, Any]) -> OpenLegResult:
         await asyncio.sleep(0.15)
 
         detail: Any = None
-        for _poll in range(8):  # up to ~1.6s
+        for _poll in range(15):  # up to ~3s
             detail = await _xt_private_request(
                 exchange_obj=exchange_obj,
                 api_key=api_key,
@@ -5093,8 +5549,14 @@ async def _xt_place_leg(*, planned: Dict[str, Any]) -> OpenLegResult:
             exchange="xt", direction=direction, ok=True,
             order_id=last_order_id, filled_qty=total_filled, avg_price=avg_price, raw=None,
         )
+    avg_price = total_notional / total_filled if total_filled > 0 else None
     return OpenLegResult(
-        exchange="xt", direction=direction, ok=False,
+        exchange="xt",
+        direction=direction,
+        ok=False,
+        order_id=last_order_id,
+        filled_qty=total_filled,
+        avg_price=avg_price,
         error=f"не набрали объём за {MAX_ORDERBOOK_LEVELS} уровней: исполнено={_format_number(total_filled)}, требовалось={_format_number(coin_amount)}",
     )
 
@@ -5131,6 +5593,8 @@ async def _xt_close_leg_partial_ioc(
     
     f = await _xt_fetch_instrument_filters(exchange_obj=exchange_obj, symbol=symbol)
     qty_step_raw = f.get("qtyStep")
+    min_qty_raw = f.get("minOrderQty")
+    min_amt_raw = f.get("minOrderAmt")
     tick_raw = f.get("tickSize")
     contract_size_raw = f.get("contractSize")
     contract_size = float(contract_size_raw) if contract_size_raw else 1.0
@@ -5147,6 +5611,9 @@ async def _xt_close_leg_partial_ioc(
         logger.warning(f"⚠️ XT close: tickSize отсутствует для {symbol}, fallback tickSize=0.0001")
         tick_raw = "0.0001"
     tick = float(tick_raw) if tick_raw else 0.0001
+
+    min_qty = float(min_qty_raw) if min_qty_raw else 0.0  # contracts
+    min_amt = float(min_amt_raw) if min_amt_raw else 0.0  # USDT notional (best-effort)
     
     eps = max(1e-10, remaining * 1e-8)
     total_notional = 0.0
@@ -5157,6 +5624,7 @@ async def _xt_close_leg_partial_ioc(
     MAX_TOTAL_SEC = float(os.getenv("FUN_CLOSE_MAX_TOTAL_SEC", "30.0") or "30.0")
     
     start_ts = time.time()
+    last_px_used: Optional[float] = None
     
     def _first_dict(x: Any) -> Optional[Dict[str, Any]]:
         if isinstance(x, dict):
@@ -5220,10 +5688,35 @@ async def _xt_close_leg_partial_ioc(
         if qty_step > 0:
             qty_send_contracts = _floor_to_step(qty_send_contracts, qty_step)
             if qty_send_contracts <= 0:
+                if remaining <= eps:
+                    avg_price = (total_notional / total_filled) if total_filled > 0 else None
+                    return True, avg_price
+                logger.error(f"❌ XT close: не могу представить remaining по qtyStep: remaining={_format_number(remaining)} {coin} | qtyStep={qty_step_raw}")
                 avg_price = (total_notional / total_filled) if total_filled > 0 else None
+                return False, avg_price
+
+        # Минимальные ограничения (best-effort): если остаток меньше минимума — лимитным ордером не закрыть
+        if min_qty > 0 and qty_send_contracts + 1e-12 < min_qty:
+            # Возможно позиция уже закрыта, но API/стакан отстаёт — проверяем позицию по user/position/list
+            pos_q = await _xt_get_position_qty_contracts(
+                exchange_obj=exchange_obj,
+                api_key=api_key,
+                api_secret=api_secret,
+                symbol=symbol,
+                position_side=position_side,
+            )
+            if pos_q is not None and pos_q <= max(1e-12, float(qty_step) * 0.5):
+                avg_price = (total_notional / total_filled) if total_filled > 0 else last_px_used
+                logger.info("✅ XT close: позиция уже 0 по /future/user/v1/position/list")
                 return True, avg_price
+            logger.error(
+                f"❌ XT close: remaining ниже minOrderQty: remaining_contracts={_format_number(qty_send_contracts)} < {min_qty_raw} | remaining={_format_number(remaining)} {coin}"
+            )
+            avg_price = (total_notional / total_filled) if total_filled > 0 else None
+            return False, avg_price
         qty_str = _format_by_step(qty_send_contracts, qty_step_raw) if qty_step > 0 else str(qty_send_contracts)
         px = _round_price_for_side(float(px_level), tick, "sell" if order_side == "SELL" else "buy")
+        last_px_used = float(px)
         px_str = _format_by_step(px, tick_raw) if tick > 0 else str(px)
         
         logger.info(
@@ -5252,6 +5745,24 @@ async def _xt_close_leg_partial_ioc(
         )
         
         if not isinstance(data, dict) or data.get("returnCode") != 0:
+            err = data.get("error") if isinstance(data, dict) else None
+            err_code = err.get("code") if isinstance(err, dict) else None
+            # ВАЖНО: закрытие должно быть до конца. Не считаем закрытие успешным по одному коду ошибки.
+            if err_code in ("insufficient_leveling_quantity", "open_order_min_nominal_value_limit"):
+                pos_q = await _xt_get_position_qty_contracts(
+                    exchange_obj=exchange_obj,
+                    api_key=api_key,
+                    api_secret=api_secret,
+                    symbol=symbol,
+                    position_side=position_side,
+                )
+                if pos_q is not None and pos_q <= max(1e-12, float(qty_step) * 0.5):
+                    avg_price = (total_notional / total_filled) if total_filled > 0 else last_px_used
+                    logger.info("✅ XT close: позиция уже 0 по /future/user/v1/position/list")
+                    return True, avg_price
+                logger.error(f"❌ XT close: не удалось выставить ордер на остаток (err={err_code}) | remaining={_format_number(remaining)} {coin} | data={data}")
+                avg_price = (total_notional / total_filled) if total_filled > 0 else None
+                return False, avg_price
             logger.error(f"❌ XT close: api error: {data}")
             return False, None
         
@@ -5299,6 +5810,8 @@ async def _xt_close_leg_partial_ioc(
         await asyncio.sleep(0)
     
     avg_price = (total_notional / total_filled) if total_filled > 0 else None
+    if avg_price is None and remaining <= eps:
+        avg_price = last_px_used
     return remaining <= eps, avg_price
 
 

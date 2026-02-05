@@ -997,6 +997,15 @@ async def main():
                         )
                         opened_ok = open_result[0] if isinstance(open_result, (tuple, list)) else bool(open_result)
                         if opened_ok:
+                            # Если ноги открылись на разный объём — для мониторинга используем хеджируемую часть (min)
+                            if isinstance(open_result, (tuple, list)) and len(open_result) >= 5:
+                                try:
+                                    long_q = float(open_result[3] or 0.0)
+                                    short_q = float(open_result[4] or 0.0)
+                                    if long_q > 0 and short_q > 0:
+                                        monitoring_data["coin_amount"] = min(long_q, short_q)
+                                except Exception:
+                                    pass
                             should_monitor = True
                             # После успешного открытия позиций мониторинг запускается с указанным порогом закрытия
                             # close_threshold_pct уже установлен выше

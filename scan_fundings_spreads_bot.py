@@ -41,6 +41,7 @@ from position_opener import (
     get_xt_fees_from_trades,
     get_gate_fees_from_trades,
     get_gate_funding_from_settlements,
+    get_bitget_fees_from_trades,
 )
 from telegram_sender import TelegramSender
 from fun import _bybit_fetch_executions, _bybit_fetch_funding_from_transaction_log
@@ -208,7 +209,24 @@ async def _get_real_fees_from_executions(
                 end_ms=end_ms,
             )
         
-        # TODO: Реализовать получение комиссий для MEXC, Bitget, BingX
+        if exchange_name.lower() == "bitget":
+            end_ms = int(time.time() * 1000)
+            start_ms = end_ms - (time_window_sec * 1000)
+            api_pass = os.getenv("BITGET_API_PASSPHRASE", "").strip()
+            if not api_pass:
+                return None
+            return await get_bitget_fees_from_trades(
+                exchange_obj=exchange_obj,
+                api_key=api_key,
+                api_secret=api_secret,
+                api_passphrase=api_pass,
+                coin=coin,
+                direction=direction,
+                start_ms=start_ms,
+                end_ms=end_ms,
+            )
+        
+        # TODO: Реализовать получение комиссий для MEXC, BingX
         return None
         
     except Exception as e:
@@ -283,7 +301,8 @@ async def _get_real_funding_usdt(
 
 
 def _calculate_pnl_usdt(
-    coin_amount: float,
+    long_coin_amount: float,
+    short_coin_amount: float,
     ask_long_open: Optional[float],
     bid_long_current: Optional[float],
     bid_short_open: Optional[float],
@@ -303,16 +322,16 @@ def _calculate_pnl_usdt(
         bid_short_open is None or ask_short_current is None):
         return None
 
-    if coin_amount <= 0 or ask_long_open <= 0 or ask_short_current <= 0:
+    if long_coin_amount <= 0 or short_coin_amount <= 0 or ask_long_open <= 0 or ask_short_current <= 0:
         return None
 
     # Long: покупаем по ask_long_open, продаем по bid_long_current; при fee_long=None комиссию не считаем
     fee_l = fee_long if fee_long is not None else 0.0
     fee_s = fee_short if fee_short is not None else 0.0
-    pnl_long = (bid_long_current - ask_long_open) * coin_amount - fee_l
+    pnl_long = (bid_long_current - ask_long_open) * long_coin_amount - fee_l
 
     # Short: продаем по bid_short_open, покупаем по ask_short_current
-    pnl_short = (bid_short_open - ask_short_current) * coin_amount - fee_s
+    pnl_short = (bid_short_open - ask_short_current) * short_coin_amount - fee_s
 
     total = pnl_long + pnl_short
     if funding_impact_usdt is not None:
@@ -325,7 +344,8 @@ async def _monitor_until_close(
     coin: str,
     long_exchange: str,
     short_exchange: str,
-    coin_amount: float,
+    long_coin_amount: float,
+    short_coin_amount: float,
     close_threshold_pct: Optional[float] = None,
     close_positions_on_trigger: bool = True,
     ask_long_open: Optional[float] = None,
@@ -472,8 +492,8 @@ async def _monitor_until_close(
                 funding_short_usdt: Optional[float] = None
                 if open_time is not None and frozen_ask_long_open is not None and frozen_bid_short_open is not None:
                     elapsed_sec = time.time() - open_time
-                    notional_long = frozen_ask_long_open * coin_amount
-                    notional_short = frozen_bid_short_open * coin_amount
+                    notional_long = frozen_ask_long_open * long_coin_amount
+                    notional_short = frozen_bid_short_open * short_coin_amount
                     if close_positions_on_trigger:
                         # Реальные позиции: только фактические данные с бирж. L и S показываем по отдельности (N/A если нет данных).
                         real_funding_long = await _get_real_funding_usdt(bot, long_exchange, coin, open_time)
@@ -547,7 +567,8 @@ async def _monitor_until_close(
 
                 # Расчет PNL: + комиссии + фандинг за прошедшие периоды
                 pnl_usdt = _calculate_pnl_usdt(
-                    coin_amount=coin_amount,
+                    long_coin_amount=long_coin_amount,
+                    short_coin_amount=short_coin_amount,
                     ask_long_open=pnl_ask_long_open,
                     bid_long_current=bid_long,
                     bid_short_open=pnl_bid_short_open,
@@ -608,7 +629,8 @@ async def _monitor_until_close(
                             coin=coin,
                             long_exchange=long_exchange,
                             short_exchange=short_exchange,
-                            coin_amount=coin_amount,
+                            long_coin_amount=long_coin_amount,
+                            short_coin_amount=short_coin_amount,
                         )
                         if ok_closed:
                             logger.info("Позиции закрыты, мониторинг остановлен")
@@ -673,7 +695,8 @@ async def _monitor_until_close(
                             coin=coin,
                             long_exchange=long_exchange,
                             short_exchange=short_exchange,
-                            coin_amount=coin_amount,
+                            long_coin_amount=long_coin_amount,
+                            short_coin_amount=short_coin_amount,
                         ),
                         timeout=30.0
                     )
@@ -716,16 +739,17 @@ async def _monitor_until_close(
                         # 3) L/S доход (включая фандинг; при N/A фандинг = 0)
                         income_l = None
                         if bid_long_close is not None and frozen_ask_long_open is not None:
-                            income_l = (bid_long_close - frozen_ask_long_open) * coin_amount - fee_l_open - fee_l_close + fund_l_usdt
+                            income_l = (bid_long_close - frozen_ask_long_open) * long_coin_amount - fee_l_open - fee_l_close + fund_l_usdt
                         income_s = None
                         if ask_short_close is not None and frozen_bid_short_open is not None:
-                            income_s = (frozen_bid_short_open - ask_short_close) * coin_amount - fee_s_open - fee_s_close + fund_s_usdt
+                            income_s = (frozen_bid_short_open - ask_short_close) * short_coin_amount - fee_s_open - fee_s_close + fund_s_usdt
                         income_l_str = f"{income_l:.8f}" if income_l is not None else "N/A"
                         income_s_str = f"{income_s:.8f}" if income_s is not None else "N/A"
                         logger.info(f"L доход: {income_l_str} | S доход: {income_s_str}")
                         # 4) Финальный PNL
                         final_pnl = _calculate_pnl_usdt(
-                            coin_amount=coin_amount,
+                            long_coin_amount=long_coin_amount,
+                            short_coin_amount=short_coin_amount,
                             ask_long_open=frozen_ask_long_open,
                             bid_long_current=bid_long_close,
                             bid_short_open=frozen_bid_short_open,
@@ -813,7 +837,7 @@ async def main():
             else:
                 logger.info("Порог закрытия не указан, мониторинг без порога закрытия")
 
-            opened_ok, long_px_actual, short_px_actual = await open_long_short_positions(
+            opened_ok, long_px_actual, short_px_actual, long_coin_amount, short_coin_amount = await open_long_short_positions(
                 bot=bot,
                 coin=coin,
                 long_exchange=long_exchange,
@@ -823,6 +847,16 @@ async def main():
             if not opened_ok:
                 logger.error("Не удалось открыть позиции, мониторинг не запущен")
                 return
+
+            # Фактические цены исполнения (из результата открытия) — для единых цен в логе мониторинга и оценки комиссии.
+            ask_long_open = long_px_actual if long_px_actual is not None else None
+            bid_short_open = short_px_actual if short_px_actual is not None else None
+
+            logger.info(
+                f"Фактический объём открытия: Long={format_number(long_coin_amount)} {coin} ({long_exchange}) | "
+                f"Short={format_number(short_coin_amount)} {coin} ({short_exchange}) | "
+                f"запрос={format_number(coin_amount)} {coin}"
+            )
             
             # Получаем реальные комиссии из исполненных сделок
             # Ждем немного, чтобы executions успели появиться в API
@@ -842,6 +876,7 @@ async def main():
                 direction="short",
                 time_window_sec=10,
             )
+
             # При None комиссия в PNL не учитывается, в логе — N/A
             fee_long_str = format_number(fee_long) if fee_long is not None else "N/A"
             fee_short_str = format_number(fee_short) if fee_short is not None else "N/A"
@@ -853,18 +888,34 @@ async def main():
                 "coin": coin,
                 "long_exchange": long_exchange,
                 "short_exchange": short_exchange,
-                "coin_amount": coin_amount,
+                "requested_coin_amount": coin_amount,
+                "long_coin_amount": long_coin_amount,
+                "short_coin_amount": short_coin_amount,
             }
-            # Фактические цены исполнения (из результата открытия) — для единых цен в логе мониторинга
-            ask_long_open = long_px_actual if long_px_actual is not None else None
-            bid_short_open = short_px_actual if short_px_actual is not None else None
+            # Старый лог (по просьбе пользователя): фиксируем биржи/цены входа/спред открытия перед стартом мониторинга
+            ask_long_str = f"{ask_long_open:.8f}" if ask_long_open is not None else "N/A"
+            bid_short_str = f"{bid_short_open:.8f}" if bid_short_open is not None else "N/A"
+            opening_spread_pct: Optional[float] = None
+            if ask_long_open is not None and bid_short_open is not None and ask_long_open > 0:
+                opening_spread_pct = (bid_short_open - ask_long_open) / ask_long_open * 100.0
+            opening_spread_str = f"{opening_spread_pct:.3f}%" if opening_spread_pct is not None else "N/A"
+            logger.info(
+                "Биржа лонг: %s, Цена входа Long: %s, Биржа шорт: %s, Цена входа Short: %s, Количество монет: %s, Спред открытия: %s",
+                long_exchange,
+                ask_long_str,
+                short_exchange,
+                bid_short_str,
+                format_number(coin_amount),
+                opening_spread_str,
+            )
             try:
                 await _monitor_until_close(
                     bot=bot,
                     coin=coin,
                     long_exchange=long_exchange,
                     short_exchange=short_exchange,
-                    coin_amount=coin_amount,
+                    long_coin_amount=long_coin_amount,
+                    short_coin_amount=short_coin_amount,
                     close_threshold_pct=close_threshold_pct,
                     close_positions_on_trigger=True,
                     ask_long_open=ask_long_open,
@@ -881,7 +932,8 @@ async def main():
                         coin=positions_info["coin"],
                         long_exchange=positions_info["long_exchange"],
                         short_exchange=positions_info["short_exchange"],
-                        coin_amount=positions_info["coin_amount"],
+                        long_coin_amount=positions_info["long_coin_amount"],
+                        short_coin_amount=positions_info["short_coin_amount"],
                     )
                     if ok_closed:
                         logger.info("Позиции закрыты")
@@ -925,7 +977,8 @@ async def main():
             coin=coin,
             long_exchange=long_exchange,
             short_exchange=short_exchange,
-            coin_amount=coin_amount,
+            long_coin_amount=coin_amount,
+            short_coin_amount=coin_amount,
             close_threshold_pct=close_threshold_pct,
             close_positions_on_trigger=False,
             ask_long_open=ask_long_open,
@@ -945,7 +998,8 @@ async def main():
                     coin=positions_info["coin"],
                     long_exchange=positions_info["long_exchange"],
                     short_exchange=positions_info["short_exchange"],
-                    coin_amount=positions_info["coin_amount"],
+                    long_coin_amount=positions_info["long_coin_amount"],
+                    short_coin_amount=positions_info["short_coin_amount"],
                 )
                 if ok_closed:
                     logger.info("Позиции закрыты")
@@ -964,7 +1018,8 @@ async def main():
                     coin=positions_info["coin"],
                     long_exchange=positions_info["long_exchange"],
                     short_exchange=positions_info["short_exchange"],
-                    coin_amount=positions_info["coin_amount"],
+                    long_coin_amount=positions_info["long_coin_amount"],
+                    short_coin_amount=positions_info["short_coin_amount"],
                 )
                 if ok_closed:
                     logger.info("Позиции закрыты")
