@@ -53,44 +53,48 @@ class AsyncMexcExchange(AsyncBaseExchange):
     def __init__(self, pool_limit: int = 100):
         super().__init__("MEXC", pool_limit)
         self._mexc_dynamic_aliases: Optional[Dict[str, str]] = None
+        # Защищаем загрузку алиасов от гонок: при старте много параллельных запросов
+        # могут одновременно вызвать contract/detail и/или перезаписать результат {} при ошибке.
+        self._mexc_alias_lock = asyncio.Lock()
 
-    async def _ensure_mexc_aliases_loaded(self) -> None:
+    async def _ensure_mexc_aliases_loaded(self, force_reload: bool = False) -> None:
         """Один раз загрузить алиасы из API contract/detail (логика как в scripts/mexc_alias_check.py)."""
-        if self._mexc_dynamic_aliases is not None:
-            return
-        try:
-            data = await self._request_json_with_domain_fallback(
-                "GET", "/api/v1/contract/detail", params={},
-                retries_per_domain=1, backoff_s=0.25,
-            )
-            if not isinstance(data, dict) or data.get("code") != 0:
-                self._mexc_dynamic_aliases = {}
+        async with self._mexc_alias_lock:
+            if self._mexc_dynamic_aliases is not None and not force_reload:
                 return
-            items = data.get("data") or []
-            if not isinstance(items, list):
+            try:
+                data = await self._request_json_with_domain_fallback(
+                    "GET", "/api/v1/contract/detail", params={},
+                    retries_per_domain=1, backoff_s=0.25,
+                )
+                if not isinstance(data, dict) or data.get("code") != 0:
+                    self._mexc_dynamic_aliases = {}
+                    return
+                items = data.get("data") or []
+                if not isinstance(items, list):
+                    self._mexc_dynamic_aliases = {}
+                    return
+                aliases: Dict[str, str] = {}
+                for it in items:
+                    if not isinstance(it, dict):
+                        continue
+                    sym = it.get("symbol") or ""
+                    if not sym.endswith("_USDT"):
+                        continue
+                    settle = (it.get("settleCoin") or "").upper()
+                    if settle != "USDT":
+                        continue
+                    state = str(it.get("state", ""))
+                    if state in ("3", "4", "5"):
+                        continue
+                    coin, symbol = _mexc_coin_from_contract(it)
+                    if coin and symbol:
+                        aliases[coin] = symbol
+                self._mexc_dynamic_aliases = aliases
+                logger.debug(f"MEXC: загружено {len(aliases)} алиасов из contract/detail")
+            except Exception as e:
+                logger.debug(f"MEXC: не удалось загрузить алиасы: {e}")
                 self._mexc_dynamic_aliases = {}
-                return
-            aliases: Dict[str, str] = {}
-            for it in items:
-                if not isinstance(it, dict):
-                    continue
-                sym = it.get("symbol") or ""
-                if not sym.endswith("_USDT"):
-                    continue
-                settle = (it.get("settleCoin") or "").upper()
-                if settle != "USDT":
-                    continue
-                state = str(it.get("state", ""))
-                if state in ("3", "4", "5"):
-                    continue
-                coin, symbol = _mexc_coin_from_contract(it)
-                if coin and symbol:
-                    aliases[coin] = symbol
-            self._mexc_dynamic_aliases = aliases
-            logger.debug(f"MEXC: загружено {len(aliases)} алиасов из contract/detail")
-        except Exception as e:
-            logger.debug(f"MEXC: не удалось загрузить алиасы: {e}")
-            self._mexc_dynamic_aliases = {}
 
     def _normalize_symbol(self, coin: str) -> str:
         """
@@ -319,6 +323,7 @@ class AsyncMexcExchange(AsyncBaseExchange):
     async def get_futures_ticker(self, coin: str) -> Optional[Dict]:
         """
         Тикер: GET /api/v1/contract/ticker?symbol=...
+        При ошибке пытается обновить алиасы и повторить запрос.
         """
         try:
             await self._ensure_mexc_aliases_loaded()
@@ -331,6 +336,7 @@ class AsyncMexcExchange(AsyncBaseExchange):
             # 2) если ответ странный/ошибочный — пробуем COINUSDT
             code_int = _to_int(data.get("code")) if isinstance(data, dict) else None
             looks_empty = self._looks_empty_top(data)
+            symbol_fallback = None
 
             if (not data) or looks_empty or (code_int is not None and code_int != 0):
                 symbol_fallback = symbol.replace("_", "")
@@ -347,6 +353,34 @@ class AsyncMexcExchange(AsyncBaseExchange):
                     # оставляем исходный data (он нужен для корректной диагностики ниже)
                     data = data2 if data2 is not None else data
                     code_int = _to_int(data.get("code")) if isinstance(data, dict) else code_int
+
+            # 3) Если все еще ошибка — обновляем алиасы и пробуем снова
+            if (not data) or (isinstance(data, dict) and self._looks_empty_top(data)) or (code_int is not None and code_int != 0):
+                # Обновляем алиасы только если они уже были загружены (чтобы не делать лишний запрос при первой загрузке)
+                if self._mexc_dynamic_aliases is not None:
+                    logger.debug(f"MEXC: обновление алиасов и повторная попытка для {coin}")
+                    await self._ensure_mexc_aliases_loaded(force_reload=True)
+                    symbol_retry = self._normalize_symbol(coin)
+                    if symbol_retry != symbol and (symbol_fallback is None or symbol_retry != symbol_fallback):
+                        logger.debug(f"MEXC: повторная попытка с обновленным символом {symbol_retry} для {coin}")
+                        data_retry = await self._request_json_with_domain_fallback("GET", url, params={"symbol": symbol_retry})
+                        code_retry = _to_int(data_retry.get("code")) if isinstance(data_retry, dict) else None
+                        looks_empty_retry = isinstance(data_retry, dict) and self._looks_empty_top(data_retry) if data_retry else False
+                        if data_retry and isinstance(data_retry, dict) and code_retry == 0 and not looks_empty_retry:
+                            data = data_retry
+                            symbol = symbol_retry
+                            code_int = code_retry
+                        elif not data_retry or (code_retry is not None and code_retry != 0) or looks_empty_retry:
+                            # Пробуем fallback с обновленным символом
+                            symbol_fallback_retry = symbol_retry.replace("_", "")
+                            if symbol_fallback is None or symbol_fallback_retry != symbol_fallback:
+                                data_fallback_retry = await self._request_json_with_domain_fallback("GET", url, params={"symbol": symbol_fallback_retry})
+                                code_fallback_retry = _to_int(data_fallback_retry.get("code")) if isinstance(data_fallback_retry, dict) else None
+                                looks_empty_fallback_retry = isinstance(data_fallback_retry, dict) and self._looks_empty_top(data_fallback_retry) if data_fallback_retry else False
+                                if data_fallback_retry and isinstance(data_fallback_retry, dict) and code_fallback_retry == 0 and not looks_empty_fallback_retry:
+                                    data = data_fallback_retry
+                                    symbol = symbol_fallback_retry
+                                    code_int = code_fallback_retry
 
             if not data:
                 # это может быть сеть/домен/HTTP — но это уже залогировано в domain_fallback как debug,

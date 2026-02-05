@@ -205,8 +205,9 @@ async def fetch(
     exchange = bot.exchanges.get(ex)
     if not exchange:
         return None
-    timeout_ticker = REQ_TIMEOUT_SEC
-    timeout_funding = MEXC_REQ_TIMEOUT_SEC if ex.lower() == "mexc" else REQ_TIMEOUT_SEC
+    is_mexc = ex.lower() == "mexc"
+    timeout_ticker = MEXC_REQ_TIMEOUT_SEC if is_mexc else REQ_TIMEOUT_SEC
+    timeout_funding = MEXC_REQ_TIMEOUT_SEC if is_mexc else REQ_TIMEOUT_SEC
     try:
         async with sem:
             ticker = await asyncio.wait_for(
