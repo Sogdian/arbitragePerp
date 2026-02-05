@@ -58,6 +58,9 @@ except ImportError:
 # Логируем в __main__, чтобы совпадало с основным логгером bot.py
 logger = logging.getLogger("__main__")
 
+# Одноразовый лог подсказки XT Abusive Trading (не спамить при каждой попытке доооткрытия)
+_xt_abusive_hint_logged: set = set()
+
 # Глубина стакана при открытии: уровни 1..N, с первого уровня частичные ордера (IOC) до набора объёма.
 MAX_ORDERBOOK_LEVELS = max(1, int(os.getenv("OPEN_ORDERBOOK_LEVELS", "10") or "10"))
 
@@ -2638,15 +2641,16 @@ async def get_bitget_fees_from_trades(
     symbol_v1_id = f"{symbol}{v1_suffix}"
     direction_l = (direction or "").lower().strip()
 
+    # Официально: GET /api/v2/mix/order/fills — возвращает data.fillList с feeDetail[].totalFee (документация Bitget)
     candidates: List[Tuple[str, Dict[str, Any]]] = [
-        # v1 (Mix) — стабильно есть fee в fills
+        ("/api/v2/mix/order/fills", {"symbol": symbol, "productType": str(product_type_v2), "startTime": str(start_ms), "endTime": str(end_ms), "limit": "100"}),
+        ("/api/v2/mix/order/fills", {"symbol": symbol, "productType": pt_l, "startTime": str(start_ms), "endTime": str(end_ms), "limit": "100"}),
+        # v1 allFills (у части аккаунтов 404)
         ("/api/mix/v1/order/allFills", {"symbol": symbol_v1_id, "marginCoin": "USDT", "startTime": str(start_ms), "endTime": str(end_ms), "pageSize": "100"}),
         ("/api/mix/v1/order/allFills", {"symbol": symbol_v1_id, "startTime": str(start_ms), "endTime": str(end_ms), "pageSize": "100"}),
         ("/api/mix/v1/order/allFills", {"symbol": symbol_v1_id, "productType": str(product_type_v1), "startTime": str(start_ms), "endTime": str(end_ms), "pageSize": "100"}),
         ("/api/mix/v1/order/allFills", {"symbol": symbol, "marginCoin": "USDT", "startTime": str(start_ms), "endTime": str(end_ms), "pageSize": "100"}),
-        # v2 (разный регистр productType)
         ("/api/v2/mix/order/all-fills", {"symbol": symbol, "productType": str(product_type_v2), "startTime": str(start_ms), "endTime": str(end_ms), "limit": "100"}),
-        ("/api/v2/mix/order/all-fills", {"symbol": symbol, "productType": pt_l, "startTime": str(start_ms), "endTime": str(end_ms), "limit": "100"}),
         ("/api/v2/mix/order/allFills", {"symbol": symbol, "productType": str(product_type_v2), "startTime": str(start_ms), "endTime": str(end_ms), "limit": "100"}),
     ]
 
@@ -2672,9 +2676,9 @@ async def get_bitget_fees_from_trades(
     if used_path is None:
         if isinstance(data, dict) and data.get("_error"):
             err_s = str(data.get("_error") or "")
-            logger.warning("Bitget fee debug: allFills все варианты вернули ошибку | last_error=%s | code=%s", err_s, _bitget_extract_code_msg(data)[0] if isinstance(data, dict) else None)
+            logger.debug("Bitget fee: allFills ошибка | %s | code=%s", err_s, _bitget_extract_code_msg(data)[0] if isinstance(data, dict) else None)
         else:
-            logger.warning("Bitget fee debug: allFills ни один вариант не code=00000 | last_data_keys=%s", list(data.keys()) if isinstance(data, dict) else None)
+            logger.debug("Bitget fee: allFills не code=00000 | data_keys=%s", list(data.keys()) if isinstance(data, dict) else None)
         # Пробуем fallback по истории ордеров даже когда allFills недоступен
         fallback_fee = await _bitget_fees_from_order_history(
             exchange_obj=exchange_obj,
@@ -2726,6 +2730,33 @@ async def get_bitget_fees_from_trades(
         if not _side_matches(side):
             continue
 
+        # v2 /api/v2/mix/order/fills: комиссия в feeDetail[] — totalFee, feeCoin
+        fee_detail_list = t.get("feeDetail") or t.get("feeDetails")
+        if isinstance(fee_detail_list, list):
+            for fd in fee_detail_list:
+                if not isinstance(fd, dict):
+                    continue
+                fee_raw = fd.get("totalFee") or fd.get("totalDeductionFee") or fd.get("fee")
+                if fee_raw is None:
+                    continue
+                try:
+                    fee_val = abs(float(fee_raw))
+                except Exception:
+                    continue
+                if fee_val <= 0:
+                    continue
+                fc = str(fd.get("feeCoin") or "USDT").strip().upper()
+                if fc in ("USDT", "USDC"):
+                    total += fee_val
+                else:
+                    px_raw = t.get("price") or t.get("fillPrice")
+                    if px_raw is not None:
+                        try:
+                            total += fee_val * float(px_raw)
+                        except Exception:
+                            pass
+            continue
+
         fee_raw = t.get("fee") or t.get("tradeFee") or t.get("totalFee") or t.get("feeAmount") or t.get("feeVol")
         if fee_raw is None:
             continue
@@ -2740,7 +2771,6 @@ async def get_bitget_fees_from_trades(
         if fee_coin in ("USDT", "USDC"):
             total += fee_val
         else:
-            # комиссия в базовой валюте (например GIGGLE) — переводим в USDT по цене сделки
             price_raw = t.get("price") or t.get("fillPrice") or t.get("tradePrice") or t.get("execPrice") or t.get("avgPrice")
             if price_raw is not None:
                 try:
@@ -2760,23 +2790,8 @@ async def get_bitget_fees_from_trades(
     if total > 0:
         return total
 
-    # Отладка: почему комиссия 0 при успешном ответе allFills
-    if used_path and isinstance(data, dict):
-        raw = data.get("data") or data.get("result")
-        first_item = items[0] if items and len(items) > 0 and isinstance(items[0], dict) else None
-        first_keys = list(first_item.keys()) if first_item else []
-        first_side = (first_item.get("side") or first_item.get("tradeSide") or first_item.get("orderSide")) if first_item else None
-        first_fee = (first_item.get("fee") or first_item.get("tradeFee") or first_item.get("feeAmount")) if first_item else None
-        logger.warning(
-            "Bitget fee debug: path=%s | data_keys=%s | raw_type=%s | items_len=%s | first_item_keys=%s | first_side=%s | first_fee=%s",
-            used_path,
-            list(data.keys()),
-            type(raw).__name__ + ((" keys=" + str(list(raw.keys())[:20])) if isinstance(raw, dict) else ""),
-            len(items) if items else 0,
-            first_keys[:15] if first_keys else [],
-            first_side,
-            first_fee,
-        )
+    if used_path and isinstance(data, dict) and (not items or len(items) == 0):
+        logger.debug("Bitget fee: path=%s успех, но items пустой", used_path)
 
     # Fallback: order history + order detail (allFills может быть пустым или 404 на части аккаунтов)
     fallback_fee = await _bitget_fees_from_order_history(
@@ -2851,16 +2866,7 @@ async def _bitget_fees_from_order_history(
         sym_upper = symbol_v1_id.upper()
         order_list = [o for o in order_list if str(o.get("symbol") or "").upper() == sym_upper]
     if not order_list:
-        # Отладка: что вернула история ордеров
-        last = data if isinstance(data, dict) else None
-        raw = last.get("data") or last.get("result") if last else None
-        logger.warning(
-            "Bitget fee debug: order history пустой | last_path=%s | code=%s | data_type=%s | raw_keys=%s",
-            history_paths[-1][0] if history_paths else None,
-            _bitget_extract_code_msg(last)[0] if last else None,
-            type(raw).__name__ if raw is not None else None,
-            list(raw.keys()) if isinstance(raw, dict) else None,
-        )
+        logger.debug("Bitget fee: order history пустой | raw_keys=%s", list((data.get("data") or data.get("result") or {}).keys()) if isinstance(data, dict) else None)
         return None
 
     def _side_ok(s: str) -> bool:
@@ -5725,10 +5731,17 @@ async def _xt_place_leg(*, planned: Dict[str, Any]) -> OpenLegResult:
             
             # Если returnCode != 0, логируем подробнее (важно видеть data['error'])
             if isinstance(data, dict) and data.get("returnCode") != 0:
+                err = data.get("error")
+                err_code = err.get("code") if isinstance(err, dict) else None
                 logger.warning(
                     f"⚠️ XT: {endpoint} вернул returnCode={data.get('returnCode')}, "
                     f"msgInfo={data.get('msgInfo', 'N/A')}, error={data.get('error')}"
                 )
+                if err_code == "user_can_not_open_position" and "xt" not in _xt_abusive_hint_logged:
+                    _xt_abusive_hint_logged.add("xt")
+                    logger.warning(
+                        "⚠️ XT временно запретил открытие позиций (Abusive Trading). Обратитесь в поддержку XT.com или подождите снятия ограничения."
+                    )
                 last_error = data
                 continue
         
@@ -5740,8 +5753,6 @@ async def _xt_place_leg(*, planned: Dict[str, Any]) -> OpenLegResult:
         
         if not isinstance(data, dict) or data.get("returnCode") != 0:
             # ВАЖНО: открытие должно быть на полный объём.
-            # Если не можем добрать остаток (например, min nominal) — возвращаем ошибку, но с filled_qty,
-            # чтобы вызывающий код мог откатить (закрыть) частично открытый объём и повторить попытку.
             avg_price = total_notional / total_filled if total_filled > 0 else None
             return OpenLegResult(
                 exchange="xt",
