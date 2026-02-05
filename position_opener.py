@@ -3156,6 +3156,13 @@ async def _bitget_place_leg(*, planned: Dict[str, Any]) -> OpenLegResult:
                 msg_l = (msg or "").lower()
                 if "sign" in msg_l or "signature" in msg_l or "passphrase" in msg_l:
                     return OpenLegResult(exchange="bitget", direction=direction, ok=False, error=f"Bitget auth error: {msg}", raw=data)
+                # Ошибка недостаточного баланса
+                if str(code) == "40762" or "balance" in msg_l or "exceeds the balance" in msg_l:
+                    return OpenLegResult(
+                        exchange="bitget", direction=direction, ok=False,
+                        error=f"Bitget: недостаточно баланса для открытия позиции (код {code}: {msg}). Проверьте баланс USDT на бирже Bitget.",
+                        raw=data
+                    )
                 if "side mismatch" in msg_l or "unilateral" in msg_l or str(code) in ("400172", "40774"):
                     continue
                 return OpenLegResult(exchange="bitget", direction=direction, ok=False, error=f"api error: {data}", raw=data)

@@ -58,13 +58,12 @@ python bot.py
 
 - **Bybit** (bybit) ✅
 - **Gate.io** (gate) ✅
-- **MEXC** (mexc) ✅
-- **LBank** (lbank) ✅
+- **MEXC** (mexc) -
 - **XT.com** (xt) ✅
 - **Binance** (binance) ✅
-- **Bitget** (bitget) ✅
-- **OKX** (okx) ✅
-- **BingX** (bingx) ✅
+- **Bitget** (bitget) ??
+- **OKX** (okx) 
+- **BingX** (bingx)  ??
 
 ## Вывод
 

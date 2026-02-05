@@ -452,7 +452,9 @@ def format_telegram_message(opportunity: Dict[str, Any]) -> str:
     elif exchange.lower() == "mexc":
         url = f"https://futures.mexc.com/exchange/{coin}_USDT"
     elif exchange.lower() == "bingx":
-        url = f"https://bingx.com/en-us/futures/{coin}USDT"
+        # BingX использует формат без дефиса для URL: SUPERUSDT вместо SUPER-USDT
+        symbol_for_url = f"{coin.upper()}USDT"
+        url = f"https://bingx.com/ru-ru/futures/forward/{symbol_for_url}"
     elif exchange.lower() == "xt":
         url = f"https://www.xt.com/futures/{coin}USDT"
     # Add more exchanges as needed
