@@ -377,6 +377,8 @@ async def close_long_short_positions(
             return await _binance_close_leg_partial_ioc(exchange_obj=exchange_obj, coin=coin, position_direction=position_direction, coin_amount=coin_amount_f)
         if ex == "bitget":
             return await _bitget_close_leg_partial_ioc(exchange_obj=exchange_obj, coin=coin, position_direction=position_direction, coin_amount=coin_amount_f)
+        if ex == "bingx":
+            return await _bingx_close_leg_partial_ioc(exchange_obj=exchange_obj, coin=coin, position_direction=position_direction, coin_amount=coin_amount_f)
         if ex == "xt":
             return await _xt_close_leg_partial_ioc(exchange_obj=exchange_obj, coin=coin, position_direction=position_direction, coin_amount=coin_amount_f)
         logger.error(f"❌ Авто-закрытие пока не реализовано для биржи: {exchange_name}")
@@ -3459,6 +3461,147 @@ async def _bingx_place_leg(*, planned: Dict[str, Any]) -> OpenLegResult:
         exchange="bingx", direction=direction, ok=False,
         error=f"не набрали объём за {MAX_ORDERBOOK_LEVELS} уровней: исполнено={_format_number(total_filled)}, требовалось={_format_number(coin_amount)}",
     )
+
+
+async def _bingx_close_leg_partial_ioc(*, exchange_obj: Any, coin: str, position_direction: str, coin_amount: float) -> Tuple[bool, Optional[float]]:
+    """
+    BingX USDT-M Futures: закрытие позиции частями лимитными IOC ордерами.
+    position_direction: "long" (закрываем SELL) или "short" (закрываем BUY).
+    """
+    api_key = _get_env("BINGX_API_KEY")
+    api_secret = _get_env("BINGX_API_SECRET")
+    if not api_key or not api_secret:
+        logger.error("❌ BingX: missing BINGX_API_KEY/BINGX_API_SECRET in env")
+        return False, None
+
+    pos_dir = (position_direction or "").lower().strip()
+    if pos_dir not in ("long", "short"):
+        logger.error(f"❌ BingX: некорректное направление позиции: {position_direction!r}")
+        return False, None
+
+    remaining = float(coin_amount)
+    if remaining <= 0:
+        return True, None
+
+    symbol = exchange_obj._normalize_symbol(coin)
+    f = await _bingx_get_contract_filters(exchange_obj=exchange_obj, symbol=symbol)
+    tick_raw = f.get("tickSize")
+    step_raw = f.get("stepSize")
+    tick = float(tick_raw) if tick_raw else 0.0001
+    step = float(step_raw) if step_raw else 0.0
+
+    # Для закрытия: LONG позиция закрывается SELL, SHORT позиция закрывается BUY
+    side_close = "SELL" if pos_dir == "long" else "BUY"
+    position_side = "LONG" if pos_dir == "long" else "SHORT"
+
+    total_notional = 0.0
+    total_filled = 0.0
+    eps = max(1e-10, remaining * 1e-8)
+
+    max_orders_total = max(10, MAX_ORDERBOOK_LEVELS * 3)
+    for order_n in range(1, max_orders_total + 1):
+        if remaining <= eps:
+            avg_price = total_notional / total_filled if total_filled > 0 else None
+            return True, avg_price
+
+        ob = await exchange_obj.get_orderbook(coin, limit=MAX_ORDERBOOK_LEVELS)
+        if not ob or not ob.get("bids") or not ob.get("asks"):
+            logger.error(f"❌ BingX: orderbook недоступен для закрытия {coin}")
+            return False, None
+
+        levels = ob["bids"] if side_close == "SELL" else ob["asks"]
+        filled_any = 0.0
+
+        for lvl_i, lvl in enumerate(levels[:MAX_ORDERBOOK_LEVELS], start=1):
+            try:
+                px_raw = float(lvl[0])
+            except Exception:
+                continue
+            if px_raw <= 0:
+                continue
+
+            px = _round_price_for_side(px_raw, tick, "sell" if side_close == "SELL" else "buy")
+            px_str = _format_by_step(px, tick_raw)
+
+            qty_to_send = remaining
+            if step > 0:
+                qty_str = _format_by_step(qty_to_send, step_raw)
+            else:
+                qty_str = str(qty_to_send)
+
+            if float(qty_str) <= 0:
+                break
+
+            logger.info(f"BingX close: попытка {order_n}/{max_orders_total} | side={side_close} qty={qty_str} | лимит={px_str} | remaining={_format_number(remaining)}")
+
+            params = {
+                "symbol": symbol,
+                "side": side_close,
+                "type": "LIMIT",
+                "price": px_str,
+                "quantity": qty_str,
+                "timeInForce": "IOC",
+                "positionSide": position_side,
+            }
+
+            # BingX может требовать reduceOnly, но сначала пробуем без него
+            data = await _bingx_private_request(
+                exchange_obj=exchange_obj,
+                api_key=api_key,
+                api_secret=api_secret,
+                method="POST",
+                path="/openApi/swap/v2/trade/order",
+                params=params,
+            )
+
+            if not isinstance(data, dict):
+                logger.error(f"❌ BingX close: api error: {data}")
+                continue
+
+            if data.get("_error") or str(data.get("code")) not in (None, "0"):
+                logger.error(f"❌ BingX close: api error: {data}")
+                continue
+
+            # Парсим orderId из ответа
+            item = data.get("data")
+            order_container = item.get("order") if isinstance(item, dict) and isinstance(item.get("order"), dict) else item if isinstance(item, dict) else None
+            order_id = None
+            if isinstance(order_container, dict):
+                order_id = order_container.get("orderId") or order_container.get("orderID") or order_container.get("id") or order_container.get("order_id")
+            if not order_id:
+                order_id = data.get("orderId")
+            if not order_id:
+                logger.error(f"❌ BingX close: no orderId in response: {data}")
+                continue
+
+            # Ждём исполнения IOC ордера
+            ok_full, executed = await _bingx_wait_full_fill(
+                planned={"exchange_obj": exchange_obj, "api_key": api_key, "api_secret": api_secret, "symbol": symbol, "qty": qty_str},
+                order_id=str(order_id),
+            )
+            if executed and executed > 0:
+                filled_any = float(executed)
+                # Best-effort avgPrice from API (если есть)
+                avg_px = None
+                try:
+                    if isinstance(item, dict):
+                        avg_px = float(item.get("avgPrice") or item.get("avg_price") or item.get("price")) if (item.get("avgPrice") or item.get("avg_price") or item.get("price")) is not None else None
+                except Exception:
+                    avg_px = None
+                use_px = avg_px if (avg_px is not None and avg_px > 0) else px
+                total_notional += filled_any * float(use_px)
+                total_filled += filled_any
+                remaining = max(0.0, remaining - filled_any)
+                logger.info(f"BingX close: исполнено={_format_number(filled_any)} {coin} | осталось={_format_number(remaining)} {coin} | full={ok_full}")
+                break
+
+        if filled_any <= 0:
+            logger.debug(f"BingX close: 0 исполнено по уровням 1-{MAX_ORDERBOOK_LEVELS} | осталось={_format_number(remaining)} {coin}")
+            continue
+
+    logger.error(f"❌ BingX close: не удалось закрыть позицию полностью | осталось={_format_number(remaining)} {coin}")
+    avg_price = total_notional / total_filled if total_filled > 0 else None
+    return False, avg_price
 
 
 async def _open_one_leg(
