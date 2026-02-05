@@ -458,45 +458,91 @@ def _get_exchange_url(exchange: str, coin: str) -> str:
     return f"https://www.{ex_l}.com"
 
 
-def _format_combined_telegram_message(
+def _format_table_text_message(
     coin: str,
     opportunities: List[Dict[str, Any]],
 ) -> str:
-    """Текст для Telegram: как в scan_spreads, funding spread = (-long - short)*100."""
-    lines = [f'🔔 💰<b>Спред фандингов: монета {coin}</b> (для ликв.: {SCAN_COIN_INVEST:.1f} USDT)']
-    lines.append("")
+    """Текстовая таблица для Telegram с выравниванием и ссылками на биржи."""
+    if not opportunities:
+        return ""
+    rows_data = []
     for opp in opportunities:
-        long_ex = opp["long_ex"]
-        short_ex = opp["short_ex"]
         long_data = opp.get("long_data")
         short_data = opp.get("short_data")
         open_spread_pct = opp["open_spread_pct"]
         funding_spread_val = opp.get("funding_spread_pct")
-        price_long = None
-        funding_long = None
-        if long_data:
-            price_long = long_data.get("price") or (long_data.get("bid") and long_data.get("ask") and (long_data["bid"] + long_data["ask"]) / 2.0)
-            funding_long = long_data.get("funding_rate")
-        price_short = None
-        funding_short = None
-        if short_data:
-            price_short = short_data.get("price") or (short_data.get("bid") and short_data.get("ask") and (short_data["bid"] + short_data["ask"]) / 2.0)
-            funding_short = short_data.get("funding_rate")
+        price_long = long_data.get("ask") or long_data.get("price") if long_data else None
+        if not price_long and long_data and long_data.get("bid") and long_data.get("ask"):
+            price_long = (long_data["bid"] + long_data["ask"]) / 2.0
+        price_short = short_data.get("bid") or short_data.get("price") if short_data else None
+        if not price_short and short_data and short_data.get("bid") and short_data.get("ask"):
+            price_short = (short_data["bid"] + short_data["ask"]) / 2.0
+        funding_long = long_data.get("funding_rate") if long_data else None
+        funding_short = short_data.get("funding_rate") if short_data else None
+        total_spread = open_spread_pct + (funding_spread_val if funding_spread_val is not None else 0)
+        long_ex = opp["long_ex"]
+        short_ex = opp["short_ex"]
         long_url = _get_exchange_url(long_ex, coin)
         short_url = _get_exchange_url(short_ex, coin)
-        long_cap = long_ex.capitalize()
-        short_cap = short_ex.capitalize()
-        long_price_str = f"{price_long:.3f}" if price_long is not None else "N/A"
-        long_funding_str = f"{funding_long * 100:.3f}%" if funding_long is not None else "N/A"
-        short_price_str = f"{price_short:.3f}" if price_short is not None else "N/A"
-        short_funding_str = f"{funding_short * 100:.3f}%" if funding_short is not None else "N/A"
-        lines.append(f'🟢 Лонг (<a href="{long_url}">{long_cap}</a>) | Цена: {long_price_str} | Фандинг: {long_funding_str}')
-        lines.append(f'🔴 Шорт (<a href="{short_url}">{short_cap}</a>) | Цена: {short_price_str} | Фандинг: {short_funding_str}')
-        fr_str = f" | Спред по фандингу: {funding_spread_val:.3f}%" if funding_spread_val is not None else ""
-        lines.append(f'• Спред по цене: {open_spread_pct:.3f}%{fr_str}')
-        lines.append(f'💎 Стратегия: {coin} Лонг (<a href="{long_url}">{long_cap}</a>), Шорт (<a href="{short_url}">{short_cap}</a>)')
-        lines.append("")
+        funding_long_str = f"{funding_long * 100:.3f}" if funding_long is not None else "N/A"
+        funding_short_str = f"{funding_short * 100:.3f}" if funding_short is not None else "N/A"
+        fr_spread_str = f"{funding_spread_val:.3f}" if funding_spread_val is not None else "N/A"
+        rows_data.append({
+            "pr_long": f"{price_long:.3f}" if price_long else "N/A",
+            "funding_long": funding_long_str,
+            "pr_short": f"{price_short:.3f}" if price_short else "N/A",
+            "funding_short": funding_short_str,
+            "pr_spread": f"{open_spread_pct:.3f}",
+            "fr_spread": fr_spread_str,
+            "total_spread": f"{total_spread:.3f}",
+            "long_ex": long_ex,
+            "short_ex": short_ex,
+            "long_url": long_url,
+            "short_url": short_url,
+            "total_spread_num": total_spread,
+        })
+    rows_data.sort(key=lambda x: x["total_spread_num"], reverse=True)
+    col_widths = {
+        "pr_long": 8, "funding_long": 8, "pr_short": 8, "funding_short": 8,
+        "pr_spread": 8, "fr_spread": 8, "total_spread": 8,
+    }
+    header_parts = ["L pr", "L fun", "S pr", "S fun", "Spr pr", "Spr fun", "Spt tot", "Биржи"]
+    header = (
+        f"{header_parts[0].ljust(col_widths['pr_long'])}|"
+        f"{header_parts[1].ljust(col_widths['funding_long'])}|"
+        f"{header_parts[2].ljust(col_widths['pr_short'])}|"
+        f"{header_parts[3].ljust(col_widths['funding_short'])}|"
+        f"{header_parts[4].ljust(col_widths['pr_spread'])}|"
+        f"{header_parts[5].ljust(col_widths['fr_spread'])}|"
+        f"{header_parts[6].ljust(col_widths['total_spread'])}|"
+        f"{header_parts[7]}"
+    )
+    lines = [f'🔔💰 монета {coin} — спред фандингов (для ликв. {SCAN_COIN_INVEST:.0f} USDT)']
+    lines.append("")
+    lines.append(f"<pre>{header}</pre>")
+    for row in rows_data:
+        ex_link = f'<a href="{row["long_url"]}">{row["long_ex"]}</a>→<a href="{row["short_url"]}">{row["short_ex"]}</a>'
+        pr_long_pad = row['pr_long'].ljust(col_widths['pr_long'])
+        funding_long_pad = row['funding_long'].ljust(col_widths['funding_long'])
+        pr_short_pad = row['pr_short'].ljust(col_widths['pr_short'])
+        funding_short_pad = row['funding_short'].ljust(col_widths['funding_short'])
+        pr_spread_pad = row['pr_spread'].ljust(col_widths['pr_spread'])
+        fr_spread_pad = row['fr_spread'].ljust(col_widths['fr_spread'])
+        total_spread_pad = row['total_spread'].ljust(col_widths['total_spread'])
+        row_line = (
+            f"{pr_long_pad}|{funding_long_pad}|{pr_short_pad}|{funding_short_pad}|"
+            f"{pr_spread_pad}|{fr_spread_pad}|{total_spread_pad}|{ex_link}"
+        )
+        lines.append(row_line)
     return "\n".join(lines)
+
+
+def _format_combined_telegram_message(
+    coin: str,
+    opportunities: List[Dict[str, Any]],
+) -> str:
+    """Текст для Telegram: таблица с выравниванием и ссылками."""
+    return _format_table_text_message(coin, opportunities)
 
 
 def _generate_arbitrage_table_image(
@@ -526,23 +572,25 @@ def _generate_arbitrage_table_image(
             funding_long = long_data.get("funding_rate") if long_data else None
             funding_short = short_data.get("funding_rate") if short_data else None
             total_spread = open_spread_pct + (funding_spread_val if funding_spread_val is not None else 0)
+            long_ex = opp['long_ex']
+            short_ex = opp['short_ex']
             rows.append({
-                "coin": coin,
-                "pr_long": f"{price_long:.3f}" if price_long else "none",
-                "pr_short": f"{price_short:.3f}" if price_short else "none",
-                "funding_long": f"{funding_long * 100:.3f}" if funding_long is not None else "none",
-                "funding_short": f"{funding_short * 100:.3f}" if funding_short is not None else "none",
+                "pr_long": f"{price_long:.3f}" if price_long else "N/A",
+                "pr_short": f"{price_short:.3f}" if price_short else "N/A",
+                "funding_long": f"{funding_long * 100:.3f}" if funding_long is not None else "N/A",
+                "funding_short": f"{funding_short * 100:.3f}" if funding_short is not None else "N/A",
                 "pr_spread": f"{open_spread_pct:.3f}",
-                "fr_spread": f"{funding_spread_val:.3f}" if funding_spread_val is not None else "none",
+                "fr_spread": f"{funding_spread_val:.3f}" if funding_spread_val is not None else "N/A",
                 "total_spread": f"{total_spread:.3f}",
-                "ex_spread": f"Long ({opp['long_ex']}), Short ({opp['short_ex']})",
+                "ex_spread": f"{long_ex}→{short_ex}",
+                "long_ex": long_ex,
+                "short_ex": short_ex,
                 "total_spread_num": total_spread,  # для сортировки
             })
         rows.sort(key=lambda x: x["total_spread_num"], reverse=True)
         col_widths = {
-            "coin": 120, "pr_long": 90, "pr_short": 90,
-            "funding_long": 80, "funding_short": 80,
-            "pr_spread": 100, "fr_spread": 100, "total_spread": 100, "ex_spread": 200,
+            "pr_long": 80, "funding_long": 80, "pr_short": 80, "funding_short": 80,
+            "pr_spread": 90, "fr_spread": 90, "total_spread": 90, "ex_spread": 120,
         }
         total_width = sum(col_widths.values()) + border_width * (len(col_widths) + 1)
         total_height = header_height + len(rows) * row_height + border_width * 2
@@ -556,15 +604,27 @@ def _generate_arbitrage_table_image(
                 font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 12)
                 font_bold = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 12)
             except Exception:
-                font = ImageFont.load_default()
-                font_bold = font
-        headers = ["coin", "pr_long", "funding_long", "pr_short", "funding_short", "pr_spread", "fr_spread", "total_spread", "ex_spread"]
-        header_labels = ["coin", "Long цена", "Long фанд", "Short цена", "Shor фанд", "Спред цен", "Спред фанд", "Общ спред", "Связка бирж"]
+                try:
+                    font = ImageFont.truetype("C:/Windows/Fonts/arial.ttf", 12)
+                    font_bold = ImageFont.truetype("C:/Windows/Fonts/arialbd.ttf", 12)
+                except Exception:
+                    try:
+                        font = ImageFont.truetype("C:/Windows/Fonts/calibri.ttf", 12)
+                        font_bold = ImageFont.truetype("C:/Windows/Fonts/calibrib.ttf", 12)
+                    except Exception:
+                        font = ImageFont.load_default()
+                        font_bold = font
+        headers = ["pr_long", "funding_long", "pr_short", "funding_short", "pr_spread", "fr_spread", "total_spread", "ex_spread"]
+        header_labels = ["L pr", "L fun", "S pr", "S fun", "Spr pr", "Spr fun", "Spt tot", "Exchanges"]
         x, y = border_width, border_width
         draw.rectangle([x, y, total_width - border_width, y + header_height], fill="#e0e0e0", outline="#000000", width=border_width)
         for i, h in enumerate(headers):
             w = col_widths[h]
-            draw.text((x + cell_padding, y + (header_height - 20) // 2), header_labels[i], fill="black", font=font_bold)
+            text = header_labels[i]
+            bbox = draw.textbbox((0, 0), text, font=font_bold)
+            text_width = bbox[2] - bbox[0]
+            text_x = x + (w - text_width) // 2
+            draw.text((text_x, y + (header_height - 20) // 2), text, fill="black", font=font_bold)
             x += w
         y = border_width + header_height
         for row_idx, row in enumerate(rows):
@@ -574,7 +634,11 @@ def _generate_arbitrage_table_image(
             draw.rectangle([x, row_y, total_width - border_width, row_y + row_height], fill=fill, outline="#000000", width=1)
             for h in headers:
                 w = col_widths[h]
-                draw.text((x + cell_padding, row_y + cell_padding), str(row.get(h, "")), fill="black", font=font)
+                text = str(row.get(h, ""))
+                bbox = draw.textbbox((0, 0), text, font=font)
+                text_width = bbox[2] - bbox[0]
+                text_x = x + (w - text_width) // 2
+                draw.text((text_x, row_y + cell_padding), text, fill="black", font=font)
                 x += w
         buf = io.BytesIO()
         img.save(buf, format="PNG")
@@ -677,35 +741,9 @@ async def process_coin(
         if not channel_id:
             logger.warning("Telegram: канал не настроен")
             return
-        if PIL_AVAILABLE:
-            table_image = _generate_arbitrage_table_image(coin, to_send)
-            if table_image:
-                max_fr_spread = max((o.get("funding_spread_pct") or 0) for o in to_send)
-                max_opp = max(to_send, key=lambda o: o["open_spread_pct"] + o.get("funding_spread_pct", 0))
-                long_ex = max_opp["long_ex"]
-                short_ex = max_opp["short_ex"]
-                long_url = _get_exchange_url(long_ex, coin)
-                short_url = _get_exchange_url(short_ex, coin)
-                caption = (
-                    f'🔔 💰Спред фандингов: монета {coin} (для ликв.: {SCAN_COIN_INVEST:.1f} USDT)\n'
-                    f'{coin} Лонг (<a href="{long_url}">{long_ex.capitalize()}</a>), '
-                    f'Шорт (<a href="{short_url}">{short_ex.capitalize()}</a>) макс. спред фандингов: {max_fr_spread:.3f}%'
-                )
-                success = await telegram.send_photo(table_image, caption=caption, channel_id=channel_id)
-                if success:
-                    logger.debug(f"📱 Telegram: отправлено изображение для {coin}")
-                else:
-                    await telegram.send_message(
-                        _format_combined_telegram_message(coin, to_send), channel_id=channel_id,
-                    )
-            else:
-                await telegram.send_message(
-                    _format_combined_telegram_message(coin, to_send), channel_id=channel_id,
-                )
-        else:
-            await telegram.send_message(
-                _format_combined_telegram_message(coin, to_send), channel_id=channel_id,
-            )
+        await telegram.send_message(
+            _format_combined_telegram_message(coin, to_send), channel_id=channel_id,
+        )
     except Exception as e:
         logger.warning(f"Ошибка отправки в Telegram для {coin}: {e}", exc_info=True)
     return len(per_coin_found)
