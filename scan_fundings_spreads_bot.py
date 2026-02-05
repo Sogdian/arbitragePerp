@@ -33,7 +33,7 @@ def _windows_ctrl_z_listener() -> None:
 import config
 from bot import PerpArbitrageBot, format_number
 from input_parser import parse_input
-from position_opener import open_long_short_positions, close_long_short_positions, get_binance_fees_from_trades
+from position_opener import open_long_short_positions, close_long_short_positions, get_binance_fees_from_trades, get_binance_funding_from_income
 from telegram_sender import TelegramSender
 from fun import _bybit_fetch_executions, _bybit_fetch_funding_from_transaction_log
 
@@ -215,6 +215,15 @@ async def _get_real_funding_usdt(
         end_ms = int(time.time() * 1000)
         if exchange_name.lower() == "bybit":
             return await _bybit_fetch_funding_from_transaction_log(
+                exchange_obj=exchange_obj,
+                api_key=api_key,
+                api_secret=api_secret,
+                coin=coin,
+                start_ms=start_ms,
+                end_ms=end_ms,
+            )
+        if exchange_name.lower() == "binance":
+            return await get_binance_funding_from_income(
                 exchange_obj=exchange_obj,
                 api_key=api_key,
                 api_secret=api_secret,

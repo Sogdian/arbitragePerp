@@ -2231,6 +2231,62 @@ async def get_binance_fees_from_trades(
     return total if total > 0 else None
 
 
+async def get_binance_funding_from_income(
+    *,
+    exchange_obj: Any,
+    api_key: str,
+    api_secret: str,
+    coin: str,
+    start_ms: int,
+    end_ms: int,
+) -> Optional[float]:
+    """
+    Сумма фандинга (USDT) из Binance Futures Income за период [start_ms, end_ms].
+    GET /fapi/v1/income, incomeType=FUNDING_FEE. Положительное = получено, отрицательное = уплачено.
+    Возвращает None при ошибке API.
+    """
+    symbol = exchange_obj._normalize_symbol(coin)
+    data = await _binance_private_request(
+        exchange_obj=exchange_obj,
+        api_key=api_key,
+        api_secret=api_secret,
+        method="GET",
+        path="/fapi/v1/income",
+        params={
+            "symbol": symbol,
+            "incomeType": "FUNDING_FEE",
+            "startTime": start_ms,
+            "endTime": end_ms,
+            "limit": 1000,
+        },
+    )
+    if isinstance(data, dict) and data.get("_error"):
+        logger.warning(
+            "Binance income (FUNDING_FEE): ошибка запроса | %s",
+            data.get("_error") or data.get("msg") or data.get("code") or str(data)[:200],
+        )
+        return None
+    if not isinstance(data, list):
+        logger.warning("Binance income: неожиданный ответ (не список)")
+        return None
+    total = 0.0
+    for it in data:
+        if not isinstance(it, dict):
+            continue
+        if str(it.get("incomeType") or "").upper() != "FUNDING_FEE":
+            continue
+        if str(it.get("asset") or "").upper() != "USDT":
+            continue
+        sym = str(it.get("symbol") or "").upper()
+        if sym and sym != symbol.upper():
+            continue
+        try:
+            total += float(it.get("income") or 0)
+        except (TypeError, ValueError):
+            pass
+    return total
+
+
 async def _binance_wait_full_fill(*, planned: Dict[str, Any], order_id: str) -> Tuple[bool, float]:
     exchange_obj = planned["exchange_obj"]
     api_key = planned["api_key"]
