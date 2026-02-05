@@ -188,19 +188,24 @@ class PerpArbitrageBot:
     
     def calculate_funding_spread(self, funding_long: Optional[float], funding_short: Optional[float]) -> Optional[float]:
         """
-        Спред фандинга: разница ставок Long − Short (в процентах).
-        Long 0.005%, Short 0.001% → 0.004%.
+        Спред фандинга: фандинг на лонге (инвертированный, если отрицательный) минус фандинг на шорте (в процентах).
+        Фандинг на лонге: если отрицательный, инвертируем в положительный (получаем доход).
+        Фандинг на шорте: оставляем как есть (положительный = платим, отрицательный = получаем).
+        Пример: Long -0.824%, Short 0.005% → (+0.824% - 0.005%) = 0.819%.
 
         Args:
-            funding_long: Ставка фандинга на бирже Long (в десятичном формате, например 0.00005 = 0.005%)
-            funding_short: Ставка фандинга на бирже Short (в десятичном формате)
+            funding_long: Ставка фандинга на бирже Long (в десятичном формате, например -0.00824 = -0.824%)
+            funding_short: Ставка фандинга на бирже Short (в десятичном формате, например 0.00005 = 0.005%)
 
         Returns:
-            (funding_long - funding_short) * 100, в процентах
+            (abs(funding_long) - funding_short) * 100, в процентах
         """
         if funding_long is None or funding_short is None:
             return None
-        return (funding_long - funding_short) * 100.0
+        # Инвертируем фандинг на лонге (если отрицательный, делаем положительным)
+        funding_long_inverted = abs(funding_long)
+        # Фандинг на шорте оставляем как есть
+        return (funding_long_inverted - funding_short) * 100.0
     
     async def process_input(self, input_text: str):
         """
