@@ -22,6 +22,7 @@ import json
 import logging
 import math
 import os
+import sys
 import time
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_UP
@@ -2641,12 +2642,11 @@ async def get_bitget_fees_from_trades(
         # v1 (Mix) — стабильно есть fee в fills
         ("/api/mix/v1/order/allFills", {"symbol": symbol_v1_id, "marginCoin": "USDT", "startTime": str(start_ms), "endTime": str(end_ms), "pageSize": "100"}),
         ("/api/mix/v1/order/allFills", {"symbol": symbol_v1_id, "startTime": str(start_ms), "endTime": str(end_ms), "pageSize": "100"}),
-        # иногда требуют productType (встречается на некоторых аккаунтах/прокси)
         ("/api/mix/v1/order/allFills", {"symbol": symbol_v1_id, "productType": str(product_type_v1), "startTime": str(start_ms), "endTime": str(end_ms), "pageSize": "100"}),
-        # fallback: вдруг у конкретного окружения ожидают символ без суффикса
         ("/api/mix/v1/order/allFills", {"symbol": symbol, "marginCoin": "USDT", "startTime": str(start_ms), "endTime": str(end_ms), "pageSize": "100"}),
-        # v2 fallback (если есть в конкретном аккаунте/домене)
+        # v2 (разный регистр productType)
         ("/api/v2/mix/order/all-fills", {"symbol": symbol, "productType": str(product_type_v2), "startTime": str(start_ms), "endTime": str(end_ms), "limit": "100"}),
+        ("/api/v2/mix/order/all-fills", {"symbol": symbol, "productType": pt_l, "startTime": str(start_ms), "endTime": str(end_ms), "limit": "100"}),
         ("/api/v2/mix/order/allFills", {"symbol": symbol, "productType": str(product_type_v2), "startTime": str(start_ms), "endTime": str(end_ms), "limit": "100"}),
     ]
 
@@ -2672,34 +2672,53 @@ async def get_bitget_fees_from_trades(
     if used_path is None:
         if isinstance(data, dict) and data.get("_error"):
             err_s = str(data.get("_error") or "")
-            # fills используются только для расчёта комиссий; 404 часто означает "endpoint недоступен" → это не критично
-            if "404" in err_s:
-                logger.debug("Bitget fills недоступны (404), комиссии=N/A | %s", err_s)
-            else:
-                logger.warning("Bitget fills: ошибка запроса | %s", err_s or str(data)[:200])
-        return None
+            logger.warning("Bitget fee debug: allFills все варианты вернули ошибку | last_error=%s | code=%s", err_s, _bitget_extract_code_msg(data)[0] if isinstance(data, dict) else None)
+        else:
+            logger.warning("Bitget fee debug: allFills ни один вариант не code=00000 | last_data_keys=%s", list(data.keys()) if isinstance(data, dict) else None)
+        # Пробуем fallback по истории ордеров даже когда allFills недоступен
+        fallback_fee = await _bitget_fees_from_order_history(
+            exchange_obj=exchange_obj,
+            api_key=api_key,
+            api_secret=api_secret,
+            api_passphrase=api_passphrase,
+            symbol_v1_id=symbol_v1_id,
+            symbol=symbol,
+            product_type_v1=product_type_v1,
+            product_type_v2=product_type_v2,
+            direction_l=direction_l,
+            start_ms=start_ms,
+            end_ms=end_ms,
+        )
+        return fallback_fee
 
     items = None
     if isinstance(data, dict):
-        raw = data.get("data")
-        if isinstance(raw, list):
-            items = raw
-        elif isinstance(raw, dict):
-            items = raw.get("list") or raw.get("fillList") or raw.get("orderList") or raw.get("data")
+        for key in ("data", "result"):
+            raw = data.get(key)
+            if isinstance(raw, list):
+                items = raw
+                break
+            if isinstance(raw, dict):
+                items = raw.get("list") or raw.get("fillList") or raw.get("orderList") or raw.get("data") or raw.get("entrustedList")
+                if isinstance(items, list) and items:
+                    break
     if not isinstance(items, list):
-        return None
+        items = []
 
     def _side_matches(side_raw: Any) -> bool:
         s = str(side_raw or "").lower().strip()
         if not s:
             return False
         if direction_l == "long":
-            return ("open_long" in s) or (s == "buy") or ("buy" in s and "close" not in s)
+            # open long (buy) + close short (buy to close short)
+            return ("open_long" in s) or ("close_short" in s) or (s == "buy") or ("buy" in s)
         if direction_l == "short":
-            return ("open_short" in s) or (s == "sell") or ("sell" in s and "close" not in s)
+            # open short (sell) + close long (sell to close long)
+            return ("open_short" in s) or ("close_long" in s) or (s == "sell") or ("sell" in s)
         return False
 
     total = 0.0
+    coin_upper = (coin or "").upper()
     for t in items:
         if not isinstance(t, dict):
             continue
@@ -2707,19 +2726,264 @@ async def get_bitget_fees_from_trades(
         if not _side_matches(side):
             continue
 
-        fee_raw = t.get("fee") or t.get("tradeFee") or t.get("totalFee") or t.get("feeAmount")
+        fee_raw = t.get("fee") or t.get("tradeFee") or t.get("totalFee") or t.get("feeAmount") or t.get("feeVol")
         if fee_raw is None:
             continue
         try:
             fee_val = abs(float(fee_raw))
         except Exception:
             continue
+        if fee_val <= 0:
+            continue
 
-        fee_coin = str(t.get("feeCoin") or t.get("feeCurrency") or t.get("feeAsset") or "USDT").upper()
+        fee_coin = str(t.get("feeCoin") or t.get("feeCurrency") or t.get("feeAsset") or "USDT").strip().upper()
         if fee_coin in ("USDT", "USDC"):
             total += fee_val
+        else:
+            # комиссия в базовой валюте (например GIGGLE) — переводим в USDT по цене сделки
+            price_raw = t.get("price") or t.get("fillPrice") or t.get("tradePrice") or t.get("execPrice") or t.get("avgPrice")
+            if price_raw is not None:
+                try:
+                    px = float(price_raw)
+                    if px > 0:
+                        total += fee_val * px
+                except Exception:
+                    pass
+            elif fee_coin == coin_upper or fee_coin == (coin_upper + "USDT"):
+                try:
+                    px = float(t.get("price") or t.get("fillPrice") or 0)
+                    if px > 0:
+                        total += fee_val * px
+                except Exception:
+                    pass
 
-    return total if total > 0 else None
+    if total > 0:
+        return total
+
+    # Отладка: почему комиссия 0 при успешном ответе allFills
+    if used_path and isinstance(data, dict):
+        raw = data.get("data") or data.get("result")
+        first_item = items[0] if items and len(items) > 0 and isinstance(items[0], dict) else None
+        first_keys = list(first_item.keys()) if first_item else []
+        first_side = (first_item.get("side") or first_item.get("tradeSide") or first_item.get("orderSide")) if first_item else None
+        first_fee = (first_item.get("fee") or first_item.get("tradeFee") or first_item.get("feeAmount")) if first_item else None
+        logger.warning(
+            "Bitget fee debug: path=%s | data_keys=%s | raw_type=%s | items_len=%s | first_item_keys=%s | first_side=%s | first_fee=%s",
+            used_path,
+            list(data.keys()),
+            type(raw).__name__ + ((" keys=" + str(list(raw.keys())[:20])) if isinstance(raw, dict) else ""),
+            len(items) if items else 0,
+            first_keys[:15] if first_keys else [],
+            first_side,
+            first_fee,
+        )
+
+    # Fallback: order history + order detail (allFills может быть пустым или 404 на части аккаунтов)
+    fallback_fee = await _bitget_fees_from_order_history(
+        exchange_obj=exchange_obj,
+        api_key=api_key,
+        api_secret=api_secret,
+        api_passphrase=api_passphrase,
+        symbol_v1_id=symbol_v1_id,
+        symbol=symbol,
+        product_type_v1=product_type_v1,
+        product_type_v2=product_type_v2,
+        direction_l=direction_l,
+        start_ms=start_ms,
+        end_ms=end_ms,
+    )
+    return fallback_fee
+
+
+async def _bitget_fees_from_order_history(
+    *,
+    exchange_obj: Any,
+    api_key: str,
+    api_secret: str,
+    api_passphrase: str,
+    symbol_v1_id: str,
+    symbol: str,
+    product_type_v1: str,
+    product_type_v2: str,
+    direction_l: str,
+    start_ms: int,
+    end_ms: int,
+) -> Optional[float]:
+    """Пытается получить комиссии из истории ордеров + детали ордера (fillList/fee в detail)."""
+    # Официально: Get History Orders = /api/mix/v1/order/history (по symbol); Get ProductType History = /api/mix/v1/order/historyProductType (по productType, в ответе data.orderList)
+    history_paths: List[Tuple[str, Dict[str, Any]]] = [
+        ("/api/mix/v1/order/historyProductType", {"productType": product_type_v1.upper(), "startTime": str(start_ms), "endTime": str(end_ms), "pageSize": "50", "marginCoin": "USDT"}),
+        ("/api/mix/v1/order/historyProductType", {"productType": product_type_v1, "startTime": str(start_ms), "endTime": str(end_ms), "pageSize": "50"}),
+        ("/api/mix/v1/order/historyProductType", {"productType": product_type_v1.upper(), "startTime": str(start_ms), "endTime": str(end_ms), "pageSize": "50"}),
+        ("/api/mix/v1/order/history", {"symbol": symbol_v1_id, "startTime": str(start_ms), "endTime": str(end_ms), "pageSize": "50", "marginCoin": "USDT"}),
+        ("/api/mix/v1/order/history", {"symbol": symbol_v1_id, "startTime": str(start_ms), "endTime": str(end_ms), "pageSize": "50"}),
+        ("/api/v2/mix/order/orders-history", {"symbol": symbol, "productType": product_type_v2, "startTime": str(start_ms), "endTime": str(end_ms), "limit": "50"}),
+        ("/api/v2/mix/order/orders-history", {"symbol": symbol, "productType": product_type_v2, "limit": "50"}),
+        ("/api/mix/v1/order/history", {"symbol": symbol_v1_id, "pageSize": "50", "marginCoin": "USDT"}),
+    ]
+    order_list: List[Dict[str, Any]] = []
+    for path, params in history_paths:
+        data = await _bitget_private_request(
+            exchange_obj=exchange_obj,
+            api_key=api_key,
+            api_secret=api_secret,
+            api_passphrase=api_passphrase,
+            method="GET",
+            path=path,
+            params=params,
+        )
+        if isinstance(data, dict) and data.get("_error"):
+            continue
+        code, _ = _bitget_extract_code_msg(data)
+        if code is not None and code != "00000":
+            continue
+        raw = data.get("data") or data.get("result")
+        if isinstance(raw, list):
+            order_list = [x for x in raw if isinstance(x, dict) and x.get("orderId")]
+            break
+        if isinstance(raw, dict):
+            order_list = raw.get("orderList") or raw.get("list") or raw.get("entrustedList") or []
+            order_list = [x for x in order_list if isinstance(x, dict) and x.get("orderId")]
+            if order_list:
+                break
+    # historyProductType возвращает ордера по всем символам — оставляем только наш символ
+    if order_list:
+        sym_upper = symbol_v1_id.upper()
+        order_list = [o for o in order_list if str(o.get("symbol") or "").upper() == sym_upper]
+    if not order_list:
+        # Отладка: что вернула история ордеров
+        last = data if isinstance(data, dict) else None
+        raw = last.get("data") or last.get("result") if last else None
+        logger.warning(
+            "Bitget fee debug: order history пустой | last_path=%s | code=%s | data_type=%s | raw_keys=%s",
+            history_paths[-1][0] if history_paths else None,
+            _bitget_extract_code_msg(last)[0] if last else None,
+            type(raw).__name__ if raw is not None else None,
+            list(raw.keys()) if isinstance(raw, dict) else None,
+        )
+        return None
+
+    def _side_ok(s: str) -> bool:
+        s = (s or "").lower().strip()
+        if direction_l == "long":
+            return ("open_long" in s) or ("close_short" in s) or (s == "buy") or ("buy" in s)
+        if direction_l == "short":
+            return ("open_short" in s) or ("close_long" in s) or (s == "sell") or ("sell" in s)
+        return False
+
+    total_fee = 0.0
+    for ord_ in order_list[:30]:
+        oid = ord_.get("orderId") or ord_.get("orderID")
+        if not oid:
+            continue
+        side = str(ord_.get("side") or ord_.get("tradeSide") or ord_.get("orderSide") or "").strip()
+        if side and not _side_ok(side):
+            continue
+        detail = await _bitget_private_request(
+            exchange_obj=exchange_obj,
+            api_key=api_key,
+            api_secret=api_secret,
+            api_passphrase=api_passphrase,
+            method="GET",
+            path="/api/mix/v1/order/detail",
+            params={"symbol": symbol_v1_id, "orderId": str(oid), "marginCoin": "USDT"},
+        )
+        if isinstance(detail, dict) and detail.get("_error"):
+            detail = await _bitget_private_request(
+                exchange_obj=exchange_obj,
+                api_key=api_key,
+                api_secret=api_secret,
+                api_passphrase=api_passphrase,
+                method="GET",
+                path="/api/v2/mix/order/order-detail",
+                params={"symbol": symbol, "productType": product_type_v2, "orderId": str(oid)},
+            )
+        if not isinstance(detail, dict) or _bitget_extract_code_msg(detail)[0] != "00000":
+            continue
+        d = detail.get("data") or detail.get("result") or detail
+        if not isinstance(d, dict):
+            continue
+        detail_side = str(d.get("side") or d.get("tradeSide") or d.get("orderSide") or "").strip()
+        if detail_side and not _side_ok(detail_side):
+            continue
+
+        order_fee_before = total_fee
+
+        def _add_fee(v: float, fc: str, px: Optional[float] = None) -> None:
+            nonlocal total_fee
+            if v <= 0:
+                return
+            fc = (fc or "USDT").strip().upper()
+            if fc in ("USDT", "USDC"):
+                total_fee += v
+            elif px is not None and px > 0:
+                total_fee += v * px
+
+        fee_raw = d.get("fee") or d.get("tradeFee") or d.get("totalFee") or d.get("feeAmount")
+        if fee_raw is not None:
+            try:
+                v = abs(float(fee_raw))
+                fc = str(d.get("feeCoin") or d.get("feeCurrency") or "USDT").upper()
+                px = None
+                try:
+                    px = float(d.get("price") or d.get("avgPrice") or d.get("fillPrice") or 0)
+                except Exception:
+                    pass
+                _add_fee(v, fc, px)
+            except Exception:
+                pass
+        fills = d.get("fillList") or d.get("fills") or d.get("tradeList") or []
+        if isinstance(fills, dict):
+            fills = fills.get("list") or fills.get("fills") or []
+        for f in fills if isinstance(fills, list) else []:
+            if not isinstance(f, dict):
+                continue
+            fr = f.get("fee") or f.get("tradeFee") or f.get("feeAmount")
+            if fr is None:
+                continue
+            try:
+                v = abs(float(fr))
+                fc = str(f.get("feeCoin") or f.get("feeCurrency") or "USDT").upper()
+                px = None
+                try:
+                    px = float(f.get("price") or f.get("fillPrice") or f.get("tradePrice") or 0)
+                except Exception:
+                    pass
+                _add_fee(v, fc, px)
+            except Exception:
+                pass
+        # Дополнительно: fills по orderId (если из detail не получили комиссию)
+        if total_fee <= order_fee_before:
+            fills_resp = await _bitget_private_request(
+                exchange_obj=exchange_obj,
+                api_key=api_key,
+                api_secret=api_secret,
+                api_passphrase=api_passphrase,
+                method="GET",
+                path="/api/mix/v1/order/fills",
+                params={"symbol": symbol_v1_id, "orderId": str(oid), "marginCoin": "USDT"},
+            )
+            if isinstance(fills_resp, dict) and not fills_resp.get("_error") and _bitget_extract_code_msg(fills_resp)[0] == "00000":
+                fill_data = fills_resp.get("data") or fills_resp.get("result")
+                fill_list = fill_data if isinstance(fill_data, list) else (fill_data.get("fillList") or fill_data.get("list") or [] if isinstance(fill_data, dict) else [])
+                for f in fill_list if isinstance(fill_list, list) else []:
+                    if not isinstance(f, dict):
+                        continue
+                    fr = f.get("fee") or f.get("tradeFee") or f.get("feeAmount")
+                    if fr is None:
+                        continue
+                    try:
+                        v = abs(float(fr))
+                        fc = str(f.get("feeCoin") or f.get("feeCurrency") or "USDT").upper()
+                        px = None
+                        try:
+                            px = float(f.get("price") or f.get("fillPrice") or 0)
+                        except Exception:
+                            pass
+                        _add_fee(v, fc, px)
+                    except Exception:
+                        pass
+    return total_fee if total_fee > 0 else None
 
 
 async def get_gate_funding_from_settlements(
@@ -4700,85 +4964,163 @@ async def get_xt_fees_from_trades(
     end_ms: int,
 ) -> Optional[float]:
     """
-    Пытается получить комиссии XT Futures из trade-list за окно времени.
+    Пытается получить комиссии XT Futures из trade-list / order list + detail за окно времени.
     Возвращает сумму комиссий в USDT или None если не удалось.
     """
     try:
         symbol = exchange_obj._normalize_symbol(coin)
         want_side = "BUY" if (direction or "").lower().strip() == "long" else "SELL"
 
-        # XT docs for trade-list params are inconsistent; пробуем несколько вариантов params.
-        params_variants: List[Dict[str, Any]] = [
-            {"symbol": symbol, "startTime": str(start_ms), "endTime": str(end_ms)},
-            {"symbol": symbol, "startTime": start_ms, "endTime": end_ms},
-            {"symbol": symbol},
-            {"startTime": str(start_ms), "endTime": str(end_ms)},
+        def _sum_fees_from_trades(trades: List[Dict[str, Any]]) -> float:
+            fee_total = 0.0
+            for t in trades:
+                side = str(t.get("side") or t.get("orderSide") or t.get("tradeSide") or "").upper()
+                if side and side != want_side:
+                    continue
+                fee_raw = (
+                    t.get("fee")
+                    or t.get("commission")
+                    or t.get("tradeFee")
+                    or t.get("execFee")
+                    or t.get("feeAmount")
+                    or t.get("feeValue")
+                )
+                if fee_raw is None:
+                    continue
+                try:
+                    fee_val = abs(float(fee_raw))
+                except Exception:
+                    continue
+                fee_coin = str(t.get("feeCoin") or t.get("feeAsset") or t.get("commissionAsset") or "USDT")
+                if fee_coin.upper() in ("USDT", "USDC"):
+                    fee_total += fee_val
+                    continue
+                px_raw = t.get("price") or t.get("execPrice") or t.get("dealPrice") or t.get("tradePrice")
+                if px_raw is not None and fee_coin.lower() in (coin.lower(), coin.lower() + "usdt"):
+                    try:
+                        fee_total += fee_val * float(px_raw)
+                    except Exception:
+                        pass
+            return fee_total
+
+        # 1) trade-list и альтернативные пути (order/list, fill-list)
+        paths_params: List[Tuple[str, List[Dict[str, Any]]]] = [
+            ("/future/trade/v1/order/trade-list", [
+                {"symbol": symbol, "startTime": str(start_ms), "endTime": str(end_ms)},
+                {"symbol": symbol, "startTime": start_ms, "endTime": end_ms},
+                {"symbol": symbol},
+            ]),
+            ("/future/trade/v1/order/list", [
+                {"symbol": symbol, "startTime": str(start_ms), "endTime": str(end_ms)},
+                {"symbol": symbol, "startTime": start_ms, "endTime": end_ms},
+            ]),
+            ("/future/trade/v1/order/fill-list", [{"symbol": symbol, "startTime": str(start_ms), "endTime": str(end_ms)}]),
         ]
 
-        data: Any = None
-        for params in params_variants:
+        for path, params_variants in paths_params:
+            for params in params_variants:
+                data = await _xt_private_request(
+                    exchange_obj=exchange_obj,
+                    api_key=api_key,
+                    api_secret=api_secret,
+                    method="GET",
+                    path=path,
+                    params=params,
+                )
+                if not isinstance(data, dict) or data.get("returnCode") != 0:
+                    continue
+                trades: List[Dict[str, Any]] = []
+                r = data.get("result")
+                if isinstance(r, list):
+                    trades = [x for x in r if isinstance(x, dict)]
+                elif isinstance(r, dict):
+                    for k in ("list", "items", "data", "rows", "trades", "fillList", "fills"):
+                        v = r.get(k)
+                        if isinstance(v, list):
+                            trades = [x for x in v if isinstance(x, dict)]
+                            break
+                fee_total = _sum_fees_from_trades(trades)
+                if fee_total > 0:
+                    return fee_total
+
+        # 2) Fallback: список ордеров за период + деталь по каждому (fee в detail)
+        order_list_paths: List[Tuple[str, Dict[str, Any]]] = [
+            ("/future/trade/v1/order/list", {"symbol": symbol, "startTime": str(start_ms), "endTime": str(end_ms), "pageSize": "50"}),
+            ("/future/trade/v1/order/history", {"symbol": symbol, "startTime": str(start_ms), "endTime": str(end_ms)}),
+        ]
+        orders: List[Dict[str, Any]] = []
+        for path, params in order_list_paths:
             data = await _xt_private_request(
                 exchange_obj=exchange_obj,
                 api_key=api_key,
                 api_secret=api_secret,
                 method="GET",
-                path="/future/trade/v1/order/trade-list",
+                path=path,
                 params=params,
             )
-            if isinstance(data, dict) and data.get("returnCode") == 0:
+            if not isinstance(data, dict) or data.get("returnCode") != 0:
+                continue
+            r = data.get("result")
+            if isinstance(r, list):
+                orders = [x for x in r if isinstance(x, dict) and (x.get("orderId") or x.get("orderID"))]
+            elif isinstance(r, dict):
+                for k in ("list", "items", "data", "orderList"):
+                    v = r.get(k)
+                    if isinstance(v, list):
+                        orders = [x for x in v if isinstance(x, dict) and (x.get("orderId") or x.get("orderID"))]
+                        break
+            if orders:
                 break
-
-        if not isinstance(data, dict) or data.get("returnCode") != 0:
-            return None
-
-        # Extract trades list from result
-        trades: List[Dict[str, Any]] = []
-        r = data.get("result")
-        if isinstance(r, list):
-            trades = [x for x in r if isinstance(x, dict)]
-        elif isinstance(r, dict):
-            for k in ("list", "items", "data", "rows", "trades"):
-                v = r.get(k)
-                if isinstance(v, list):
-                    trades = [x for x in v if isinstance(x, dict)]
-                    break
-        if not trades:
+        if not orders:
             return None
 
         fee_total = 0.0
-        for t in trades:
-            side = str(t.get("side") or t.get("orderSide") or t.get("tradeSide") or "").upper()
+        for ord_ in orders[:30]:
+            oid = ord_.get("orderId") or ord_.get("orderID")
+            if not oid:
+                continue
+            side = str(ord_.get("side") or ord_.get("orderSide") or "").upper()
             if side and side != want_side:
                 continue
-
-            fee_raw = (
-                t.get("fee")
-                or t.get("commission")
-                or t.get("tradeFee")
-                or t.get("execFee")
-                or t.get("feeAmount")
-                or t.get("feeValue")
+            detail = await _xt_private_request(
+                exchange_obj=exchange_obj,
+                api_key=api_key,
+                api_secret=api_secret,
+                method="GET",
+                path="/future/trade/v1/order/detail",
+                params={"orderId": str(oid)},
             )
-            if fee_raw is None:
+            if not isinstance(detail, dict) or detail.get("returnCode") != 0:
                 continue
-            try:
-                fee_val = abs(float(fee_raw))
-            except Exception:
+            res = detail.get("result")
+            d = res if isinstance(res, dict) else (res[0] if isinstance(res, list) and res else None)
+            if not isinstance(d, dict):
                 continue
-
-            fee_coin = str(t.get("feeCoin") or t.get("feeAsset") or t.get("commissionAsset") or "USDT")
-            if fee_coin.upper() in ("USDT", "USDC"):
-                fee_total += fee_val
+            detail_side = str(d.get("side") or d.get("orderSide") or "").upper()
+            if detail_side and detail_side != want_side:
                 continue
-
-            # If fee is in base coin, try convert using trade price
-            px_raw = t.get("price") or t.get("execPrice") or t.get("dealPrice") or t.get("tradePrice")
-            if px_raw is not None and fee_coin.lower() in (coin.lower(), coin.lower() + "usdt"):
+            fee_raw = d.get("fee") or d.get("commission") or d.get("tradeFee") or d.get("feeAmount")
+            if fee_raw is not None:
                 try:
-                    fee_total += fee_val * float(px_raw)
+                    v = abs(float(fee_raw))
+                    fc = str(d.get("feeCoin") or d.get("feeAsset") or "USDT").upper()
+                    if fc in ("USDT", "USDC"):
+                        fee_total += v
                 except Exception:
                     pass
-
+            for fill in (d.get("fillList") or d.get("fills") or []):
+                if not isinstance(fill, dict):
+                    continue
+                fr = fill.get("fee") or fill.get("commission") or fill.get("tradeFee")
+                if fr is None:
+                    continue
+                try:
+                    v = abs(float(fr))
+                    fc = str(fill.get("feeCoin") or "USDT").upper()
+                    if fc in ("USDT", "USDC"):
+                        fee_total += v
+                except Exception:
+                    pass
         return fee_total if fee_total > 0 else None
     except Exception:
         return None
