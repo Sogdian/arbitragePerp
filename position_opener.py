@@ -2373,6 +2373,154 @@ async def _binance_wait_full_fill(*, planned: Dict[str, Any], order_id: str) -> 
     return False, 0.0
 
 
+async def get_gate_fees_from_trades(
+    *,
+    exchange_obj: Any,
+    api_key: str,
+    api_secret: str,
+    coin: str,
+    direction: str,
+    start_ms: int,
+    end_ms: int,
+) -> Optional[float]:
+    """
+    Сумма комиссий в USDT по сделкам Gate.io Futures за период [start_ms, end_ms].
+    direction: "long" → только buy trades, "short" → только sell trades.
+    Возвращает None при ошибке API или если комиссий в USDT нет.
+    """
+    contract = exchange_obj._normalize_symbol(coin)
+    want_side = 1 if (direction or "").lower().strip() == "long" else -1  # Gate: 1=buy, -1=sell
+    
+    data = await _gate_private_request(
+        exchange_obj=exchange_obj,
+        api_key=api_key,
+        api_secret=api_secret,
+        method="GET",
+        path="/api/v4/futures/usdt/trades",
+        params={
+            "contract": contract,
+            "from": start_ms // 1000,  # Gate использует секунды
+            "to": end_ms // 1000,
+            "limit": 1000,
+        },
+    )
+    
+    if isinstance(data, dict) and data.get("_error"):
+        logger.warning(
+            "Gate trades: ошибка запроса | %s",
+            data.get("_error") or str(data)[:200],
+        )
+        return None
+    
+    if not isinstance(data, list):
+        logger.warning("Gate trades: неожиданный ответ (не список)")
+        return None
+    
+    total = 0.0
+    for t in data:
+        if not isinstance(t, dict):
+            continue
+        # Gate: size положительный для buy, отрицательный для sell
+        size_raw = t.get("size") or t.get("contracts") or 0
+        try:
+            size = float(size_raw)
+        except Exception:
+            continue
+        # Проверяем направление: size > 0 для buy (long), size < 0 для sell (short)
+        if (want_side == 1 and size <= 0) or (want_side == -1 and size >= 0):
+            continue
+        
+        # Комиссия в Gate может быть в поле "fee" или "fee_value"
+        fee_raw = t.get("fee") or t.get("fee_value") or t.get("fee_usdt")
+        if fee_raw is None:
+            continue
+        
+        try:
+            fee_val = abs(float(fee_raw))
+        except Exception:
+            continue
+        
+        # Проверяем, что комиссия в USDT (Gate обычно возвращает в USDT для USDT-M)
+        fee_currency = str(t.get("fee_currency") or t.get("fee_asset") or "USDT").upper()
+        if fee_currency in ("USDT", "USDC"):
+            total += fee_val
+    
+    return total if total > 0 else None
+
+
+async def get_gate_funding_from_settlements(
+    *,
+    exchange_obj: Any,
+    api_key: str,
+    api_secret: str,
+    coin: str,
+    start_ms: int,
+    end_ms: int,
+) -> Optional[float]:
+    """
+    Сумма фандинга (USDT) из Gate.io Futures Settlements за период [start_ms, end_ms].
+    Положительное = получено, отрицательное = уплачено.
+    Возвращает None при ошибке API.
+    """
+    contract = exchange_obj._normalize_symbol(coin)
+    
+    data = await _gate_private_request(
+        exchange_obj=exchange_obj,
+        api_key=api_key,
+        api_secret=api_secret,
+        method="GET",
+        path="/api/v4/futures/usdt/settlements",
+        params={
+            "contract": contract,
+            "from": start_ms // 1000,  # Gate использует секунды
+            "to": end_ms // 1000,
+            "limit": 1000,
+        },
+    )
+    
+    if isinstance(data, dict) and data.get("_error"):
+        logger.warning(
+            "Gate settlements (funding): ошибка запроса | %s",
+            data.get("_error") or str(data)[:200],
+        )
+        return None
+    
+    if not isinstance(data, list):
+        logger.warning("Gate settlements: неожиданный ответ (не список)")
+        return None
+    
+    total = 0.0
+    for s in data:
+        if not isinstance(s, dict):
+            continue
+        # Gate settlements содержит funding в поле "funding" или "funding_rate" * "size"
+        funding_raw = s.get("funding") or s.get("funding_fee") or s.get("funding_value")
+        if funding_raw is None:
+            # Попробуем вычислить из funding_rate и size
+            rate_raw = s.get("funding_rate")
+            size_raw = s.get("size") or s.get("contracts")
+            if rate_raw is not None and size_raw is not None:
+                try:
+                    rate = float(rate_raw)
+                    size = abs(float(size_raw))
+                    # Для Gate: funding = rate * size (в базовой валюте, обычно USDT)
+                    funding_raw = rate * size
+                except Exception:
+                    continue
+        
+        if funding_raw is None:
+            continue
+        
+        try:
+            funding_val = float(funding_raw)
+        except Exception:
+            continue
+        
+        total += funding_val
+    
+    return total if total != 0.0 else None
+
+
 async def _binance_place_leg(*, planned: Dict[str, Any]) -> OpenLegResult:
     exchange_obj = planned["exchange_obj"]
     api_key = planned["api_key"]

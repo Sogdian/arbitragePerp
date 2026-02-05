@@ -39,6 +39,8 @@ from position_opener import (
     get_binance_fees_from_trades,
     get_binance_funding_from_income,
     get_xt_fees_from_trades,
+    get_gate_fees_from_trades,
+    get_gate_funding_from_settlements,
 )
 from telegram_sender import TelegramSender
 from fun import _bybit_fetch_executions, _bybit_fetch_funding_from_transaction_log
@@ -193,7 +195,20 @@ async def _get_real_fees_from_executions(
                 end_ms=end_ms,
             )
         
-        # TODO: Реализовать получение комиссий для Gate, MEXC, Bitget, BingX
+        if exchange_name.lower() == "gate":
+            end_ms = int(time.time() * 1000)
+            start_ms = end_ms - (time_window_sec * 1000)
+            return await get_gate_fees_from_trades(
+                exchange_obj=exchange_obj,
+                api_key=api_key,
+                api_secret=api_secret,
+                coin=coin,
+                direction=direction,
+                start_ms=start_ms,
+                end_ms=end_ms,
+            )
+        
+        # TODO: Реализовать получение комиссий для MEXC, Bitget, BingX
         return None
         
     except Exception as e:
@@ -251,7 +266,16 @@ async def _get_real_funding_usdt(
                 start_ms=start_ms,
                 end_ms=end_ms,
             )
-        # TODO: Gate, OKX, Bingx и др. — добавить запрос истории фандинга по API
+        if exchange_name.lower() == "gate":
+            return await get_gate_funding_from_settlements(
+                exchange_obj=exchange_obj,
+                api_key=api_key,
+                api_secret=api_secret,
+                coin=coin,
+                start_ms=start_ms,
+                end_ms=end_ms,
+            )
+        # TODO: OKX, Bingx и др. — добавить запрос истории фандинга по API
         return None
     except Exception as e:
         logger.debug(f"Ошибка при получении фандинга с {exchange_name}: {e}")
@@ -344,6 +368,9 @@ async def _monitor_until_close(
     last_logged_completed_hours: int = -1
     prev_cumulative_funding_long: Optional[float] = None
     prev_cumulative_funding_short: Optional[float] = None
+    # Сохраняем последние значения фандинга из мониторинга для использования в финальном логе
+    last_funding_long_usdt: Optional[float] = None
+    last_funding_short_usdt: Optional[float] = None
 
     try:
         while True:
@@ -454,6 +481,9 @@ async def _monitor_until_close(
                         funding_long_usdt = real_funding_long
                         funding_short_usdt = real_funding_short
                         funding_impact_usdt = (funding_long_usdt + funding_short_usdt) if (funding_long_usdt is not None and funding_short_usdt is not None) else None
+                        # Сохраняем для финального лога
+                        last_funding_long_usdt = funding_long_usdt
+                        last_funding_short_usdt = funding_short_usdt
                         num_completed_hours = int(elapsed_sec / FUNDING_INTERVAL_SEC)
                         if num_completed_hours > last_logged_completed_hours:
                             delta_long = (real_funding_long or 0.0) - (prev_cumulative_funding_long or 0.0)
@@ -492,6 +522,9 @@ async def _monitor_until_close(
                             funding_long_usdt = funding_long_total
                             funding_short_usdt = funding_short_total
                             funding_impact_usdt = total_funding if total_funding != 0.0 else None
+                            # Сохраняем для финального лога
+                            last_funding_long_usdt = funding_long_usdt
+                            last_funding_short_usdt = funding_short_usdt
                         else:
                             funding_long_usdt = None
                             funding_short_usdt = None
@@ -627,6 +660,11 @@ async def _monitor_until_close(
                         )
                     except Exception:
                         pass
+                # Используем данные из мониторинга как fallback, если реальные данные недоступны
+                if final_funding_long_usdt is None:
+                    final_funding_long_usdt = last_funding_long_usdt
+                if final_funding_short_usdt is None:
+                    final_funding_short_usdt = last_funding_short_usdt
                 logger.info("Закрываем открытые позиции...")
                 try:
                     ok_closed = await asyncio.wait_for(
@@ -667,16 +705,14 @@ async def _monitor_until_close(
                             f"L комиссия закр: {fee_l_close_str} | S комиссия закр: {fee_s_close_str} | "
                             f"L комиссия общая: {format_number(fee_long_total)} | S комиссия общая: {format_number(fee_short_total)} | Итоговая комиссия: {fee_total_str}"
                         )
-                        # 2) Фандинг L / S
+                        # 2) Фандинг L / S (используем реальные данные или данные из мониторинга)
+                        fund_l_str = format_number(final_funding_long_usdt) if final_funding_long_usdt is not None else "N/A"
+                        fund_s_str = format_number(final_funding_short_usdt) if final_funding_short_usdt is not None else "N/A"
+                        logger.info(f"Фанд L: {fund_l_str} | S: {fund_s_str}")
                         if final_funding_long_usdt is not None and final_funding_short_usdt is not None:
-                            fund_l_str = format_number(final_funding_long_usdt)
-                            fund_s_str = format_number(final_funding_short_usdt)
-                            logger.info(f"Фанд L: {fund_l_str} | S: {fund_s_str}")
                             received = max(0.0, final_funding_long_usdt) + max(0.0, final_funding_short_usdt)
                             paid = abs(min(0.0, final_funding_long_usdt)) + abs(min(0.0, final_funding_short_usdt))
                             logger.info(f"Фандинг получено: {format_number(received)} USDT | уплачено: {format_number(paid)} USDT")
-                        else:
-                            logger.info("Фанд L: N/A | S: N/A")
                         # 3) L/S доход (включая фандинг; при N/A фандинг = 0)
                         income_l = None
                         if bid_long_close is not None and frozen_ask_long_open is not None:
