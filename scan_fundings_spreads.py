@@ -507,17 +507,8 @@ def _format_table_text_message(
         "pr_long": 8, "funding_long": 8, "pr_short": 8, "funding_short": 8,
         "pr_spread": 8, "fr_spread": 8, "total_spread": 8,
     }
-    header_parts = ["L pr", "L fun", "S pr", "S fun", "Spr pr", "Spr fun", "Spt tot", "Биржи"]
-    header = (
-        f"{header_parts[0].ljust(col_widths['pr_long'])}|"
-        f"{header_parts[1].ljust(col_widths['funding_long'])}|"
-        f"{header_parts[2].ljust(col_widths['pr_short'])}|"
-        f"{header_parts[3].ljust(col_widths['funding_short'])}|"
-        f"{header_parts[4].ljust(col_widths['pr_spread'])}|"
-        f"{header_parts[5].ljust(col_widths['fr_spread'])}|"
-        f"{header_parts[6].ljust(col_widths['total_spread'])}|"
-        f"{header_parts[7]}"
-    )
+    # Заголовки с пробелами для выравнивания
+    header = "L pr|L fun |S pr  |S fun |Spr pr|Spr fun|Spt tot|Биржи"
     lines = [f'🔔💰 монета {coin} — спред фандингов (для ликв. {SCAN_COIN_INVEST:.0f} USDT)']
     lines.append("")
     lines.append(f"<pre>{header}</pre>")
