@@ -4165,8 +4165,14 @@ async def _bingx_place_leg(*, planned: Dict[str, Any]) -> OpenLegResult:
         )
         if not isinstance(data, dict) or data.get("_error"):
             return OpenLegResult(exchange="bingx", direction=direction, ok=False, error=f"api error: {data}", raw=data)
-        if str(data.get("code")) not in (None, "0"):
-            return OpenLegResult(exchange="bingx", direction=direction, ok=False, error=f"api error: {data}", raw=data)
+        code = data.get("code")
+        if code is not None and str(code) != "0":
+            msg = data.get("msg") or ""
+            if code == 109400 or "API orders are temporarily disabled" in str(msg):
+                err = "BingX временно отключил API-ордера из-за волатильности (код 109400). Попробуйте через несколько минут."
+            else:
+                err = f"api error: {data}"
+            return OpenLegResult(exchange="bingx", direction=direction, ok=False, error=err, raw=data)
         item = data.get("data")
         order_container = item.get("order") if isinstance(item, dict) and isinstance(item.get("order"), dict) else item if isinstance(item, dict) else None
         order_id = None
