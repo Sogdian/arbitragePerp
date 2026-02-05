@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import base64
@@ -27,6 +28,30 @@ from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_UP
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
+
+# Загружаем переменные окружения из .env файла (если еще не загружены)
+try:
+    from dotenv import load_dotenv
+    load_dotenv('.env', override=False)
+except ImportError:
+    # Если python-dotenv не установлен, пробуем простую загрузку
+    def load_dotenv(path: str = ".env") -> None:
+        if not os.path.exists(path):
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    k, v = line.split("=", 1)
+                    k = k.strip()
+                    v = v.strip().strip('"').strip("'")
+                    if k and (k not in os.environ):
+                        os.environ[k] = v
+        except Exception:
+            pass
+    load_dotenv('.env')
 
 
 # Логируем в __main__, чтобы совпадало с основным логгером bot.py
@@ -208,7 +233,7 @@ async def open_long_short_positions(
     long_exchange: str,
     short_exchange: str,
     coin_amount: float,
-) -> bool:
+) -> Tuple[bool, Optional[float], Optional[float]]:
     """
     Открывает Long (на long_exchange) и Short (на short_exchange) на coin_amount монет (для каждой ноги).
     Возвращает (ok, long_price, short_price): ok=True только если обе ноги открылись успешно;
@@ -218,10 +243,10 @@ async def open_long_short_positions(
         coin_amount = float(coin_amount)
     except Exception:
         logger.error(f"❌ Некорректное количество монет: {coin_amount!r}")
-        return False
+        return False, None, None
     if coin_amount <= 0:
         logger.error(f"❌ Количество монет должно быть > 0, получено: {coin_amount}")
-        return False
+        return False, None, None
 
     logger.info(f"🧩 Авто-открытие позиций: {coin} | Long {long_exchange} + Short {short_exchange} | qty={_format_number(coin_amount)} {coin}")
 
@@ -229,25 +254,27 @@ async def open_long_short_positions(
     short_obj = (getattr(bot, "exchanges", {}) or {}).get(short_exchange)
     if long_obj is None or short_obj is None:
         logger.error(f"❌ Не найдены биржи в bot.exchanges: long={long_exchange} short={short_exchange}")
-        return False
+        return False, None, None
 
     # 1) Preflight: проверяем возможность открытия на обеих биржах заранее
     long_plan = await _plan_one_leg(exchange_name=long_exchange, exchange_obj=long_obj, coin=coin, direction="long", coin_amount=coin_amount)
     if isinstance(long_plan, OpenLegResult) and not long_plan.ok:
         logger.error(f"❌ Preflight failed (Long): {long_plan.error}")
-        return False
+        return False, None, None
     short_plan = await _plan_one_leg(exchange_name=short_exchange, exchange_obj=short_obj, coin=coin, direction="short", coin_amount=coin_amount)
     if isinstance(short_plan, OpenLegResult) and not short_plan.ok:
         logger.error(f"❌ Preflight failed (Short): {short_plan.error}")
-        return False
+        return False, None, None
     if not isinstance(long_plan, dict) or not isinstance(short_plan, dict):
         logger.error("❌ Preflight не пройден, ордера не отправлены")
-        return False
+        return False, None, None
 
     # 2) Выставляем лимитные ордера параллельно
     long_task = _place_one_leg(planned=long_plan)
     short_task = _place_one_leg(planned=short_plan)
-    long_res, short_res = await _gather2(long_task, short_task)
+    long_res_raw, short_res_raw = await _gather2(long_task, short_task)
+    long_res = _as_open_leg_result(long_res_raw, exchange=str(long_exchange), direction="long")
+    short_res = _as_open_leg_result(short_res_raw, exchange=str(short_exchange), direction="short")
 
     _log_leg_result(long_res)
     _log_leg_result(short_res)
@@ -350,6 +377,8 @@ async def close_long_short_positions(
             return await _binance_close_leg_partial_ioc(exchange_obj=exchange_obj, coin=coin, position_direction=position_direction, coin_amount=coin_amount_f)
         if ex == "bitget":
             return await _bitget_close_leg_partial_ioc(exchange_obj=exchange_obj, coin=coin, position_direction=position_direction, coin_amount=coin_amount_f)
+        if ex == "xt":
+            return await _xt_close_leg_partial_ioc(exchange_obj=exchange_obj, coin=coin, position_direction=position_direction, coin_amount=coin_amount_f)
         logger.error(f"❌ Авто-закрытие пока не реализовано для биржи: {exchange_name}")
         return False, None
 
@@ -1682,12 +1711,30 @@ async def _gather2(t1, t2):
     return out[0], out[1]
 
 
+def _as_open_leg_result(res: Any, *, exchange: str, direction: str) -> OpenLegResult:
+    """
+    asyncio.gather(..., return_exceptions=True) может вернуть Exception вместо OpenLegResult.
+    Нормализуем в OpenLegResult, чтобы дальше код не падал.
+    """
+    if isinstance(res, OpenLegResult):
+        return res
+    if isinstance(res, Exception):
+        import traceback
+        tb = "".join(traceback.format_exception(type(res), res, res.__traceback__))
+        logger.error(f"❌ Исключение в ноге {exchange} {direction}: {type(res).__name__}: {res}\n{tb}")
+        return OpenLegResult(exchange=exchange, direction=direction, ok=False, error=f"exception: {type(res).__name__}: {res}")
+    logger.error(f"❌ Некорректный результат ноги {exchange} {direction}: type={type(res).__name__} value={res!r}")
+    return OpenLegResult(exchange=exchange, direction=direction, ok=False, error=f"bad result type: {type(res).__name__}")
+
+
 def _log_leg_result(res: OpenLegResult) -> None:
-    if res.ok:
+    if getattr(res, "ok", False):
         logger.info(f"✅ Ордер выставлен: {res.exchange} {res.direction}")
         return
-    msg = res.error or "unknown error"
-    logger.error(f"❌ Ошибка открытия: {res.exchange} {res.direction} | {msg}")
+    msg = getattr(res, "error", None) or "unknown error"
+    ex = getattr(res, "exchange", "unknown")
+    d = getattr(res, "direction", "unknown")
+    logger.error(f"❌ Ошибка открытия: {ex} {d} | {msg}")
 
 
 async def _plan_one_leg(
@@ -1711,6 +1758,8 @@ async def _plan_one_leg(
         return await _bitget_plan_leg(exchange_obj=exchange_obj, coin=coin, direction=direction, coin_amount=coin_amount)
     if ex == "bingx":
         return await _bingx_plan_leg(exchange_obj=exchange_obj, coin=coin, direction=direction, coin_amount=coin_amount)
+    if ex == "xt":
+        return await _xt_plan_leg(exchange_obj=exchange_obj, coin=coin, direction=direction, coin_amount=coin_amount)
     return OpenLegResult(exchange=exchange_name, direction=direction, ok=False, error="trading not implemented for this exchange")
 
 
@@ -1728,6 +1777,8 @@ async def _place_one_leg(*, planned: Dict[str, Any]) -> OpenLegResult:
         return await _bitget_place_leg(planned=planned)
     if ex == "bingx":
         return await _bingx_place_leg(planned=planned)
+    if ex == "xt":
+        return await _xt_place_leg(planned=planned)
     return OpenLegResult(exchange=str(planned.get("exchange")), direction=str(planned.get("direction")), ok=False, error="unknown exchange in plan")
 
 
@@ -3424,6 +3475,14 @@ async def _open_one_leg(
             return await _bybit_open_leg(exchange_obj=exchange_obj, coin=coin, direction=direction, notional_usdt=notional_usdt)
         if ex == "gate":
             return await _gate_open_leg(exchange_obj=exchange_obj, coin=coin, direction=direction, notional_usdt=notional_usdt)
+        if ex == "xt":
+            # Use plan + place pattern for XT
+            plan = await _xt_plan_leg(exchange_obj=exchange_obj, coin=coin, direction=direction, coin_amount=notional_usdt / (await exchange_obj.get_futures_ticker(coin) or {}).get("price", 1.0))
+            if isinstance(plan, OpenLegResult) and not plan.ok:
+                return plan
+            if not isinstance(plan, dict):
+                return OpenLegResult(exchange=exchange_name, direction=direction, ok=False, error="plan failed")
+            return await _xt_place_leg(planned=plan)
         return OpenLegResult(exchange=exchange_name, direction=direction, ok=False, error="trading not implemented for this exchange")
     except Exception as e:
         return OpenLegResult(exchange=exchange_name, direction=direction, ok=False, error=str(e))
@@ -4013,5 +4072,945 @@ async def _gate_place_leg(*, planned: Dict[str, Any]) -> OpenLegResult:
         exchange="gate", direction=direction, ok=False,
         error=f"не набрали объём за {MAX_ORDERBOOK_LEVELS} уровней: исполнено={_format_number(total_filled_base)}, требовалось={_format_number(coin_amount)}",
     )
+
+
+# =========================
+# XT.com Futures trading
+# =========================
+
+async def get_xt_fees_from_trades(
+    *,
+    exchange_obj: Any,
+    api_key: str,
+    api_secret: str,
+    coin: str,
+    direction: str,  # "long" -> BUY trades, "short" -> SELL trades (совместимо с scan_fundings_spreads_bot)
+    start_ms: int,
+    end_ms: int,
+) -> Optional[float]:
+    """
+    Пытается получить комиссии XT Futures из trade-list за окно времени.
+    Возвращает сумму комиссий в USDT или None если не удалось.
+    """
+    try:
+        symbol = exchange_obj._normalize_symbol(coin)
+        want_side = "BUY" if (direction or "").lower().strip() == "long" else "SELL"
+
+        # XT docs for trade-list params are inconsistent; пробуем несколько вариантов params.
+        params_variants: List[Dict[str, Any]] = [
+            {"symbol": symbol, "startTime": str(start_ms), "endTime": str(end_ms)},
+            {"symbol": symbol, "startTime": start_ms, "endTime": end_ms},
+            {"symbol": symbol},
+            {"startTime": str(start_ms), "endTime": str(end_ms)},
+        ]
+
+        data: Any = None
+        for params in params_variants:
+            data = await _xt_private_request(
+                exchange_obj=exchange_obj,
+                api_key=api_key,
+                api_secret=api_secret,
+                method="GET",
+                path="/future/trade/v1/order/trade-list",
+                params=params,
+            )
+            if isinstance(data, dict) and data.get("returnCode") == 0:
+                break
+
+        if not isinstance(data, dict) or data.get("returnCode") != 0:
+            return None
+
+        # Extract trades list from result
+        trades: List[Dict[str, Any]] = []
+        r = data.get("result")
+        if isinstance(r, list):
+            trades = [x for x in r if isinstance(x, dict)]
+        elif isinstance(r, dict):
+            for k in ("list", "items", "data", "rows", "trades"):
+                v = r.get(k)
+                if isinstance(v, list):
+                    trades = [x for x in v if isinstance(x, dict)]
+                    break
+        if not trades:
+            return None
+
+        fee_total = 0.0
+        for t in trades:
+            side = str(t.get("side") or t.get("orderSide") or t.get("tradeSide") or "").upper()
+            if side and side != want_side:
+                continue
+
+            fee_raw = (
+                t.get("fee")
+                or t.get("commission")
+                or t.get("tradeFee")
+                or t.get("execFee")
+                or t.get("feeAmount")
+                or t.get("feeValue")
+            )
+            if fee_raw is None:
+                continue
+            try:
+                fee_val = abs(float(fee_raw))
+            except Exception:
+                continue
+
+            fee_coin = str(t.get("feeCoin") or t.get("feeAsset") or t.get("commissionAsset") or "USDT")
+            if fee_coin.upper() in ("USDT", "USDC"):
+                fee_total += fee_val
+                continue
+
+            # If fee is in base coin, try convert using trade price
+            px_raw = t.get("price") or t.get("execPrice") or t.get("dealPrice") or t.get("tradePrice")
+            if px_raw is not None and fee_coin.lower() in (coin.lower(), coin.lower() + "usdt"):
+                try:
+                    fee_total += fee_val * float(px_raw)
+                except Exception:
+                    pass
+
+        return fee_total if fee_total > 0 else None
+    except Exception:
+        return None
+
+async def _xt_private_request(
+    *,
+    exchange_obj: Any,
+    api_key: str,
+    api_secret: str,
+    method: str,
+    path: str,
+    params: Optional[Dict[str, Any]] = None,
+    body: Optional[Dict[str, Any]] = None,
+) -> Any:
+    """
+    XT.com Futures API signing:
+    - Headers (X): validate-algorithms, validate-appkey, validate-recvwindow, validate-timestamp (sorted, joined with &)
+    - Data (Y): #method#path#query#body
+    - Signature: HMAC_SHA256(secretKey, X + Y) as hex
+    - Header: validate-signature
+    """
+    from urllib.parse import urlencode
+
+    method_u = method.upper()
+    ts = str(int(time.time() * 1000))
+    recv_window = str(int(float(os.getenv("XT_RECV_WINDOW", "5000"))))
+
+    is_future_api = path.startswith("/future/")
+    use_json_for_body = is_future_api  # фьючерсные приватные эндпоинты в SDK используют JSON
+
+    # -------------------------
+    # Scheme A (FUTURES): follow official XT futures SDK behavior
+    # - X includes ONLY validate-appkey + validate-timestamp
+    # - Y is "#path" or "#path#payload" (NO method)
+    # - signature is UPPERCASE hex
+    # -------------------------
+    if is_future_api:
+        x_header = {
+            "validate-appkey": api_key,
+            "validate-timestamp": ts,
+        }
+        X = urlencode(dict(sorted(x_header.items(), key=lambda kv: (kv[0], kv[1]))))
+
+        body_str_for_sign = ""
+        content_type = "application/json;charset=UTF-8"
+
+        if params and not body:
+            # urlencoded mode (like SDK's payload.data["urlencoded"]=True)
+            tmp = urlencode(
+                dict(
+                    sorted(
+                        [(k, str(v)) for k, v in params.items() if v is not None],
+                        key=lambda kv: (kv[0], kv[1]),
+                    )
+                ),
+                safe=",",
+            )
+            Y = f"#{path}#{tmp}"
+            content_type = "application/x-www-form-urlencoded"
+        elif body:
+            # IMPORTANT: SDK signs json.dumps(...) DEFAULT formatting (with spaces)
+            # To avoid mismatch, we send exactly the same bytes we sign.
+            body_str_for_sign = json.dumps(body, ensure_ascii=True)
+            Y = f"#{path}#{body_str_for_sign}"
+        else:
+            Y = f"#{path}"
+
+        original = X + Y
+        sign = hmac.new(api_secret.encode("utf-8"), original.encode("utf-8"), hashlib.sha256).hexdigest().upper()
+
+        # Even though futures-SDK signs only appkey+timestamp, XT API often expects
+        # validate-algorithms/validate-recvwindow headers to be present.
+        headers = {
+            "validate-algorithms": "HmacSHA256",
+            "validate-appkey": api_key,
+            "validate-recvwindow": recv_window,
+            "validate-timestamp": ts,
+            "validate-signature": sign,
+            "Content-Type": content_type,
+            "Accept": "application/json",
+        }
+
+        req_kwargs: Dict[str, Any] = {"headers": headers}
+        if params and not body:
+            req_kwargs["params"] = params
+        if body:
+            req_kwargs["content"] = body_str_for_sign.encode("utf-8")
+
+        logger.warning(f"🔍 XT NEW signature debug: header_part={X}")
+        logger.warning(f"🔍 XT NEW signature debug: data_part={Y}")
+        logger.warning(f"🔍 XT NEW signature debug: original={original}")
+        logger.warning(f"🔍 XT NEW signature: {sign}")
+
+    # -------------------------
+    # Scheme B (V4 / others): follow XT docs
+    # - X includes validate-algorithms/appkey/recvwindow/timestamp
+    # - Y is #METHOD#path#query#body
+    # - signature is lowercase hex
+    # -------------------------
+    else:
+        x_parts = [
+            ("validate-algorithms", "HmacSHA256"),
+            ("validate-appkey", api_key),
+            ("validate-recvwindow", recv_window),
+            ("validate-timestamp", ts),
+        ]
+        x_parts_sorted = sorted([(k, str(v)) for (k, v) in x_parts], key=lambda kv: kv[0])
+        header_part = "&".join([f"{k}={v}" for (k, v) in x_parts_sorted])
+
+        query = ""
+        if params:
+            q_pairs = sorted([(k, str(v)) for k, v in params.items() if v is not None], key=lambda kv: kv[0])
+            query = "&".join([f"{k}={v}" for (k, v) in q_pairs])
+
+        body_str_for_sign = ""
+        if body:
+            b_pairs = sorted([(k, str(v)) for k, v in body.items() if v is not None], key=lambda kv: kv[0])
+            body_str_for_sign = "&".join([f"{k}={v}" for (k, v) in b_pairs])
+
+        if query and body_str_for_sign:
+            data_part = f"#{method_u}#{path}#{query}#{body_str_for_sign}"
+        elif query and (not body_str_for_sign):
+            data_part = f"#{method_u}#{path}#{query}"
+        elif (not query) and body_str_for_sign:
+            data_part = f"#{method_u}#{path}#{body_str_for_sign}"
+        else:
+            data_part = f"#{method_u}#{path}"
+
+        original = header_part + data_part
+        sign = hmac.new(api_secret.encode("utf-8"), original.encode("utf-8"), hashlib.sha256).hexdigest()
+
+        headers = {
+            "validate-algorithms": "HmacSHA256",
+            "validate-appkey": api_key,
+            "validate-recvwindow": recv_window,
+            "validate-timestamp": ts,
+            "validate-signature": sign,
+        }
+        req_kwargs = {"headers": headers}
+        if body_str_for_sign:
+            headers["Content-Type"] = "application/x-www-form-urlencoded"
+            req_kwargs["content"] = body_str_for_sign
+        else:
+            headers["Content-Type"] = "application/json"
+            headers["Accept"] = "application/json"
+        if params:
+            req_kwargs["params"] = params
+
+        logger.warning(f"🔍 XT NEW signature debug: header_part={header_part}")
+        logger.warning(f"🔍 XT NEW signature debug: data_part={data_part}")
+        logger.warning(f"🔍 XT NEW signature debug: original={original}")
+        logger.warning(f"🔍 XT NEW signature: {sign}")
+    
+    try:
+        resp = await exchange_obj.client.request(method_u, path, **req_kwargs)
+    except Exception as e:
+        return {"_error": f"http error: {type(e).__name__}: {e}"}
+    if resp.status_code < 200 or resp.status_code >= 300:
+        return {"_error": f"http {resp.status_code}", "_body": resp.text[:400]}
+    try:
+        return resp.json()
+    except Exception:
+        return {"_error": "bad json", "_body": resp.text[:400]}
+
+
+async def _xt_fetch_instrument_filters(*, exchange_obj: Any, symbol: str) -> Dict[str, Optional[str]]:
+    """
+    Возвращает фильтры инструмента XT.com (fapi): qtyStep, minOrderQty, minOrderAmt, tickSize, contractSize.
+    Пробует несколько эндпоинтов для получения информации об инструменте.
+    """
+    def _precision_to_step_str(raw: Any) -> Optional[str]:
+        if raw is None:
+            return None
+        # Sometimes XT returns *precision* as integer (number of decimals), not a step size.
+        try:
+            p = int(str(raw))
+            if 0 <= p < 20:
+                return "1" if p == 0 else str(10 ** (-p))
+        except Exception:
+            pass
+        # Otherwise treat as already a step value
+        try:
+            s = str(raw).strip()
+            return s if s else None
+        except Exception:
+            return None
+
+    # Official SDK uses /future/market/v1/public/symbol/detail for symbol metadata.
+    endpoints = [
+        "/future/market/v1/public/symbol/detail",
+        # fallbacks (older/alternative)
+        "/future/market/v1/public/q/instrument",
+        "/future/market/v1/public/q/symbol",
+        "/future/market/v1/public/q/contract",
+    ]
+    
+    for endpoint in endpoints:
+        try:
+            resp = await exchange_obj.client.request(
+                "GET",
+                endpoint,
+                params={"symbol": symbol},
+            )
+            if resp.status_code < 200 or resp.status_code >= 300:
+                continue
+            data = resp.json()
+            if not isinstance(data, dict) or data.get("returnCode") != 0:
+                continue
+            result = data.get("result")
+            info: Optional[Dict[str, Any]] = None
+            if isinstance(result, dict):
+                info = result
+            elif isinstance(result, list) and result and isinstance(result[0], dict):
+                info = result[0]
+            if not isinstance(info, dict):
+                continue
+            
+            # Extract filters from info - try multiple keys.
+            qty_step = info.get("qtyStep") or info.get("stepSize") or info.get("lotSize")
+            qty_precision = info.get("quantityPrecision") or info.get("qtyPrecision") or info.get("qtyScale")
+            if qty_step is None and qty_precision is not None:
+                qty_step = _precision_to_step_str(qty_precision)
+            else:
+                qty_step = _precision_to_step_str(qty_step)
+
+            min_qty = info.get("minOrderQty") or info.get("minQty") or info.get("minQuantity")
+            min_amt = info.get("minOrderAmt") or info.get("minNotional") or info.get("minOrderValue")
+
+            tick_size = info.get("tickSize") or info.get("priceTick") or info.get("tick")
+            price_precision = info.get("pricePrecision") or info.get("priceScale")
+            if tick_size is None and price_precision is not None:
+                tick_size = _precision_to_step_str(price_precision)
+            else:
+                tick_size = _precision_to_step_str(tick_size)
+
+            contract_size = (
+                info.get("contractSize")
+                or info.get("contractUnit")
+                or info.get("contractValue")
+                or info.get("contractVal")
+                or info.get("multiplier")
+                or info.get("contractMultiplier")
+                or info.get("contractMul")
+            )
+            
+            return {
+                "qtyStep": str(qty_step) if qty_step is not None else None,
+                "minOrderQty": str(min_qty) if min_qty is not None else None,
+                "minOrderAmt": str(min_amt) if min_amt is not None else None,
+                "tickSize": str(tick_size) if tick_size is not None else None,
+                "contractSize": str(contract_size) if contract_size is not None else None,
+            }
+        except Exception:
+            continue
+    
+    # Fallback: возвращаем пустой dict, код будет использовать значения по умолчанию
+    logger.warning(f"⚠️ XT: не удалось получить фильтры для {symbol}, используем значения по умолчанию")
+    return {}
+
+
+async def _xt_plan_leg(*, exchange_obj: Any, coin: str, direction: str, coin_amount: float) -> Any:
+    api_key = _get_env("XT_API_KEY")
+    api_secret = _get_env("XT_API_SECRET")
+    if not api_key or not api_secret:
+        return OpenLegResult(exchange="xt", direction=direction, ok=False, error="missing XT_API_KEY/XT_API_SECRET in env")
+    
+    symbol = exchange_obj._normalize_symbol(coin)
+    order_side = "BUY" if direction == "long" else "SELL"
+    
+    ob = await exchange_obj.get_orderbook(coin, limit=MAX_ORDERBOOK_LEVELS)
+    if not ob or not ob.get("bids") or not ob.get("asks"):
+        return OpenLegResult(exchange="xt", direction=direction, ok=False, error=f"orderbook not available for {coin}")
+    book_side = ob["asks"] if order_side == "BUY" else ob["bids"]
+    best_price = float(book_side[0][0])
+    if best_price <= 0:
+        return OpenLegResult(exchange="xt", direction=direction, ok=False, error="bad orderbook best price")
+    
+    f = await _xt_fetch_instrument_filters(exchange_obj=exchange_obj, symbol=symbol)
+    qty_step_raw = f.get("qtyStep")
+    min_qty_raw = f.get("minOrderQty")
+    min_amt_raw = f.get("minOrderAmt")
+    tick_raw = f.get("tickSize")
+    contract_size_raw = f.get("contractSize")
+
+    # NOTE: On XT futures, origQty is typically in CONTRACTS, not in base coins.
+    # We keep public API of our bot in "coin_amount" (base coins), but convert to contracts for XT.
+    contract_size = float(contract_size_raw) if contract_size_raw else 1.0
+    if contract_size <= 0:
+        contract_size = 1.0
+
+    qty_step = float(qty_step_raw) if qty_step_raw else 0.0001  # step in contracts
+    min_qty = float(min_qty_raw) if min_qty_raw else 0.0         # min in contracts
+    min_amt = float(min_amt_raw) if min_amt_raw else 0.0
+    tick = float(tick_raw) if tick_raw else 0.0001
+
+    contracts = coin_amount / contract_size
+    if qty_step > 0 and not _is_multiple_of_step(contracts, qty_step):
+        return OpenLegResult(
+            exchange="xt",
+            direction=direction,
+            ok=False,
+            error=f"qty {coin_amount} {coin} (= {contracts} contracts) not multiple of qtyStep {qty_step_raw}",
+        )
+    if min_qty > 0 and contracts < min_qty:
+        min_coins = min_qty * contract_size
+        return OpenLegResult(
+            exchange="xt",
+            direction=direction,
+            ok=False,
+            error=f"qty {coin_amount} {coin} (< {min_coins} {coin} min) | minOrderQty={min_qty_raw} contracts | contractSize={contract_size_raw}",
+        )
+    notional = coin_amount * best_price
+    if min_amt > 0 and notional < min_amt:
+        return OpenLegResult(
+            exchange="xt", direction=direction, ok=False,
+            error=f"Order does not meet minimum order value {min_amt:.3f}USDT (requested ~{notional:.3f}USDT)",
+        )
+
+    # Display qty in coins (user-facing), but store contracts for order placement.
+    qty_coin_str = _format_number(coin_amount)
+    qty_contracts_str = _format_by_step(contracts, qty_step_raw) if qty_step_raw else _format_number(contracts)
+    logger.info(f"План XT: {direction} qty={qty_coin_str} | best={_format_number(best_price)} | уровни 1..{MAX_ORDERBOOK_LEVELS} (IOC)")
+    
+    return {
+        "exchange": "xt",
+        "direction": direction,
+        "exchange_obj": exchange_obj,
+        "symbol": symbol,
+        "order_side": order_side,
+        "coin": coin,
+        "coin_amount": coin_amount,
+        "qty": qty_coin_str,
+        "contracts_qty": contracts,
+        "contracts_qty_str": qty_contracts_str,
+        "contract_size": contract_size,
+        "qty_step_raw": qty_step_raw,
+        "tick_raw": tick_raw,
+        "api_key": api_key,
+        "api_secret": api_secret,
+    }
+
+
+async def _xt_place_leg(*, planned: Dict[str, Any]) -> OpenLegResult:
+    exchange_obj = planned["exchange_obj"]
+    api_key = planned["api_key"]
+    api_secret = planned["api_secret"]
+    direction = planned["direction"]
+    order_side = planned["order_side"]
+    coin = planned["coin"]
+    coin_amount = float(planned["coin_amount"])
+    contract_size = float(planned.get("contract_size") or 1.0)
+    if contract_size <= 0:
+        contract_size = 1.0
+    tick_raw = planned.get("tick_raw")
+    tick = float(tick_raw) if tick_raw else 0.0
+    qty_step_raw = planned.get("qty_step_raw")
+    
+    total_filled = 0.0
+    total_notional = 0.0
+    last_order_id: Optional[str] = None
+    
+    for level_idx in range(1, MAX_ORDERBOOK_LEVELS + 1):
+        remaining = coin_amount - total_filled
+        if remaining <= 0:
+            break
+        ob = await exchange_obj.get_orderbook(coin, limit=MAX_ORDERBOOK_LEVELS)
+        if not ob or not ob.get("bids") or not ob.get("asks"):
+            break
+        book_side = ob["asks"] if order_side == "BUY" else ob["bids"]
+        if level_idx > len(book_side):
+            break
+        try:
+            price_raw = float(book_side[level_idx - 1][0])
+        except (IndexError, TypeError, ValueError):
+            break
+        if price_raw <= 0:
+            logger.error(f"❌ XT: invalid price_raw={price_raw} at level {level_idx}")
+            break
+        px = _round_price_for_side(price_raw, tick, "buy" if order_side == "BUY" else "sell")
+        if px <= 0:
+            logger.error(f"❌ XT: rounded price <= 0: px={px}, price_raw={price_raw}, tick={tick}")
+            break
+        px_str = _format_by_step(px, tick_raw) if tick_raw else str(px)
+        remaining_contracts = remaining / contract_size
+        qty_contracts_str = _format_by_step(remaining_contracts, qty_step_raw) if qty_step_raw else _format_number(remaining_contracts)
+        try:
+            if float(qty_contracts_str) <= 0:
+                break
+        except Exception:
+            break
+        # Log qty in coins (user-facing), send qty in contracts to XT
+        logger.info(
+            f"XT: уровень {level_idx}/{MAX_ORDERBOOK_LEVELS} | {direction} qty={_format_number(remaining)} | "
+            f"лимит={px_str} | осталось={_format_number(remaining)}"
+        )
+        
+        # XT.com order creation endpoint - пробуем несколько вариантов
+        # Параметры должны быть строками
+        # positionSide обязателен для фьючерсов: LONG для long позиции, SHORT для short позиции
+        position_side = "LONG" if direction == "long" else "SHORT"
+        
+        # Для /v4/order могут быть другие названия параметров (side вместо orderSide, type вместо orderType)
+        # Пробуем оба варианта в зависимости от эндпоинта
+        # Для фьючерсов может потребоваться positionSide даже в /v4/order
+        body_future = {
+            "symbol": str(planned["symbol"]),
+            "orderSide": str(order_side),  # Для /future/trade/v1/*
+            "orderType": "LIMIT",
+            "origQty": str(qty_contracts_str),  # contracts
+            "price": str(px_str),
+            "timeInForce": "IOC",
+            "positionSide": position_side,
+        }
+        
+        # Пробуем правильные эндпоинты для создания ордеров на фьючерсах XT.com
+        # Из официального SDK: правильный эндпоинт - /future/trade/v1/order/create с json=data
+        # /v4/order не предназначен для фьючерсов (вернул returnCode=0, но без orderId)
+        # Futures: official SDK uses ONLY /future/trade/v1/order/create
+        # Other endpoints here were returning 404 or non-actionable responses.
+        endpoints_to_try = [
+            ("/future/trade/v1/order/create", body_future),
+        ]
+        
+        data = None
+        last_error = None
+        successful_data = None
+        
+        for endpoint, body_to_use in endpoints_to_try:
+            data = await _xt_private_request(
+                exchange_obj=exchange_obj,
+                api_key=api_key,
+                api_secret=api_secret,
+                method="POST",
+                path=endpoint,
+                body=body_to_use,
+            )
+            
+            if isinstance(data, dict) and data.get("returnCode") == 0:
+                # Проверяем, есть ли orderId в ответе
+                result = data.get("result")
+                order_id_check = None
+                if isinstance(result, dict):
+                    order_id_check = result.get("orderId") or result.get("order_id") or result.get("id") or result.get("orderIdStr")
+                elif isinstance(result, (str, int)) and str(result).strip():
+                    # XT может вернуть orderId строкой прямо в result
+                    order_id_check = str(result).strip()
+                if not order_id_check:
+                    order_id_check = data.get("orderId") or data.get("order_id") or data.get("id")
+                if not order_id_check and isinstance(data.get("data"), dict):
+                    order_id_check = data.get("data").get("orderId") or data.get("data").get("id")
+                
+                # Если orderId найден - используем этот ответ
+                if order_id_check:
+                    successful_data = data
+                    break
+                # Если orderId не найден, но returnCode=0 - возможно неправильный эндпоинт
+                # Продолжаем пробовать другие эндпоинты
+                # У некоторых эндпоинтов result может быть строкой/None → не вызываем .get() без проверки
+                r0 = data.get("result")
+                if isinstance(r0, dict) and r0.get("openapiDocs"):
+                    logger.warning(f"⚠️ XT: {endpoint} вернул returnCode=0, но без orderId (только openapiDocs), пробуем следующий эндпоинт")
+                    continue
+                # Если нет openapiDocs, но и нет orderId - тоже продолжаем
+                logger.warning(f"⚠️ XT: {endpoint} вернул returnCode=0, но orderId не найден. result_type={type(r0).__name__}")
+                continue
+            
+            if isinstance(data, dict) and data.get("_error"):
+                # Логируем ошибки для отладки
+                error_msg = str(data.get("_error", ""))
+                error_body = str(data.get("_body", ""))[:200]
+                logger.warning(f"⚠️ XT: {endpoint} вернул ошибку: {error_msg} | body: {error_body}")
+                # Если ошибка не 404 (endpoint не найден), сохраняем её
+                if "404" not in error_msg:
+                    last_error = data
+                continue
+            
+            # Если returnCode != 0, логируем подробнее (важно видеть data['error'])
+            if isinstance(data, dict) and data.get("returnCode") != 0:
+                logger.warning(
+                    f"⚠️ XT: {endpoint} вернул returnCode={data.get('returnCode')}, "
+                    f"msgInfo={data.get('msgInfo', 'N/A')}, error={data.get('error')}"
+                )
+                last_error = data
+                continue
+        
+        # Используем успешный ответ с orderId, если есть
+        if successful_data:
+            data = successful_data
+        elif data is None:
+            data = last_error or {"_error": "all endpoints failed"}
+        
+        if not isinstance(data, dict) or data.get("returnCode") != 0:
+            return OpenLegResult(exchange="xt", direction=direction, ok=False, error=f"api error: {data}", raw=data)
+        
+        # XT.com может возвращать orderId в разных местах
+        # Проверяем несколько возможных путей
+        order_id = None
+        result = data.get("result")
+        
+        # Вариант 1: result.orderId или result.id
+        if isinstance(result, dict):
+            order_id = result.get("orderId") or result.get("order_id") or result.get("id") or result.get("orderIdStr")
+        elif isinstance(result, (str, int)) and str(result).strip():
+            order_id = str(result).strip()
+        
+        # Вариант 2: напрямую в data
+        if not order_id:
+            order_id = data.get("orderId") or data.get("order_id") or data.get("id")
+        
+        # Вариант 3: в data.data (если есть вложенная структура)
+        if not order_id and isinstance(data.get("data"), dict):
+            order_id = data.get("data").get("orderId") or data.get("data").get("id")
+        
+        # Если orderId все еще не найден после всех попыток
+        if not order_id:
+            logger.error(f"❌ XT: orderId не найден в ответе после всех попыток. Response: {str(data)[:500]}")
+            return OpenLegResult(exchange="xt", direction=direction, ok=False, error=f"no orderId in response (returnCode=0): {str(data)[:300]}", raw=data)
+        
+        last_order_id = str(order_id)
+
+        # Get fill from order detail (executedQty is typically in contracts).
+        # IMPORTANT: don't send next IOC order until this one is in a final state,
+        # otherwise we risk overfilling (XT can lag in order updates).
+        await asyncio.sleep(0.15)
+
+        detail: Any = None
+        for _poll in range(8):  # up to ~1.6s
+            detail = await _xt_private_request(
+                exchange_obj=exchange_obj,
+                api_key=api_key,
+                api_secret=api_secret,
+                method="GET",
+                path="/future/trade/v1/order/detail",
+                params={"orderId": last_order_id},
+            )
+            # If API error, retry briefly
+            if not (isinstance(detail, dict) and detail.get("returnCode") == 0):
+                await asyncio.sleep(0.2)
+                continue
+            # Try to detect a terminal status if present
+            r_any = detail.get("result")
+            status = None
+            if isinstance(r_any, dict):
+                status = r_any.get("status") or r_any.get("state") or r_any.get("orderStatus")
+            if status is not None:
+                st = str(status).upper()
+                if st in ("FILLED", "CANCELED", "CANCELLED", "DONE", "FINISHED", "CLOSED", "PARTIALLY_FILLED", "PARTIALLYFILLED"):
+                    break
+            # If no status field, do a few polls anyway
+            await asyncio.sleep(0.2)
+
+        def _first_dict(x: Any) -> Optional[Dict[str, Any]]:
+            if isinstance(x, dict):
+                return x
+            if isinstance(x, list):
+                for it in x:
+                    if isinstance(it, dict):
+                        return it
+            return None
+
+        def _find_num_by_keys(obj: Any, keys: Tuple[str, ...]) -> Optional[float]:
+            # Depth-first search for a numeric field by key name
+            if isinstance(obj, dict):
+                for k in keys:
+                    if k in obj and obj[k] is not None:
+                        try:
+                            return float(obj[k])
+                        except Exception:
+                            pass
+                for v in obj.values():
+                    got = _find_num_by_keys(v, keys)
+                    if got is not None:
+                        return got
+            elif isinstance(obj, list):
+                for it in obj:
+                    got = _find_num_by_keys(it, keys)
+                    if got is not None:
+                        return got
+            return None
+
+        filled_contracts = 0.0
+        avg_px = None
+        if isinstance(detail, dict) and detail.get("returnCode") == 0:
+            r_any = detail.get("result")
+            r = _first_dict(r_any) or _first_dict(detail.get("data")) or _first_dict(detail)
+
+            # Try common keys, then recursive search (XT responses vary)
+            fc = None
+            if isinstance(r, dict):
+                fc_raw = r.get("executedQty") or r.get("filledQty") or r.get("cumQty") or r.get("dealQty") or r.get("executedQuantity")
+                if fc_raw is not None:
+                    try:
+                        fc = float(fc_raw)
+                    except Exception:
+                        fc = None
+            if fc is None:
+                fc = _find_num_by_keys(r_any, ("executedQty", "filledQty", "cumQty", "dealQty", "executedQuantity"))
+            if fc is not None:
+                filled_contracts = float(fc)
+
+            ap = None
+            if isinstance(r, dict):
+                ap_raw = r.get("avgPrice") or r.get("avgPx") or r.get("avg") or r.get("dealAvgPrice") or r.get("avgDealPrice")
+                if ap_raw is not None:
+                    try:
+                        ap = float(ap_raw)
+                    except Exception:
+                        ap = None
+            if ap is None:
+                ap = _find_num_by_keys(r_any, ("avgPrice", "avgPx", "dealAvgPrice", "avgDealPrice"))
+            if ap is not None:
+                avg_px = float(ap)
+        else:
+            # If detail failed, log once (helps debug without crashing)
+            if isinstance(detail, dict):
+                logger.warning(f"⚠️ XT detail: returnCode={detail.get('returnCode')}, msgInfo={detail.get('msgInfo')}, error={detail.get('error')}")
+            else:
+                logger.warning(f"⚠️ XT detail: bad response type={type(detail).__name__} value={str(detail)[:200]}")
+
+        filled_qty = filled_contracts * contract_size
+        if avg_px is None:
+            avg_px = px
+
+        if filled_qty > 0:
+            total_filled += filled_qty
+            total_notional += filled_qty * float(avg_px)
+            logger.info(f"XT: уровень {level_idx} исполнено={_format_number(filled_qty)} | всего={_format_number(total_filled)}")
+        else:
+            # IOC order: if 0 filled, we can move to next level; if parsing failed, this prevents silent looping
+            logger.debug(f"XT: уровень {level_idx} 0 исполнено по order/detail | orderId={last_order_id}")
+    
+    if total_filled >= coin_amount - 1e-9:
+        avg_price = total_notional / total_filled if total_filled > 0 else None
+        return OpenLegResult(
+            exchange="xt", direction=direction, ok=True,
+            order_id=last_order_id, filled_qty=total_filled, avg_price=avg_price, raw=None,
+        )
+    return OpenLegResult(
+        exchange="xt", direction=direction, ok=False,
+        error=f"не набрали объём за {MAX_ORDERBOOK_LEVELS} уровней: исполнено={_format_number(total_filled)}, требовалось={_format_number(coin_amount)}",
+    )
+
+
+async def _xt_close_leg_partial_ioc(
+    *,
+    exchange_obj: Any,
+    coin: str,
+    position_direction: str,
+    coin_amount: float,
+    position_idx: Optional[int] = None,
+) -> Tuple[bool, Optional[float]]:
+    """
+    Закрытие позиции на XT.com частями: limit + IOC + reduceOnly.
+    """
+    api_key = _get_env("XT_API_KEY")
+    api_secret = _get_env("XT_API_SECRET")
+    if not api_key or not api_secret:
+        logger.error("❌ XT: missing XT_API_KEY/XT_API_SECRET in env")
+        return False, None
+    
+    pos_dir = (position_direction or "").lower().strip()
+    if pos_dir not in ("long", "short"):
+        logger.error(f"❌ XT: некорректное направление позиции: {position_direction!r}")
+        return False, None
+    
+    remaining = float(coin_amount)
+    if remaining <= 0:
+        return True, None
+    
+    symbol = exchange_obj._normalize_symbol(coin)
+    order_side = "SELL" if pos_dir == "long" else "BUY"  # Close long = sell, close short = buy
+    position_side = "LONG" if pos_dir == "long" else "SHORT"
+    
+    f = await _xt_fetch_instrument_filters(exchange_obj=exchange_obj, symbol=symbol)
+    qty_step_raw = f.get("qtyStep")
+    tick_raw = f.get("tickSize")
+    contract_size_raw = f.get("contractSize")
+    contract_size = float(contract_size_raw) if contract_size_raw else 1.0
+    if contract_size <= 0:
+        contract_size = 1.0
+    # qtyStep/tick can be missing depending on XT response format. For futures, qty is in contracts.
+    # If qtyStep is missing, assume integer contracts (step=1). This is safer than aborting close.
+    if not qty_step_raw:
+        logger.warning(f"⚠️ XT close: qtyStep отсутствует для {symbol}, fallback qtyStep=1 (контракты)")
+        qty_step_raw = "1"
+    qty_step = float(qty_step_raw) if qty_step_raw else 1.0
+
+    if not tick_raw:
+        logger.warning(f"⚠️ XT close: tickSize отсутствует для {symbol}, fallback tickSize=0.0001")
+        tick_raw = "0.0001"
+    tick = float(tick_raw) if tick_raw else 0.0001
+    
+    eps = max(1e-10, remaining * 1e-8)
+    total_notional = 0.0
+    total_filled = 0.0
+    
+    max_orders_total = max(10, MAX_ORDERBOOK_LEVELS * 3)
+    CLOSE_OB_LEVELS = max(10, int(os.getenv("FUN_CLOSE_OB_LEVELS", "25") or "25"))
+    MAX_TOTAL_SEC = float(os.getenv("FUN_CLOSE_MAX_TOTAL_SEC", "30.0") or "30.0")
+    
+    start_ts = time.time()
+    
+    def _first_dict(x: Any) -> Optional[Dict[str, Any]]:
+        if isinstance(x, dict):
+            return x
+        if isinstance(x, list):
+            for it in x:
+                if isinstance(it, dict):
+                    return it
+        return None
+
+    def _find_num_by_keys(obj: Any, keys: Tuple[str, ...]) -> Optional[float]:
+        if isinstance(obj, dict):
+            for k in keys:
+                if k in obj and obj[k] is not None:
+                    try:
+                        return float(obj[k])
+                    except Exception:
+                        pass
+            for v in obj.values():
+                got = _find_num_by_keys(v, keys)
+                if got is not None:
+                    return got
+        elif isinstance(obj, list):
+            for it in obj:
+                got = _find_num_by_keys(it, keys)
+                if got is not None:
+                    return got
+        return None
+
+    for order_n in range(1, max_orders_total + 1):
+        if time.time() - start_ts > MAX_TOTAL_SEC:
+            logger.error(f"❌ XT close: timeout {MAX_TOTAL_SEC}s exceeded | remaining={_format_number(remaining)} {coin}")
+            avg_price = (total_notional / total_filled) if total_filled > 0 else None
+            return False, avg_price
+        
+        if remaining <= eps:
+            avg_price = (total_notional / total_filled) if total_filled > 0 else None
+            return True, avg_price
+        
+        ob = await exchange_obj.get_orderbook(coin, limit=CLOSE_OB_LEVELS)
+        if not ob or not ob.get("bids") or not ob.get("asks"):
+            logger.error(f"❌ XT: orderbook недоступен для закрытия {coin}")
+            return False, None
+        
+        levels = ob["bids"] if order_side == "SELL" else ob["asks"]
+        if not isinstance(levels, list) or not levels:
+            logger.error(f"❌ XT: пустой стакан для закрытия {coin}")
+            return False, None
+        
+        # Choose price from orderbook level (like open logic), to gradually get more aggressive.
+        level_idx = min(order_n, min(len(levels), CLOSE_OB_LEVELS))
+        try:
+            px_level = float(levels[level_idx - 1][0])
+        except Exception:
+            logger.error(f"❌ XT close: не удалось взять цену уровня {level_idx} для {coin}")
+            return False, None
+        
+        # XT futures origQty is in contracts; convert remaining coins -> contracts
+        remaining_contracts = remaining / contract_size
+        qty_send_contracts = remaining_contracts
+        if qty_step > 0:
+            qty_send_contracts = _floor_to_step(qty_send_contracts, qty_step)
+            if qty_send_contracts <= 0:
+                avg_price = (total_notional / total_filled) if total_filled > 0 else None
+                return True, avg_price
+        qty_str = _format_by_step(qty_send_contracts, qty_step_raw) if qty_step > 0 else str(qty_send_contracts)
+        px = _round_price_for_side(float(px_level), tick, "sell" if order_side == "SELL" else "buy")
+        px_str = _format_by_step(px, tick_raw) if tick > 0 else str(px)
+        
+        logger.info(
+            f"XT close: попытка {order_n}/{max_orders_total} | side={order_side} qty={qty_str} | "
+            f"лимит={px_str} | remaining={_format_number(remaining)}"
+        )
+        
+        body = {
+            "symbol": symbol,
+            "orderSide": order_side,
+            "orderType": "LIMIT",
+            "origQty": qty_str,
+            "price": px_str,
+            "timeInForce": "IOC",
+            "reduceOnly": True,  # Close position
+            "positionSide": position_side,
+        }
+        
+        data = await _xt_private_request(
+            exchange_obj=exchange_obj,
+            api_key=api_key,
+            api_secret=api_secret,
+            method="POST",
+            path="/future/trade/v1/order/create",
+            body=body,
+        )
+        
+        if not isinstance(data, dict) or data.get("returnCode") != 0:
+            logger.error(f"❌ XT close: api error: {data}")
+            return False, None
+        
+        order_id = None
+        result = data.get("result")
+        if isinstance(result, dict):
+            order_id = result.get("orderId") or result.get("order_id") or result.get("id") or result.get("orderIdStr")
+        elif isinstance(result, (str, int)) and str(result).strip():
+            order_id = str(result).strip()
+        
+        if order_id:
+            await asyncio.sleep(0.1)
+            detail = await _xt_private_request(
+                exchange_obj=exchange_obj,
+                api_key=api_key,
+                api_secret=api_secret,
+                method="GET",
+                path="/future/trade/v1/order/detail",
+                params={"orderId": str(order_id)},
+            )
+            
+            filled_contracts = 0.0
+            if isinstance(detail, dict) and detail.get("returnCode") == 0:
+                r_any = detail.get("result")
+                r = _first_dict(r_any) or _first_dict(detail.get("data")) or _first_dict(detail)
+                fc = None
+                if isinstance(r, dict):
+                    fc_raw = r.get("executedQty") or r.get("filledQty") or r.get("cumQty") or r.get("dealQty") or r.get("executedQuantity")
+                    if fc_raw is not None:
+                        try:
+                            fc = float(fc_raw)
+                        except Exception:
+                            fc = None
+                if fc is None:
+                    fc = _find_num_by_keys(r_any, ("executedQty", "filledQty", "cumQty", "dealQty", "executedQuantity"))
+                if fc is not None:
+                    filled_contracts = float(fc)
+            
+            filled_qty = filled_contracts * contract_size
+            if filled_qty > 0:
+                total_notional += filled_qty * px
+                total_filled += filled_qty
+                remaining = max(0.0, remaining - filled_qty)
+        
+        await asyncio.sleep(0)
+    
+    avg_price = (total_notional / total_filled) if total_filled > 0 else None
+    return remaining <= eps, avg_price
 
 

@@ -33,7 +33,13 @@ def _windows_ctrl_z_listener() -> None:
 import config
 from bot import PerpArbitrageBot, format_number
 from input_parser import parse_input
-from position_opener import open_long_short_positions, close_long_short_positions, get_binance_fees_from_trades, get_binance_funding_from_income
+from position_opener import (
+    open_long_short_positions,
+    close_long_short_positions,
+    get_binance_fees_from_trades,
+    get_binance_funding_from_income,
+    get_xt_fees_from_trades,
+)
 from telegram_sender import TelegramSender
 from fun import _bybit_fetch_executions, _bybit_fetch_funding_from_transaction_log
 
@@ -93,6 +99,7 @@ async def _get_real_fees_from_executions(
             "mexc": ("MEXC_API_KEY", "MEXC_API_SECRET"),
             "bitget": ("BITGET_API_KEY", "BITGET_API_SECRET", "BITGET_API_PASSPHRASE"),
             "bingx": ("BINGX_API_KEY", "BINGX_API_SECRET"),
+            "xt": ("XT_API_KEY", "XT_API_SECRET"),
         }
         
         env_keys = api_key_env_map.get(exchange_name.lower())
@@ -172,6 +179,19 @@ async def _get_real_fees_from_executions(
                 end_ms=end_ms,
             )
             return fee_total
+
+        if exchange_name.lower() == "xt":
+            end_ms = int(time.time() * 1000)
+            start_ms = end_ms - (time_window_sec * 1000)
+            return await get_xt_fees_from_trades(
+                exchange_obj=exchange_obj,
+                api_key=api_key,
+                api_secret=api_secret,
+                coin=coin,
+                direction=direction,
+                start_ms=start_ms,
+                end_ms=end_ms,
+            )
         
         # TODO: Реализовать получение комиссий для Gate, MEXC, Bitget, BingX
         return None
