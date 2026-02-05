@@ -4256,11 +4256,6 @@ async def _xt_private_request(
         if body:
             req_kwargs["content"] = body_str_for_sign.encode("utf-8")
 
-        logger.warning(f"🔍 XT NEW signature debug: header_part={X}")
-        logger.warning(f"🔍 XT NEW signature debug: data_part={Y}")
-        logger.warning(f"🔍 XT NEW signature debug: original={original}")
-        logger.warning(f"🔍 XT NEW signature: {sign}")
-
     # -------------------------
     # Scheme B (V4 / others): follow XT docs
     # - X includes validate-algorithms/appkey/recvwindow/timestamp
@@ -4315,11 +4310,6 @@ async def _xt_private_request(
             headers["Accept"] = "application/json"
         if params:
             req_kwargs["params"] = params
-
-        logger.warning(f"🔍 XT NEW signature debug: header_part={header_part}")
-        logger.warning(f"🔍 XT NEW signature debug: data_part={data_part}")
-        logger.warning(f"🔍 XT NEW signature debug: original={original}")
-        logger.warning(f"🔍 XT NEW signature: {sign}")
     
     try:
         resp = await exchange_obj.client.request(method_u, path, **req_kwargs)
