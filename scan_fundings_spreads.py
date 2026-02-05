@@ -453,7 +453,7 @@ def _get_exchange_url(exchange: str, coin: str) -> str:
     if ex_l == "mexc":
         return f"https://www.mexc.com/ru-RU/futures/{coin_u}_USDT"
     if ex_l == "xt":
-        return f"https://www.xt.com/ru/trade/{coin_u.lower()}_usdt"
+        return f"https://www.xt.com/ru/futures/trade/{coin_u.lower()}_usdt"
     if ex_l == "lbank":
         return f"https://www.lbank.com/ru/trade/{coin_u.lower()}/"
     return f"https://www.{ex_l}.com"
