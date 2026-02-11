@@ -2,13 +2,16 @@
 Бот для арбитража фьючерсов между биржами
 """
 import asyncio
+import base64
 import logging
 import os
 import re
+import hmac
+import hashlib
 import sys
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Optional, Dict, List, Any
+from typing import Optional, Dict, List, Any, Tuple
 from exchanges.async_bybit import AsyncBybitExchange
 from exchanges.async_gate import AsyncGateExchange
 from exchanges.async_mexc import AsyncMexcExchange
@@ -21,10 +24,21 @@ from exchanges.async_bingx import AsyncBingxExchange
 from input_parser import parse_input
 from news_monitor import NewsMonitor
 from announcements_monitor import AnnouncementsMonitor
-from x_news_monitor import XNewsMonitor
 from telegram_sender import TelegramSender
 import config
-from position_opener import open_long_short_positions, close_long_short_positions
+from position_opener import (
+    OpenLegResult,
+    _binance_private_request,
+    _bingx_private_request,
+    _bitget_private_request,
+    _bybit_private_request,
+    _gate_private_request,
+    _mexc_private_request,
+    _xt_private_request,
+    _plan_one_leg,
+    close_long_short_positions,
+    open_long_short_positions,
+)
 
 # Настройка логирования
 logging.basicConfig(
@@ -90,7 +104,6 @@ class PerpArbitrageBot:
         }
         self.news_monitor = NewsMonitor()
         self.announcements_monitor = AnnouncementsMonitor(news_monitor=self.news_monitor)
-        self.x_news_monitor = XNewsMonitor()
     
     async def close(self):
         """Закрывает соединения с биржами"""
@@ -208,6 +221,404 @@ class PerpArbitrageBot:
         funding_long_abs = abs(funding_long)
         funding_short_abs = abs(funding_short)
         return (funding_long_abs - funding_short_abs) * 100.0
+
+    def _extract_usdt_available(self, payload: Any) -> Optional[float]:
+        """
+        Best-effort extraction of available USDT balance from heterogeneous API payloads.
+        """
+        target_keys = ("coin", "currency", "asset", "marginCoin", "settleCoin", "ccy")
+        value_keys = (
+            "availableToWithdraw",
+            "availableBalance",
+            "available",
+            "availBal",
+            "availEq",
+            "cashBal",
+            "walletBalance",
+            "equity",
+            "balance",
+        )
+        best: Optional[float] = None
+        stack: List[Any] = [payload]
+        seen_ids = set()
+        max_nodes = 1500
+        n = 0
+
+        while stack and n < max_nodes:
+            n += 1
+            cur = stack.pop()
+            oid = id(cur)
+            if oid in seen_ids:
+                continue
+            seen_ids.add(oid)
+
+            if isinstance(cur, dict):
+                coin_val = None
+                for k in target_keys:
+                    if cur.get(k) is not None:
+                        coin_val = str(cur.get(k)).upper().strip()
+                        break
+                if coin_val == "USDT":
+                    for vk in value_keys:
+                        raw = cur.get(vk)
+                        if raw is None:
+                            continue
+                        try:
+                            val = float(raw)
+                        except Exception:
+                            continue
+                        if val >= 0 and (best is None or val > best):
+                            best = val
+                for v in cur.values():
+                    if isinstance(v, (dict, list)):
+                        stack.append(v)
+            elif isinstance(cur, list):
+                for item in cur:
+                    if isinstance(item, (dict, list)):
+                        stack.append(item)
+
+        return best
+
+    async def _get_exchange_usdt_available(self, exchange_name: str, exchange_obj: Any) -> Tuple[Optional[float], str]:
+        ex = (exchange_name or "").lower().strip()
+        try:
+            if ex == "bybit":
+                api_key = os.getenv("BYBIT_API_KEY", "").strip()
+                api_secret = os.getenv("BYBIT_API_SECRET", "").strip()
+                if not api_key or not api_secret:
+                    return None, "missing BYBIT_API_KEY/BYBIT_API_SECRET"
+                for account_type in ("UNIFIED", "CONTRACT"):
+                    data = await _bybit_private_request(
+                        exchange_obj=exchange_obj,
+                        api_key=api_key,
+                        api_secret=api_secret,
+                        method="GET",
+                        path="/v5/account/wallet-balance",
+                        params={"accountType": account_type, "coin": "USDT"},
+                    )
+                    if isinstance(data, dict) and data.get("retCode") not in (None, 0):
+                        msg = str(data.get("retMsg") or data.get("retCode"))
+                        return None, f"wallet-balance error: {msg}"
+                    val = self._extract_usdt_available(data)
+                    if val is not None:
+                        return val, f"accountType={account_type}"
+                return None, "USDT not found in wallet-balance"
+
+            if ex == "mexc":
+                api_key = os.getenv("MEXC_API_KEY", "").strip()
+                api_secret = os.getenv("MEXC_API_SECRET", "").strip()
+                if not api_key or not api_secret:
+                    return None, "missing MEXC_API_KEY/MEXC_API_SECRET"
+                data = await _mexc_private_request(
+                    exchange_obj=exchange_obj,
+                    api_key=api_key,
+                    api_secret=api_secret,
+                    method="GET",
+                    path="/api/v1/private/account/assets",
+                    params={},
+                )
+                if isinstance(data, dict) and data.get("_error"):
+                    return None, f"account/assets error: {data.get('_error')}"
+                if isinstance(data, dict) and data.get("success") is False:
+                    msg = str(data.get("msg") or data.get("code") or "unknown error")
+                    return None, f"account/assets error: {msg}"
+                val = self._extract_usdt_available(data)
+                if val is not None:
+                    return val, "account/assets"
+                return None, "USDT not found in account/assets"
+
+            if ex == "binance":
+                api_key = os.getenv("BINANCE_API_KEY", "").strip()
+                api_secret = os.getenv("BINANCE_API_SECRET", "").strip()
+                if not api_key or not api_secret:
+                    return None, "missing BINANCE_API_KEY/BINANCE_API_SECRET"
+                data = await _binance_private_request(
+                    exchange_obj=exchange_obj,
+                    api_key=api_key,
+                    api_secret=api_secret,
+                    method="GET",
+                    path="/fapi/v2/balance",
+                    params={},
+                )
+                if isinstance(data, dict) and data.get("_error"):
+                    return None, f"fapi/v2/balance error: {data.get('_error')}"
+                val = self._extract_usdt_available(data)
+                if val is not None:
+                    return val, "fapi/v2/balance"
+                return None, "USDT not found in fapi/v2/balance"
+
+            if ex == "gate":
+                api_key = os.getenv("GATEIO_API_KEY", "").strip()
+                api_secret = os.getenv("GATEIO_API_SECRET", "").strip()
+                if not api_key or not api_secret:
+                    return None, "missing GATEIO_API_KEY/GATEIO_API_SECRET"
+                data = await _gate_private_request(
+                    exchange_obj=exchange_obj,
+                    api_key=api_key,
+                    api_secret=api_secret,
+                    method="GET",
+                    path="/api/v4/futures/usdt/accounts",
+                    params={},
+                )
+                if isinstance(data, dict) and data.get("_error"):
+                    return None, f"futures/usdt/accounts error: {data.get('_error')}"
+                val = self._extract_usdt_available(data)
+                if val is not None:
+                    return val, "futures/usdt/accounts"
+                return None, "USDT not found in futures/usdt/accounts"
+
+            if ex == "bitget":
+                api_key = os.getenv("BITGET_API_KEY", "").strip()
+                api_secret = os.getenv("BITGET_API_SECRET", "").strip()
+                api_passphrase = os.getenv("BITGET_API_PASSPHRASE", "").strip()
+                if not api_key or not api_secret:
+                    return None, "missing BITGET_API_KEY/BITGET_API_SECRET"
+                if not api_passphrase:
+                    return None, "missing BITGET_API_PASSPHRASE"
+
+                data = await _bitget_private_request(
+                    exchange_obj=exchange_obj,
+                    api_key=api_key,
+                    api_secret=api_secret,
+                    api_passphrase=api_passphrase,
+                    method="GET",
+                    path="/api/v2/mix/account/accounts",
+                    params={"productType": "USDT-FUTURES"},
+                )
+                if isinstance(data, dict) and data.get("_error"):
+                    return None, f"mix/account/accounts error: {data.get('_error')}"
+                if isinstance(data, dict) and str(data.get("code")) not in ("00000", "0", ""):
+                    msg = str(data.get("msg") or data.get("code") or "unknown error")
+                    return None, f"mix/account/accounts error: {msg}"
+                val = self._extract_usdt_available(data)
+                if val is not None:
+                    return val, "mix/account/accounts"
+                return None, "USDT not found in mix/account/accounts"
+
+            if ex == "bingx":
+                api_key = os.getenv("BINGX_API_KEY", "").strip()
+                api_secret = os.getenv("BINGX_API_SECRET", "").strip()
+                if not api_key or not api_secret:
+                    return None, "missing BINGX_API_KEY/BINGX_API_SECRET"
+                data = await _bingx_private_request(
+                    exchange_obj=exchange_obj,
+                    api_key=api_key,
+                    api_secret=api_secret,
+                    method="GET",
+                    path="/openApi/swap/v2/user/balance",
+                    params={},
+                )
+                if isinstance(data, dict) and data.get("_error"):
+                    return None, f"user/balance error: {data.get('_error')}"
+                if isinstance(data, dict) and str(data.get("code")) not in ("0", "00000", ""):
+                    msg = str(data.get("msg") or data.get("code") or "unknown error")
+                    return None, f"user/balance error: {msg}"
+                val = self._extract_usdt_available(data)
+                if val is not None:
+                    return val, "user/balance"
+                return None, "USDT not found in user/balance"
+
+            if ex == "xt":
+                api_key = os.getenv("XT_API_KEY", "").strip()
+                api_secret = os.getenv("XT_API_SECRET", "").strip()
+                if not api_key or not api_secret:
+                    return None, "missing XT_API_KEY/XT_API_SECRET"
+                data = await _xt_private_request(
+                    exchange_obj=exchange_obj,
+                    api_key=api_key,
+                    api_secret=api_secret,
+                    method="GET",
+                    path="/future/user/v1/balance/list",
+                    params={},
+                )
+                if isinstance(data, dict) and data.get("_error"):
+                    return None, f"balance/list error: {data.get('_error')}"
+                if isinstance(data, dict) and data.get("returnCode") not in (None, 0):
+                    msg = str(data.get("msg") or data.get("returnCode") or "unknown error")
+                    return None, f"balance/list error: {msg}"
+                val = self._extract_usdt_available(data)
+                if val is not None:
+                    return val, "balance/list"
+                return None, "USDT not found in balance/list"
+
+            if ex == "okx":
+                api_key = os.getenv("OKX_API_KEY", "").strip()
+                api_secret = os.getenv("OKX_API_SECRET", "").strip()
+                api_passphrase = (os.getenv("OKX_API_PASSPHRASE", "").strip() or os.getenv("OKX_API_PASS", "").strip())
+                if not api_key or not api_secret:
+                    return None, "missing OKX_API_KEY/OKX_API_SECRET"
+                if not api_passphrase:
+                    return None, "missing OKX_API_PASSPHRASE"
+
+                method = "GET"
+                path = "/api/v5/account/balance"
+                params = {"ccy": "USDT"}
+                ts = datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+                prehash = f"{ts}{method}{path}?ccy=USDT"
+                sign = base64.b64encode(
+                    hmac.new(api_secret.encode("utf-8"), prehash.encode("utf-8"), hashlib.sha256).digest()
+                ).decode("utf-8")
+                headers = {
+                    "OK-ACCESS-KEY": api_key,
+                    "OK-ACCESS-SIGN": sign,
+                    "OK-ACCESS-TIMESTAMP": ts,
+                    "OK-ACCESS-PASSPHRASE": api_passphrase,
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                }
+                try:
+                    resp = await exchange_obj.client.request(method, path, params=params, headers=headers)
+                except Exception as e:
+                    return None, f"account/balance http error: {type(e).__name__}: {e}"
+                if resp.status_code < 200 or resp.status_code >= 300:
+                    return None, f"account/balance http {resp.status_code}"
+                try:
+                    data = resp.json()
+                except Exception:
+                    return None, "account/balance bad json"
+                if isinstance(data, dict) and str(data.get("code")) not in ("0", ""):
+                    msg = str(data.get("msg") or data.get("code") or "unknown error")
+                    return None, f"account/balance error: {msg}"
+                val = self._extract_usdt_available(data)
+                if val is not None:
+                    return val, "account/balance"
+                return None, "USDT not found in account/balance"
+
+            return None, f"balance check not implemented for {exchange_name}"
+        except Exception as e:
+            return None, str(e)
+
+    async def check_balances_for_coin(
+        self,
+        coin: str,
+        long_exchange: str,
+        short_exchange: str,
+        coin_amount: float,
+        price_long: Optional[float],
+        price_short: Optional[float],
+    ) -> Dict[str, Any]:
+        """
+        Проверка достаточности USDT баланса для открытия обеих ног.
+        """
+        px_long = float(price_long) if price_long is not None and price_long > 0 else None
+        px_short = float(price_short) if price_short is not None and price_short > 0 else None
+        fallback_px = px_long or px_short
+        req_long = float(coin_amount) * float(px_long or fallback_px or 0.0)
+        req_short = float(coin_amount) * float(px_short or fallback_px or 0.0)
+
+        out: Dict[str, Any] = {
+            "ok": True,
+            "long_ok": True,
+            "short_ok": True,
+            "required_long_usdt": req_long,
+            "required_short_usdt": req_short,
+        }
+
+        async def _check_one(ex_name: str, required_usdt: float) -> Tuple[bool, Optional[float], str]:
+            ex_obj = self.exchanges.get(ex_name)
+            if ex_obj is None:
+                return False, None, "exchange not found"
+            if required_usdt <= 0:
+                return True, None, "required_notional_not_available"
+            available, source = await self._get_exchange_usdt_available(ex_name, ex_obj)
+            if available is None:
+                # Не блокируем анализ, если баланс не удалось прочитать (best-effort).
+                src_l = str(source or "").lower()
+                if ex_name.lower() == "mexc" and ("http 401" in src_l or "not logged in" in src_l):
+                    logger.info(
+                        f"ℹ️ Баланс {ex_name} ({coin}): приватный endpoint недоступен (401), проверка баланса пропущена."
+                    )
+                else:
+                    logger.warning(
+                        f"⚠️ Баланс {ex_name} ({coin}): не удалось проверить доступный USDT (причина: {source})."
+                    )
+                return True, None, source
+            ok = available + 1e-9 >= required_usdt
+            status = "✅" if ok else "❌"
+            logger.info(
+                f"{status} Баланс {ex_name} ({coin}): доступно {available:.3f} USDT | "
+                f"требуется ~{required_usdt:.3f} USDT"
+            )
+            if not ok:
+                logger.warning(
+                    f"Недостаточно баланса на {ex_name}: {available:.3f} < {required_usdt:.3f} USDT"
+                )
+            return ok, available, source
+
+        long_ok, long_available, _ = await _check_one(long_exchange, req_long)
+        short_ok, short_available, _ = await _check_one(short_exchange, req_short)
+        out["long_ok"] = bool(long_ok)
+        out["short_ok"] = bool(short_ok)
+        out["long_available_usdt"] = long_available
+        out["short_available_usdt"] = short_available
+        out["ok"] = bool(long_ok and short_ok)
+        return out
+
+    async def check_min_order_constraints_for_coin(
+        self,
+        coin: str,
+        long_exchange: str,
+        short_exchange: str,
+        coin_amount: float,
+    ) -> Dict[str, Any]:
+        """
+        Проверка минимальных ограничений открытия ордеров (step/minQty/minNotional и т.п.)
+        через preflight planner из position_opener.py.
+        """
+        out: Dict[str, Any] = {"ok": True, "long_ok": True, "short_ok": True}
+
+        async def _check_one(ex_name: str, direction: str) -> Tuple[bool, str]:
+            ex_obj = self.exchanges.get(ex_name)
+            if ex_obj is None:
+                return False, "exchange not found"
+            try:
+                plan = await _plan_one_leg(
+                    exchange_name=ex_name,
+                    exchange_obj=ex_obj,
+                    coin=coin,
+                    direction=direction,
+                    coin_amount=float(coin_amount),
+                )
+            except Exception as e:
+                return False, f"preflight exception: {e}"
+
+            if isinstance(plan, OpenLegResult):
+                if plan.ok:
+                    return True, "ok"
+                msg = str(plan.error or "preflight failed")
+                if "trading not implemented for this exchange" in msg.lower():
+                    logger.warning(
+                        f"⚠️ Минимальные ограничения {ex_name} ({direction}): проверка не реализована."
+                    )
+                    return True, msg
+                msg_l = msg.lower()
+                if ex_name.lower() == "mexc" and (
+                    "401" in msg_l or "not logged in" in msg_l or "авториз" in msg_l
+                ):
+                    logger.info(
+                        f"ℹ️ Минимальные ограничения {ex_name} ({direction}): API недоступен для preflight, проверка пропущена."
+                    )
+                    return True, msg
+                return False, msg
+            if isinstance(plan, dict):
+                return True, "ok"
+            return False, f"unexpected preflight result type: {type(plan).__name__}"
+
+        long_ok, long_msg = await _check_one(long_exchange, "long")
+        short_ok, short_msg = await _check_one(short_exchange, "short")
+        out["long_ok"] = bool(long_ok)
+        out["short_ok"] = bool(short_ok)
+        out["ok"] = bool(long_ok and short_ok)
+        out["long_msg"] = long_msg
+        out["short_msg"] = short_msg
+
+        if not long_ok:
+            logger.warning(f"❌ Минимальные ограничения {long_exchange} Long ({coin}): {long_msg}")
+
+        if not short_ok:
+            logger.warning(f"❌ Минимальные ограничения {short_exchange} Short ({coin}): {short_msg}")
+
+        return out
     
     async def process_input(self, input_text: str):
         """
@@ -335,6 +746,24 @@ class PerpArbitrageBot:
         
         logger.info("=" * 60)
         
+        # Проверка баланса на обеих биржах перед анализом ликвидности
+        balances_check = await self.check_balances_for_coin(
+            coin=coin,
+            long_exchange=long_exchange,
+            short_exchange=short_exchange,
+            coin_amount=float(coin_amount),
+            price_long=price_long,
+            price_short=price_short,
+        )
+
+        # Проверка минимальных ограничений на открытие ордеров перед анализом ликвидности
+        min_constraints_check = await self.check_min_order_constraints_for_coin(
+            coin=coin,
+            long_exchange=long_exchange,
+            short_exchange=short_exchange,
+            coin_amount=float(coin_amount),
+        )
+
         # Проверяем ликвидность на обеих биржах для указанного размера инвестиций
         # Оценка в USDT для ликвидности: используем last price как приближение
         approx_price = None
@@ -343,6 +772,8 @@ class PerpArbitrageBot:
         elif price_short is not None and price_short > 0:
             approx_price = price_short
         approx_notional_usdt = float(coin_amount) * float(approx_price) if approx_price else 0.0
+        if not balances_check.get("ok", True):
+            logger.warning("Недостаточно баланса для открытия обеих ног (анализ ликвидности продолжается).")
         if approx_notional_usdt > 0:
             await self.check_liquidity_for_coin(coin, long_exchange, short_exchange, approx_notional_usdt)
         else:
@@ -441,37 +872,8 @@ class PerpArbitrageBot:
                 logger.warning(f"Укажите биржи для проверки делистинга {coin}")
                 return
             
-            # 1) Exchange announcements (existing)
+            # 1) Exchange announcements
             delisting_news = await self.news_monitor.check_delisting(coin, exchanges=exchanges, days_back=days_back)
-
-            # 2) X(Twitter) (optional)
-            now_utc = datetime.now(timezone.utc)
-            lookback = now_utc - timedelta(days=days_back, hours=6) if days_back > 0 else None
-            x_delisting_news: List[Dict[str, Any]] = []
-            if getattr(self, "x_news_monitor", None) is not None and self.x_news_monitor.enabled:
-                x_delisting_news = await self.x_news_monitor.find_delisting_news(
-                    coin_symbol=coin,
-                    exchanges=exchanges,
-                    lookback=lookback,
-                )
-                # Логируем найденные X-делистинги (в отличие от exchange announcements, они иначе не логируются)
-                for n in x_delisting_news[:5]:
-                    title = (n.get("title") or "")[:120]
-                    url = n.get("url") or "N/A"
-                    logger.warning(f"⚠️ X delisting {coin}: {title} | URL: {url}")
-
-            # Dedupe by URL/title
-            if x_delisting_news:
-                seen = set()
-                merged: List[Dict[str, Any]] = []
-                for it in (delisting_news or []) + x_delisting_news:
-                    url = str(it.get("url") or "").strip()
-                    key = url or (str(it.get("title") or "").strip()[:200])
-                    if not key or key in seen:
-                        continue
-                    seen.add(key)
-                    merged.append(it)
-                delisting_news = merged
             
             # Формируем строку с биржами для вывода
             exchanges_str = ", ".join(exchanges)
@@ -485,30 +887,6 @@ class PerpArbitrageBot:
                     exchanges=exchanges,
                     days_back=days_back,
                 )
-                # X security (optional) — добавляем к exchange-security
-                x_security_news: List[Dict[str, Any]] = []
-                if getattr(self, "x_news_monitor", None) is not None and self.x_news_monitor.enabled:
-                    x_security_news = await self.x_news_monitor.find_security_news(
-                        coin_symbol=coin,
-                        exchanges=exchanges,
-                        lookback=lookback,
-                    )
-                    for n in x_security_news[:5]:
-                        title = (n.get("title") or "")[:120]
-                        url = n.get("url") or "N/A"
-                        logger.warning(f"⚠️ X security {coin}: {title} | URL: {url}")
-
-                if x_security_news:
-                    seen2 = set()
-                    merged2: List[Dict[str, Any]] = []
-                    for it in (security_news or []) + x_security_news:
-                        url = str(it.get("url") or "").strip()
-                        key = url or (str(it.get("title") or "").strip()[:200])
-                        if not key or key in seen2:
-                            continue
-                        seen2.add(key)
-                        merged2.append(it)
-                    security_news = merged2
                 if not security_news:
                     logger.info(
                         f"✅ Новостей о взломах/безопасности {coin} ({exchanges_str}) за последние {days_back} дней не найдено"
@@ -1057,6 +1435,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
-
-

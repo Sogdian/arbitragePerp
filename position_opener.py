@@ -1925,6 +1925,10 @@ async def _plan_one_leg(
         return await _bingx_plan_leg(exchange_obj=exchange_obj, coin=coin, direction=direction, coin_amount=coin_amount)
     if ex == "xt":
         return await _xt_plan_leg(exchange_obj=exchange_obj, coin=coin, direction=direction, coin_amount=coin_amount)
+    if ex == "okx":
+        return await _okx_plan_leg(exchange_obj=exchange_obj, coin=coin, direction=direction, coin_amount=coin_amount)
+    if ex == "lbank":
+        return await _lbank_plan_leg(exchange_obj=exchange_obj, coin=coin, direction=direction, coin_amount=coin_amount)
     return OpenLegResult(exchange=exchange_name, direction=direction, ok=False, error="trading not implemented for this exchange")
 
 
@@ -3157,20 +3161,25 @@ async def _mexc_private_request(
     params: Dict[str, Any],
 ) -> Any:
     """
-    Best-effort signing for MEXC contract API:
-    - adds api_key, req_time (ms)
-    - sign = HMAC_SHA256(secret, urlencode(sorted(params)))
-    - sends as query params
+    MEXC Contract private signing (header-based):
+    - headers: ApiKey, Request-Time, Signature
+    - signature = HMAC_SHA256(secret, apiKey + requestTime + paramString)
+      where paramString is urlencode(sorted(params))
     """
     from urllib.parse import urlencode
     req_time = str(int(time.time() * 1000))
-    p = {**params, "api_key": api_key, "req_time": req_time}
-    pairs = sorted([(k, str(v)) for k, v in p.items() if v is not None], key=lambda kv: kv[0])
-    query = urlencode(pairs, doseq=True)
-    sign = hmac.new(api_secret.encode("utf-8"), query.encode("utf-8"), hashlib.sha256).hexdigest()
-    pairs.append(("sign", sign))
+    pairs = sorted([(k, str(v)) for k, v in (params or {}).items() if v is not None], key=lambda kv: kv[0])
+    param_string = urlencode(pairs, doseq=True)
+    to_sign = f"{api_key}{req_time}{param_string}"
+    sign = hmac.new(api_secret.encode("utf-8"), to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
+    headers = {
+        "ApiKey": api_key,
+        "Request-Time": req_time,
+        "Signature": sign,
+        "Content-Type": "application/json",
+    }
     try:
-        resp = await exchange_obj.client.request(method.upper(), path, params=pairs)
+        resp = await exchange_obj.client.request(method.upper(), path, params=pairs, headers=headers)
     except Exception as e:
         return {"_error": f"http error: {type(e).__name__}: {e}"}
     if resp.status_code < 200 or resp.status_code >= 300:
@@ -3179,6 +3188,36 @@ async def _mexc_private_request(
         return resp.json()
     except Exception:
         return {"_error": "bad json", "_body": resp.text[:400]}
+
+
+async def _mexc_get_contract_filters(*, exchange_obj: Any, symbol: str) -> Dict[str, Optional[str]]:
+    """
+    Fetch MEXC contract filters from public /api/v1/contract/detail.
+    Returns volUnit/minVol as strings when available.
+    """
+    try:
+        resp = await exchange_obj.client.request("GET", "/api/v1/contract/detail", params={})
+        if resp.status_code < 200 or resp.status_code >= 300:
+            return {}
+        data = resp.json()
+        if not isinstance(data, dict) or data.get("code") != 0:
+            return {}
+        items = data.get("data") or []
+        if not isinstance(items, list):
+            return {}
+        item = None
+        for it in items:
+            if isinstance(it, dict) and str(it.get("symbol") or "") == symbol:
+                item = it
+                break
+        if not isinstance(item, dict):
+            return {}
+        return {
+            "volUnit": str(item.get("volUnit")) if item.get("volUnit") is not None else None,
+            "minVol": str(item.get("minVol")) if item.get("minVol") is not None else None,
+        }
+    except Exception:
+        return {}
 
 
 async def _mexc_plan_leg(*, exchange_obj: Any, coin: str, direction: str, coin_amount: float) -> Any:
@@ -3226,9 +3265,30 @@ async def _mexc_plan_leg(*, exchange_obj: Any, coin: str, direction: str, coin_a
     if best_price <= 0:
         return OpenLegResult(exchange="mexc", direction=direction, ok=False, error="bad orderbook best price")
 
+    f = await _mexc_get_contract_filters(exchange_obj=exchange_obj, symbol=symbol)
+    vol_unit_raw = f.get("volUnit")
+    min_vol_raw = f.get("minVol")
+    vol_unit = float(vol_unit_raw) if vol_unit_raw else 0.0
+    min_vol = float(min_vol_raw) if min_vol_raw else 0.0
+
+    if vol_unit > 0 and not _is_multiple_of_step(coin_amount, vol_unit):
+        return OpenLegResult(
+            exchange="mexc",
+            direction=direction,
+            ok=False,
+            error=f"qty {coin_amount} not multiple of volUnit {vol_unit_raw}",
+        )
+
+    if min_vol > 0 and coin_amount < min_vol:
+        return OpenLegResult(
+            exchange="mexc",
+            direction=direction,
+            ok=False,
+            error=f"qty {coin_amount} < minVol {min_vol_raw}",
+        )
+
     mexc_type = int(os.getenv("MEXC_ORDER_TYPE", "4"))
     open_type = int(os.getenv("MEXC_OPEN_TYPE", "2"))
-    logger.info(f"План MEXC: {direction} qty={_format_number(coin_amount)} | best={_format_number(best_price)} | уровни 1..{MAX_ORDERBOOK_LEVELS} (IOC)")
 
     return {
         "exchange": "mexc",
@@ -5513,6 +5573,170 @@ async def _xt_get_position_qty_contracts(
     return None
 
 
+async def _okx_get_instrument_filters(*, exchange_obj: Any, symbol: str) -> Dict[str, Optional[str]]:
+    """
+    Best-effort fetch of OKX SWAP filters: tickSz, lotSz, minSz, ctVal.
+    """
+    try:
+        resp = await exchange_obj.client.request(
+            "GET",
+            "/api/v5/public/instruments",
+            params={"instType": "SWAP", "instId": symbol},
+        )
+        if resp.status_code < 200 or resp.status_code >= 300:
+            return {}
+        data = resp.json()
+        if not isinstance(data, dict) or str(data.get("code")) != "0":
+            return {}
+        items = data.get("data") or []
+        if not items or not isinstance(items[0], dict):
+            return {}
+        item = items[0]
+        return {
+            "tickSz": str(item.get("tickSz")) if item.get("tickSz") is not None else None,
+            "lotSz": str(item.get("lotSz")) if item.get("lotSz") is not None else None,
+            "minSz": str(item.get("minSz")) if item.get("minSz") is not None else None,
+            "ctVal": str(item.get("ctVal")) if item.get("ctVal") is not None else None,
+        }
+    except Exception:
+        return {}
+
+
+async def _okx_plan_leg(*, exchange_obj: Any, coin: str, direction: str, coin_amount: float) -> Any:
+    symbol = exchange_obj._normalize_symbol(coin)
+    ob = await exchange_obj.get_orderbook(coin, limit=MAX_ORDERBOOK_LEVELS)
+    if not ob or not ob.get("bids") or not ob.get("asks"):
+        return OpenLegResult(exchange="okx", direction=direction, ok=False, error=f"orderbook not available for {coin}")
+
+    side = "buy" if direction == "long" else "sell"
+    book_side = ob["asks"] if side == "buy" else ob["bids"]
+    best_price = float(book_side[0][0])
+    if best_price <= 0:
+        return OpenLegResult(exchange="okx", direction=direction, ok=False, error="bad orderbook best price")
+
+    f = await _okx_get_instrument_filters(exchange_obj=exchange_obj, symbol=symbol)
+    lot_raw = f.get("lotSz")
+    min_sz_raw = f.get("minSz")
+    ct_val_raw = f.get("ctVal")
+    lot = float(lot_raw) if lot_raw else 0.0
+    min_sz = float(min_sz_raw) if min_sz_raw else 0.0
+    ct_val = float(ct_val_raw) if ct_val_raw else 0.0
+
+    qty_for_rules = (coin_amount / ct_val) if ct_val > 0 else float(coin_amount)
+    if lot > 0 and not _is_multiple_of_step(qty_for_rules, lot):
+        return OpenLegResult(
+            exchange="okx",
+            direction=direction,
+            ok=False,
+            error=f"qty {coin_amount} not multiple of lotSz {lot_raw} (contracts={_format_number(qty_for_rules)})",
+        )
+    if min_sz > 0 and qty_for_rules < min_sz:
+        return OpenLegResult(
+            exchange="okx",
+            direction=direction,
+            ok=False,
+            error=f"qty {coin_amount} below minSz {min_sz_raw} (contracts={_format_number(qty_for_rules)})",
+        )
+
+    return {
+        "exchange": "okx",
+        "direction": direction,
+        "exchange_obj": exchange_obj,
+        "symbol": symbol,
+        "coin": coin,
+        "coin_amount": coin_amount,
+    }
+
+
+async def _lbank_get_instrument_filters(*, exchange_obj: Any, symbol: str) -> Dict[str, Optional[str]]:
+    """
+    Best-effort fetch of LBank filters: volumeTick, minOrderVolume, minOrderCost.
+    """
+    try:
+        resp = await exchange_obj.client.request(
+            "GET",
+            "/cfd/openApi/v1/pub/instrument",
+            params={"productGroup": "SwapU"},
+        )
+        if resp.status_code < 200 or resp.status_code >= 300:
+            return {}
+        data = resp.json()
+        if not isinstance(data, dict):
+            return {}
+        items = data.get("data") or []
+        if not isinstance(items, list):
+            return {}
+
+        sym_target = str(symbol or "").replace("-", "").replace("_", "").upper()
+        item = None
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            s = str(it.get("symbol") or it.get("instrumentId") or it.get("instrument_id") or "")
+            s = s.replace("-", "").replace("_", "").upper()
+            if s == sym_target:
+                item = it
+                break
+        if not isinstance(item, dict):
+            return {}
+        return {
+            "volumeTick": str(item.get("volumeTick")) if item.get("volumeTick") is not None else None,
+            "minOrderVolume": str(item.get("minOrderVolume")) if item.get("minOrderVolume") is not None else None,
+            "minOrderCost": str(item.get("minOrderCost")) if item.get("minOrderCost") is not None else None,
+        }
+    except Exception:
+        return {}
+
+
+async def _lbank_plan_leg(*, exchange_obj: Any, coin: str, direction: str, coin_amount: float) -> Any:
+    symbol = exchange_obj._normalize_symbol(coin)
+    if hasattr(exchange_obj, "resolve_symbol"):
+        try:
+            symbol = await exchange_obj.resolve_symbol(coin)
+        except Exception:
+            pass
+
+    ob = await exchange_obj.get_orderbook(coin, limit=MAX_ORDERBOOK_LEVELS)
+    if not ob or not ob.get("bids") or not ob.get("asks"):
+        return OpenLegResult(exchange="lbank", direction=direction, ok=False, error=f"orderbook not available for {coin}")
+
+    side = "buy" if direction == "long" else "sell"
+    book_side = ob["asks"] if side == "buy" else ob["bids"]
+    best_price = float(book_side[0][0])
+    if best_price <= 0:
+        return OpenLegResult(exchange="lbank", direction=direction, ok=False, error="bad orderbook best price")
+
+    f = await _lbank_get_instrument_filters(exchange_obj=exchange_obj, symbol=symbol)
+    step_raw = f.get("volumeTick")
+    min_qty_raw = f.get("minOrderVolume")
+    min_notional_raw = f.get("minOrderCost")
+    step = float(step_raw) if step_raw else 0.0
+    min_qty = float(min_qty_raw) if min_qty_raw else 0.0
+    min_notional = float(min_notional_raw) if min_notional_raw else 0.0
+
+    if step > 0 and not _is_multiple_of_step(coin_amount, step):
+        return OpenLegResult(exchange="lbank", direction=direction, ok=False, error=f"qty {coin_amount} not multiple of volumeTick {step_raw}")
+    if min_qty > 0 and coin_amount < min_qty:
+        return OpenLegResult(exchange="lbank", direction=direction, ok=False, error=f"qty {coin_amount} < minOrderVolume {min_qty_raw}")
+    notional = coin_amount * best_price
+    if min_notional > 0 and notional < min_notional:
+        return OpenLegResult(
+            exchange="lbank",
+            direction=direction,
+            ok=False,
+            error=f"minOrderCost {min_notional_raw} > requested ~{_format_number(notional)}",
+        )
+
+    return {
+        "exchange": "lbank",
+        "direction": direction,
+        "exchange_obj": exchange_obj,
+        "symbol": symbol,
+        "coin": coin,
+        "coin_amount": coin_amount,
+    }
+
+
 async def _xt_plan_leg(*, exchange_obj: Any, coin: str, direction: str, coin_amount: float) -> Any:
     api_key = _get_env("XT_API_KEY")
     api_secret = _get_env("XT_API_SECRET")
@@ -6172,5 +6396,3 @@ async def _xt_close_leg_partial_ioc(
     if avg_price is None and remaining <= eps:
         avg_price = last_px_used
     return remaining <= eps, avg_price
-
-
