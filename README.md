@@ -28,8 +28,10 @@ pip install -r requirements.txt
 python scan_spreads.py (тут SCAN_COIN_INVEST) - спред цен
 python one_coin_bot.py CLO (тут SCAN_COIN_INVEST) - спред цен по одной монете
 python bot.py "STO Long (mexc), Short (bybit) 30" --no-monitor (30 = количество монет CVC) - открытие и закрытие ордеров
+
 python scan_fundings.py - поиск фанлингов
 python fun.py "LPT Bybit 10 -0.1%" - скальпинг фандингов
+
 python scan_fundings_spreads.py - скан спреда фандингов
 python scan_fundings_spreads_bot.py "WHITEWHALE Long (bybit), Short (bingx) 200" - открытие и закрытие (ручное по "CTRL+Z") ордеров 
 ```

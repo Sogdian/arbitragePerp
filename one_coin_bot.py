@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import logging
 import os
+import re
 import sys
 import time
 from datetime import datetime, timedelta, timezone
@@ -118,6 +119,68 @@ def _price_from_ticker(d: Optional[Dict[str, Any]]) -> Optional[float]:
         except Exception:
             return None
     return None
+
+
+def _parse_summary_from_line(line: str) -> Optional[Dict[str, Any]]:
+    """
+    Парсит одну строку с вердиктом \"✅ арбитр\" и вытаскивает поля
+    для итоговой таблички.
+
+    Формат строки сейчас:
+    📈 Long {long_ex} Ц/Ф: {price_long} / {funding_long_pct} | 📉 Short {short_ex} Ц/Ф: {price_short} / {funding_short_pct} |
+    📊 Спред Ц/Ф/О: {price_spread}% / {funding_spread}% / {total_spread}% | ✅ арбитр ({long_ex}: X COIN, {short_ex}: Y COIN)
+    """
+    if "✅ арбитр" not in line:
+        return None
+
+    try:
+        # Биржи
+        m_long = re.search(r"📈 Long (\w+)\s", line)
+        m_short = re.search(r"📉 Short (\w+)\s", line)
+        # Спреды (допускаем произвольные пробелы вокруг '/')
+        m_spreads = re.search(
+            r"Спред Ц/Ф/О:\s*([-0-9.]+)%\s*/\s*([-0-9.]+)%\s*/\s*([-0-9.]+)%",
+            line,
+        )
+        # Кол-во монет (может отсутствовать, допускаем произвольные пробелы)
+        m_coins = re.search(
+            r"\(\s*(\w+):\s*([0-9.]+)\s+(\w+),\s*(\w+):\s*([0-9.]+)\s+(\w+)\s*\)",
+            line,
+        )
+
+        if not (m_long and m_short and m_spreads):
+            return None
+
+        long_ex = m_long.group(1)
+        short_ex = m_short.group(1)
+        price_spread = float(m_spreads.group(1))
+        funding_spread = float(m_spreads.group(2))
+        total_spread = float(m_spreads.group(3))
+
+        coins_long: Optional[float] = None
+        coins_short: Optional[float] = None
+        coin_symbol: Optional[str] = None
+        if m_coins:
+            ex1, qty1, coin1, ex2, qty2, coin2 = m_coins.groups()
+            if ex1.lower() == long_ex.lower() and ex2.lower() == short_ex.lower():
+                coins_long = float(qty1)
+                coins_short = float(qty2)
+                if coin1 == coin2:
+                    coin_symbol = coin1
+
+        return {
+            "long_ex": long_ex,
+            "short_ex": short_ex,
+            "price_spread": price_spread,
+            "funding_spread": funding_spread,
+            "total_spread": total_spread,
+            "coins_long": coins_long,
+            "coins_short": coins_short,
+            "coin": coin_symbol,
+            "raw_line": line,
+        }
+    except Exception:
+        return None
 
 
 def calc_open_spread_pct(ask_long: Optional[float], bid_short: Optional[float]) -> Optional[float]:
@@ -486,6 +549,7 @@ async def main() -> int:
 
         # 2) Анализируем все направленные пары Long/Short (без сортировки; печатаем по мере готовности)
         pair_tasks: List[asyncio.Task] = []
+        good_summaries: List[Dict[str, Any]] = []
         for long_ex in supported:
             for short_ex in supported:
                 if long_ex == short_ex:
@@ -498,8 +562,41 @@ async def main() -> int:
             try:
                 line = await fut
                 logger.info(line)
+                summary = _parse_summary_from_line(line)
+                if summary is not None:
+                    good_summaries.append(summary)
             except Exception as e:
                 logger.warning(f"Unexpected pair task error: {e}", exc_info=True)
+
+        # 3) Итоговая табличка по найденным арбитражам
+        if good_summaries:
+            good_summaries.sort(key=lambda x: x.get("total_spread", 0.0), reverse=True)
+            logger.info("-" * 80)
+            logger.info("ИТОГОВАЯ ТАБЛИЦА АРБИТРАЖЕЙ (отсортировано по общему спреду):")
+            header = (
+                "| # | Long   | Short  |Спред Цен|"
+                "Спред Фан|Общ спред| Объёмы                         |"
+            )
+            logger.info(header)
+            for idx, item in enumerate(good_summaries, start=1):
+                long_ex = item["long_ex"]
+                short_ex = item["short_ex"]
+                ps = item["price_spread"]
+                fs = item["funding_spread"]
+                ts = item["total_spread"]
+                coins_long = item.get("coins_long")
+                coins_short = item.get("coins_short")
+                coin_symbol = item.get("coin") or coin
+                if coins_long is not None and coins_short is not None:
+                    volumes = f"{long_ex}: {coins_long:.3f} {coin_symbol}, {short_ex}: {coins_short:.3f} {coin_symbol}"
+                else:
+                    volumes = "-"
+                row = (
+                    f"| {idx} | {long_ex:<6} | {short_ex:<6} | "
+                    f"{ps:>7.3f} | {fs:>7.3f} | {ts:>7.3f} | {volumes} |"
+                )
+                logger.info(row)
+            logger.info("-" * 80)
 
         return 0
     finally:
